@@ -1,0 +1,6 @@
+python-telegram-bot[socks]==22.8
+Telethon==1.44.0
+PySocks==1.7.1
+python-socks==2.8.2
+python-dotenv==1.2.2
+httpx[socks]==0.28.1
