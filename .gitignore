@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+*.session
+*.session-journal
+__pycache__/
+*.py[cod]
+.pytest_cache/
+downloads/
+live-test-results/
+bot.log*
+.railway-variables.env
