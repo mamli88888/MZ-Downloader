@@ -2360,7 +2360,6 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
         await progress.update(
             10,
             "🎵 دارم آهنگ رو از ربات دریافت می‌کنم…",
-            f"@{SETTINGS.music_finder_bot} • منتظر پاسخ…",
             force=True,
         )
 
