@@ -2338,7 +2338,7 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
         status_card(
             "⏳ لینک رفت توی صف" if queued else "🎵 دارم آهنگ ریلز رو پیدا می‌کنم…",
             f"نوبت تقریبی: <b>{ACCOUNT_POOL.queue_length + 1}</b>" if queued
-            else f"لینک ریلز به @{SETTINGS.music_finder_bot} ارسال می‌شه.",
+            else f"دارم آهنگ ریلز رو تشخیص می‌دم و بعدش دانلود کنم.",
             "برای توقف: /cancel",
         ),
         reply_to,
@@ -2391,7 +2391,6 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
             status_message,
             status_card(
                 "❌ آهنگ پیدا نشد",
-                f"@{SETTINGS.music_finder_bot} پاسخ مناسبی نداد.",
                 "ریلز ممکنه موزیک نداشته باشه یا از صدای اوریجینال استفاده شده باشه.",
             ),
         )
