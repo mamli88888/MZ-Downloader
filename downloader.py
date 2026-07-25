@@ -978,6 +978,7 @@ class DownloaderGateway:
         url: str,
         attempt_directory: Path,
         progress_callback: ProgressCallback | None = None,
+        expected_kind_override: MediaKind | None = None,
     ) -> GatewayResult:
         if self.cooldowns.remaining(worker_name, bot_username) > 0:
             return GatewayResult(status="error", bot_username=bot_username, reason="cooldown")
@@ -986,6 +987,11 @@ class DownloaderGateway:
                 baseline = await self._latest_message_id(client, bot_username)
                 sent = await client.send_message(bot_username, url)
                 sent_id = int(getattr(sent, "id", 0) or 0)
+                effective_kind = (
+                    expected_kind_override
+                    if expected_kind_override is not None
+                    else expected_kind_for_url(url)
+                )
                 decision = await await_response_decision(
                     stream,
                     after_id=max(baseline, sent_id),
@@ -993,7 +999,7 @@ class DownloaderGateway:
                     timeout=self.wait_timeout,
                     preview_grace=self.preview_grace,
                     album_window=self.album_window,
-                    expected_kind=expected_kind_for_url(url),
+                    expected_kind=effective_kind,
                 )
             if decision.status == "timeout":
                 self.cooldowns.mark_timeout(worker_name, bot_username)

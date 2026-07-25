@@ -44,6 +44,7 @@ class Settings:
     instagram_youtube_bots: tuple[str, ...]
     tiktok_bots: tuple[str, ...]
     fallback_bots: tuple[str, ...]
+    music_finder_bot: str
     download_root: Path
     max_file_size: int
     max_download_size: int
@@ -155,6 +156,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         "allsaverbot,instadowbot,download_it_bot,AllSavesBot",
     )
     tiktok_bots = bot_list("TIKTOK_DOWNLOADER_BOTS", "download_it_bot,AllSavesBot")
+    music_finder_bot = bot_name("MUSIC_FINDER_BOT", "whatisthismusicbot")
     fallback_bots = tuple(
         dict.fromkeys(
             (*instagram_youtube_bots, *tiktok_bots, primary_bot, secondary_bot, spotify_bot, soundcloud_bot)
@@ -179,6 +181,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         instagram_youtube_bots=instagram_youtube_bots,
         tiktok_bots=tiktok_bots,
         fallback_bots=fallback_bots,
+        music_finder_bot=music_finder_bot,
         download_root=download_root,
         max_file_size=_as_int(env, "MAX_FILE_SIZE_MB", 30) * 1024 * 1024,
         # Zero disables the application-level source-size cap. Telegram upload

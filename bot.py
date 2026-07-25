@@ -63,7 +63,6 @@ from downloader import (
 )
 from instagram_caption import InstagramCaptionError, fetch_instagram_caption
 from routing import Platform, all_providers, detect_platform, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
-from yt_dlp import YoutubeDL
 from spotisaver import SpotisaverAlbumDownloader
 from youtube_search import (
     MAX_RESULTS as YOUTUBE_SEARCH_MAX_RESULTS,
@@ -689,110 +688,6 @@ async def scrape_instagram_caption(url: str) -> str:
     except Exception as exc:
         logger.warning("Instagram caption scraper failed: %s", exc)
     return ""
-
-
-_AUDIO_EXTS = {".m4a", ".mp3", ".aac", ".ogg", ".opus", ".webm", ".wav", ".flac"}
-
-
-def _find_audio_file(directory: Path) -> Path | None:
-    """Return the first audio file found in *directory*, or None."""
-    for candidate in directory.iterdir():
-        if candidate.suffix.lower() in _AUDIO_EXTS:
-            return candidate
-    return None
-
-
-async def get_reel_music_info(url: str) -> tuple[str, str] | None:
-    """
-    Extract the music (artist, title) used in an Instagram Reel via yt-dlp metadata.
-    Does *not* download the video — only fetches page info.
-    Returns (artist, title) or None if no music metadata is found.
-    """
-    ydl_opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "socket_timeout": 30,
-    }
-
-    def _extract() -> tuple[str, str] | None:
-        with YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=False)
-            except Exception as exc:
-                logger.debug("yt-dlp metadata fetch failed for Reel: %s", exc)
-                return None
-        if not info:
-            return None
-
-        # Standard yt-dlp mapped fields
-        track = (info.get("track") or "").strip()
-        artist = (info.get("artist") or "").strip()
-        if track and artist:
-            return artist, track
-
-        # Some extractors use alt_title for song name
-        alt = (info.get("alt_title") or "").strip()
-        if alt and artist:
-            return artist, alt
-
-        # music_metadata dict (yt-dlp internal for some extractors)
-        for key in ("music_metadata", "music_info"):
-            mm = info.get(key)
-            if isinstance(mm, dict):
-                t = (mm.get("title") or mm.get("song") or "").strip()
-                a = (mm.get("artist") or mm.get("performer") or mm.get("author") or "").strip()
-                if t and a:
-                    return a, t
-
-        return None
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _extract)
-
-
-async def download_song_from_youtube(artist: str, title: str, output_dir: Path) -> tuple[Path, str]:
-    """
-    Search YouTube for "[artist] - [title]" and download the top result as audio.
-    Returns (audio_path, video_title).
-    """
-    query = f"{artist} - {title}"
-    ydl_opts: dict[str, Any] = {
-        "format": "bestaudio/best",
-        "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 30,
-        "retries": 3,
-        "noplaylist": True,
-    }
-
-    def _download() -> tuple[Path, str]:
-        search_query = f"ytsearch1:{query}"
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_query, download=True)
-        if not info:
-            raise RuntimeError("yt-dlp یوتیوب نتیجه‌ای برنگرداند")
-
-        # ytsearch wraps results in a playlist-like dict
-        entries = info.get("entries") or []
-        entry = entries[0] if entries else info
-        video_title = (entry.get("title") or query).strip()
-
-        # Try the prepared filename first
-        with YoutubeDL({**ydl_opts, "skip_download": True}) as ydl2:
-            filename = Path(ydl2.prepare_filename(entry))
-        if filename.exists():
-            return filename, video_title
-
-        # Fallback: scan the directory
-        found = _find_audio_file(output_dir)
-        if found:
-            return found, video_title
-        raise RuntimeError(f"فایل صوتی بعد از دانلود یوتیوب پیدا نشد (دایرکتوری: {output_dir})")
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _download)
 
 
 def is_active_channel_member(member: Any) -> bool:
@@ -2426,75 +2321,100 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
     chat_id = update.effective_chat.id
     reply_to = query.message.message_id if query.message else None
     request_id = uuid.uuid4().hex[:8]
+
+    if ACCOUNT_POOL.total == 0:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=status_card("🛠 بخش دانلود موقتاً آماده نیست", "لطفاً کمی بعد دوباره امتحان کن."),
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=reply_to,
+        )
+        return
+
+    queued = ACCOUNT_POOL.busy_count >= ACCOUNT_POOL.total
     status_message = await send_status(
         context,
         chat_id,
-        status_card("🔍 دارم آهنگ ریلز رو شناسایی می‌کنم…", "داریم متادیتای موزیک رو از اینستاگرام می‌گیریم."),
+        status_card(
+            "⏳ لینک رفت توی صف" if queued else "🎵 دارم آهنگ ریلز رو پیدا می‌کنم…",
+            f"نوبت تقریبی: <b>{ACCOUNT_POOL.queue_length + 1}</b>" if queued
+            else f"لینک ریلز به @{SETTINGS.music_finder_bot} ارسال می‌شه.",
+            "برای توقف: /cancel",
+        ),
         reply_to,
     )
+    progress = ProgressReporter(status_message, request_id)
 
-    output_dir = SETTINGS.download_root / f"reel-music-{request_id}"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    lease: WorkerLease | None = None
+    attempt_directory: Path | None = None
     try:
-        # Step 1: identify the song used in the Reel
-        music_info = await get_reel_music_info(url)
-        if music_info is None:
-            await edit_status(
+        lease = await asyncio.wait_for(
+            ACCOUNT_POOL.acquire(),
+            timeout=SETTINGS.worker_acquire_timeout,
+        )
+        attempt_directory = create_attempt_directory(
+            SETTINGS.download_root,
+            request_id,
+            f"reel-music-{SETTINGS.music_finder_bot}",
+        )
+        await progress.update(
+            10,
+            "🎵 دارم آهنگ رو از ربات دریافت می‌کنم…",
+            f"@{SETTINGS.music_finder_bot} • منتظر پاسخ…",
+            force=True,
+        )
+
+        result = await GATEWAY.request(
+            client=lease.worker.client,
+            worker_name=lease.worker.name,
+            bot_username=SETTINGS.music_finder_bot,
+            url=url,
+            attempt_directory=attempt_directory,
+            progress_callback=progress.download,
+            expected_kind_override=MediaKind.AUDIO,
+        )
+
+        if result.status == "ready":
+            await send_result_to_user(
+                update,
+                context,
                 status_message,
-                status_card(
-                    "❌ آهنگی شناسایی نشد",
-                    "اینستاگرام اطلاعات موزیک این ریلز رو در اختیار نمی‌ذاره.",
-                    "ممکنه ریلز موزیک نداشته باشه، خصوصی باشه یا از صدای اوریجینال استفاده شده باشه.",
-                ),
+                result,
+                reply_to=reply_to,
+                request_id=request_id,
+                progress=progress,
             )
             return
 
-        artist, title = music_info
+        reason = result.reason or "service_error"
+        logger.info("Reel music bot @%s returned %s (%s) for %s", SETTINGS.music_finder_bot, result.status, reason, request_id)
         await edit_status(
             status_message,
             status_card(
-                "🎵 آهنگ شناسایی شد!",
-                f"🎤 خواننده: <b>{html.escape(artist)}</b>\n🎵 عنوان: <b>{html.escape(title)}</b>",
-                "دارم نسخه کامل رو از یوتیوب پیدا و دانلود می‌کنم…",
+                "❌ آهنگ پیدا نشد",
+                f"@{SETTINGS.music_finder_bot} پاسخ مناسبی نداد.",
+                "ریلز ممکنه موزیک نداشته باشه یا از صدای اوریجینال استفاده شده باشه.",
             ),
         )
-
-        # Step 2: search YouTube and download the full song
-        audio_path, yt_title = await download_song_from_youtube(artist, title, output_dir)
-        audio_size = audio_path.stat().st_size
-        caption = (
-            f"🎵 <b>{html.escape(title)}</b> — {html.escape(artist)}\n"
-            f"<i>{html.escape(yt_title)}</i>"
-        )
+    except (PoolUnavailable, asyncio.TimeoutError):
         await edit_status(
             status_message,
-            status_card("📤 آماده شد؛ دارم ارسال می‌کنم…", f"حجم: <b>{fmt_size(audio_size)}</b>"),
+            status_card("⏳ صف پر است", "لطفاً چند لحظه صبر کن و دوباره امتحان کن."),
         )
-        with audio_path.open("rb") as fh:
-            await context.bot.send_audio(
-                chat_id=chat_id,
-                audio=fh,
-                filename=audio_path.name,
-                title=title,
-                performer=artist,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=reply_to,
-            )
-        with contextlib.suppress(TelegramError):
-            await status_message.delete()
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
-        logger.warning("Reel music search failed for %s: %s", request_id, exc)
-        await edit_status(
-            status_message,
-            status_card(
-                "❌ دانلود آهنگ ناموفق بود",
-                "آهنگ شناسایی شد ولی دانلود از یوتیوب موفق نبود.",
-                "کمی بعد دوباره امتحان کن.",
-            ),
-        )
+        logger.exception("Reel music callback failed for %s: %s", request_id, exc)
+        with contextlib.suppress(TelegramError):
+            await edit_status(
+                status_message,
+                status_card("❌ خطای غیرمنتظره", "لطفاً دوباره امتحان کن."),
+            )
     finally:
-        cleanup_request_directory(output_dir, SETTINGS.download_root)
+        if attempt_directory is not None:
+            cleanup_request_directory(attempt_directory, SETTINGS.download_root)
+        if lease is not None:
+            ACCOUNT_POOL.release(lease)
 
 
 def cleanup_stale_download_directories(max_age_seconds: float = 24 * 60 * 60) -> None:
