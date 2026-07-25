@@ -1893,10 +1893,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+def _is_admin(user: Any) -> bool:
+    return bool(user and (user.username or "").lower() == ADMIN_USERNAME.lower())
+
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message to all registered users. Admin-only."""
-    user = update.effective_user
-    if not user or (user.username or "").lower() != ADMIN_USERNAME.lower():
+    if not _is_admin(update.effective_user):
         await update.effective_message.reply_text(
             status_card("⛔ دسترسی ممنوع", "این دستور فقط برای ادمین ربات قابل استفاده است."),
             parse_mode=ParseMode.HTML,
@@ -1936,6 +1939,63 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "✅ ارسال پیام همگانی تموم شد",
             f"ارسال‌شده: <b>{sent}</b>\nناموفق: <b>{failed}</b>",
         ),
+    )
+
+
+async def adduser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually register one or more user IDs. Admin-only.
+
+    Usage:  /adduser 123456789 987654321 …
+    After adding, the bot prints the full KNOWN_USERS string so you can
+    copy it into the Railway Variable to survive the next redeploy.
+    """
+    if not _is_admin(update.effective_user):
+        await update.effective_message.reply_text(
+            status_card("⛔ دسترسی ممنوع", "این دستور فقط برای ادمین ربات قابل استفاده است."),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            status_card(
+                "➕ افزودن کاربر دستی",
+                "آی‌دی عددی کاربر(ان) را بعد از دستور بنویس:\n"
+                "<code>/adduser 123456789</code>\n"
+                "<code>/adduser 123456789 987654321</code>",
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    added_ids: list[int] = []
+    invalid: list[str] = []
+    for arg in context.args:
+        if arg.lstrip("-").isdigit():
+            uid = int(arg)
+            if users_db.register(uid):
+                added_ids.append(uid)
+        else:
+            invalid.append(arg)
+
+    lines: list[str] = []
+    if added_ids:
+        lines.append(f"اضافه‌شده: <b>{len(added_ids)}</b> کاربر")
+    if invalid:
+        lines.append(f"نامعتبر (نادیده گرفته شد): {', '.join(html_escape(v) for v in invalid)}")
+
+    total = users_db.count()
+    known_users_str = users_db.all_user_ids_str()
+    lines.append(f"\nمجموع کاربران ذخیره‌شده: <b>{total}</b>")
+    lines.append(
+        f"\nبرای پایداری بعد از ری‌دیپلوی Railway، این مقدار را در متغیر "
+        f"<code>KNOWN_USERS</code> ست کن:\n"
+        f"<code>{html_escape(known_users_str)}</code>"
+    )
+
+    await update.effective_message.reply_text(
+        status_card("✅ ثبت کاربر دستی", "\n".join(lines)),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -2594,6 +2654,7 @@ def main() -> None:
     application = builder.build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("adduser", adduser_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("services", services_command))
