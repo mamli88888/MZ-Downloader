@@ -62,7 +62,8 @@ from downloader import (
     create_attempt_directory,
 )
 from instagram_caption import InstagramCaptionError, fetch_instagram_caption
-from routing import Platform, all_providers, detect_platform, platform_info, providers_for_platform, spotify_resource_type
+from routing import Platform, all_providers, detect_platform, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
+from yt_dlp import YoutubeDL
 from spotisaver import SpotisaverAlbumDownloader
 from youtube_search import (
     MAX_RESULTS as YOUTUBE_SEARCH_MAX_RESULTS,
@@ -178,6 +179,9 @@ USER_RATE_LIMITS: dict[tuple[int, int], deque[float]] = defaultdict(deque)
 YOUTUBE_SEARCH_RATE_LIMITS: dict[tuple[int, int], deque[float]] = defaultdict(deque)
 ACTIVE_YOUTUBE_SEARCHES: set[tuple[int, int]] = set()
 MEMBERSHIP_CACHE: dict[int, float] = {}
+# token → (url, created_at, chat_id, user_id)
+REEL_MUSIC_URLS: dict[str, tuple[str, float, int, int]] = {}
+REEL_MUSIC_TTL = 600  # 10 minutes
 FEEDBACK_STICKER_IDS: tuple[str, ...] = ()
 SELECTION_REAPER_TASK: asyncio.Task[Any] | None = None
 HEALTH_SERVER: asyncio.AbstractServer | None = None
@@ -685,6 +689,36 @@ async def scrape_instagram_caption(url: str) -> str:
     except Exception as exc:
         logger.warning("Instagram caption scraper failed: %s", exc)
     return ""
+
+
+async def extract_reel_audio(url: str, output_dir: Path) -> Path:
+    """Download the best-quality audio track from an Instagram Reel via yt-dlp."""
+    ydl_opts: dict[str, Any] = {
+        "format": "bestaudio/best",
+        "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 3,
+    }
+
+    def _do_download() -> Path:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        if info is None:
+            raise RuntimeError("yt-dlp returned no info for URL")
+        filename = Path(ydl.prepare_filename(info))
+        if filename.exists():
+            return filename
+        # yt-dlp may pick a different extension — scan the directory
+        audio_exts = {".m4a", ".mp3", ".aac", ".ogg", ".opus", ".webm", ".wav", ".flac"}
+        for candidate in output_dir.iterdir():
+            if candidate.suffix.lower() in audio_exts:
+                return candidate
+        raise RuntimeError(f"Audio file not found after yt-dlp download (looked in {output_dir})")
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _do_download)
 
 
 def is_active_channel_member(member: Any) -> bool:
@@ -1405,6 +1439,22 @@ async def _process_url(
                     instagram_caption=instagram_caption,
                     progress=progress,
                 )
+                if platform == Platform.INSTAGRAM and is_instagram_reel(url):
+                    reel_token = uuid.uuid4().hex[:12]
+                    REEL_MUSIC_URLS[reel_token] = (url, time.monotonic(), chat_id, update.effective_user.id)
+                    with contextlib.suppress(TelegramError):
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=status_card(
+                                "🎵 موزیک این ریلز رو می‌خوای؟",
+                                "دکمه زیر رو بزن تا آهنگ برات استخراج و ارسال بشه.",
+                            ),
+                            parse_mode=ParseMode.HTML,
+                            reply_to_message_id=reply_to,
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("🎵 دریافت موزیک ریلز", callback_data=f"reel_music:{reel_token}")
+                            ]]),
+                        )
                 return
             if result.status == "needs_selection":
                 displayed_options = tuple(
@@ -1468,6 +1518,16 @@ async def _process_url(
                             )
                         ]
                     )
+                    if is_instagram_reel(url):
+                        REEL_MUSIC_URLS[token] = (url, time.monotonic(), chat_id, update.effective_user.id)
+                        rows.append(
+                            [
+                                InlineKeyboardButton(
+                                    "🎵 موزیک ریلز",
+                                    callback_data=f"reel_music:{token}",
+                                )
+                            ]
+                        )
                 elif not any(option.action == "caption" for option in displayed_options) and result.text:
                     rows.append(
                         [InlineKeyboardButton("📝 متن/اطلاعات پست", callback_data=f"info:{token}")]
@@ -2263,6 +2323,77 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         release_pending_selection(session)
 
 
+@membership_required
+async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 🎵 موزیک ریلز button presses."""
+    query = update.callback_query
+    data = query.data or ""
+    parts = data.split(":")
+    token = parts[1] if len(parts) > 1 else ""
+
+    entry = REEL_MUSIC_URLS.get(token)
+    if entry is None:
+        await query.answer("این درخواست منقضی شده است.", show_alert=True)
+        return
+    url, created_at, orig_chat_id, orig_user_id = entry
+    if time.monotonic() - created_at > REEL_MUSIC_TTL:
+        REEL_MUSIC_URLS.pop(token, None)
+        await query.answer("این درخواست منقضی شده است.", show_alert=True)
+        return
+    if update.effective_user.id != orig_user_id or update.effective_chat.id != orig_chat_id:
+        await query.answer("این درخواست متعلق به شما نیست.", show_alert=True)
+        return
+
+    REEL_MUSIC_URLS.pop(token, None)
+    await query.answer("🎵 دارم موزیک رو استخراج می‌کنم…")
+    with contextlib.suppress(TelegramError):
+        await query.edit_message_reply_markup(reply_markup=None)
+
+    chat_id = update.effective_chat.id
+    reply_to = query.message.message_id if query.message else None
+    request_id = uuid.uuid4().hex[:8]
+    status_message = await send_status(
+        context,
+        chat_id,
+        status_card("🎵 دارم موزیک ریلز رو استخراج می‌کنم…", "yt-dlp داره صدای ریلز رو آماده می‌کنه."),
+        reply_to,
+    )
+
+    output_dir = SETTINGS.download_root / f"reel-music-{request_id}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        audio_path = await extract_reel_audio(url, output_dir)
+        audio_size = audio_path.stat().st_size
+        caption = f"🎵 موزیک ریلز • <code>{html.escape(url.split('?')[0])}</code>"
+        await edit_status(
+            status_message,
+            status_card("📤 آماده شد؛ دارم ارسال می‌کنم…", f"حجم: <b>{fmt_size(audio_size)}</b>"),
+        )
+        with audio_path.open("rb") as fh:
+            await context.bot.send_audio(
+                chat_id=chat_id,
+                audio=fh,
+                filename=audio_path.name,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=reply_to,
+            )
+        with contextlib.suppress(TelegramError):
+            await status_message.delete()
+    except Exception as exc:
+        logger.warning("Reel music extraction failed for %s: %s", request_id, exc)
+        await edit_status(
+            status_message,
+            status_card(
+                "❌ استخراج موزیک ناموفق بود",
+                "ریلز ممکنه خصوصی باشه، موزیک نداشته باشه یا اینستاگرام دسترسی رو محدود کرده باشه.",
+                "کمی بعد دوباره امتحان کن.",
+            ),
+        )
+    finally:
+        cleanup_request_directory(output_dir, SETTINGS.download_root)
+
+
 def cleanup_stale_download_directories(max_age_seconds: float = 24 * 60 * 60) -> None:
     cutoff = time.time() - max_age_seconds
     for child in SETTINGS.download_root.iterdir():
@@ -2399,6 +2530,7 @@ def main() -> None:
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("dl", dl_command))
     application.add_handler(CallbackQueryHandler(on_selection, pattern=r"^(?:sel|cancel|info|caption):"))
+    application.add_handler(CallbackQueryHandler(on_reel_music_callback, pattern=r"^reel_music:"))
     application.add_handler(CallbackQueryHandler(on_youtube_search_callback, pattern=r"^(?:ys|yp):"))
     application.add_handler(
         MessageHandler(

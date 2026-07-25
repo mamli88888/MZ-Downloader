@@ -98,3 +98,16 @@ def spotify_resource_type(url: str) -> str | None:
 
 def platform_info(platform: Platform) -> PlatformInfo:
     return PLATFORM_INFO[platform]
+
+
+def is_instagram_reel(url: str) -> bool:
+    """Return True if the URL is an Instagram Reel (/reel/, /reels/, or /tv/)."""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower().strip(".")
+        path = parsed.path.lower()
+    except ValueError:
+        return False
+    if not (host == "instagram.com" or host.endswith(".instagram.com")):
+        return False
+    return path.startswith("/reel/") or path.startswith("/reels/") or path.startswith("/tv/")
