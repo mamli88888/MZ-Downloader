@@ -47,6 +47,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from config import ConfigError, PROJECT_DIR, SETTINGS
+import users_db
 from downloader import (
     AccountPool,
     AccountWorker,
@@ -181,6 +182,7 @@ MEMBERSHIP_CACHE: dict[int, float] = {}
 # token → (url, created_at, chat_id, user_id)
 REEL_MUSIC_URLS: dict[str, tuple[str, float, int, int]] = {}
 REEL_MUSIC_TTL = 600  # 10 minutes
+ADMIN_USERNAME = "iR0nin"  # only this user can use /broadcast
 FEEDBACK_STICKER_IDS: tuple[str, ...] = ()
 SELECTION_REAPER_TASK: asyncio.Task[Any] | None = None
 HEALTH_SERVER: asyncio.AbstractServer | None = None
@@ -1880,11 +1882,60 @@ WELCOME_GROUP = status_card(
 
 @membership_required
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user and update.effective_chat.type == ChatType.PRIVATE:
+        users_db.register(user.id)
     text = WELCOME_PRIVATE if update.effective_chat.type == ChatType.PRIVATE else WELCOME_GROUP
     await update.effective_message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+    )
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message to all registered users. Admin-only."""
+    user = update.effective_user
+    if not user or (user.username or "").lower() != ADMIN_USERNAME.lower():
+        await update.effective_message.reply_text(
+            status_card("⛔ دسترسی ممنوع", "این دستور فقط برای ادمین ربات قابل استفاده است."),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    text = " ".join(context.args).strip() if context.args else ""
+    if not text:
+        await update.effective_message.reply_text(
+            status_card(
+                "📢 ارسال پیام همگانی",
+                "متن پیام را بعد از دستور بنویس:\n<code>/broadcast متن پیام</code>",
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    all_ids = users_db.all_user_ids()
+    total = len(all_ids)
+    status_msg = await update.effective_message.reply_text(
+        status_card("📢 در حال ارسال…", f"تعداد گیرنده: <b>{total}</b> نفر"),
+        parse_mode=ParseMode.HTML,
+    )
+
+    sent = 0
+    failed = 0
+    for uid in all_ids:
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+            sent += 1
+        except TelegramError:
+            failed += 1
+
+    await edit_status(
+        status_msg,
+        status_card(
+            "✅ ارسال پیام همگانی تموم شد",
+            f"ارسال‌شده: <b>{sent}</b>\nناموفق: <b>{failed}</b>",
+        ),
     )
 
 
@@ -2457,6 +2508,7 @@ async def post_init(application: Application) -> None:
         BotCommand("search", "جست‌وجو در YouTube"),
         BotCommand("cancel", "توقف دانلودهای من"),
         BotCommand("dl", "دانلود لینک"),
+        BotCommand("broadcast", "ارسال پیام همگانی (فقط ادمین)"),
     ]
     group_commands = [
         BotCommand("dl", "دانلود لینک یا پیام ریپلای‌شده"),
@@ -2541,6 +2593,7 @@ def main() -> None:
         builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
     application = builder.build()
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("services", services_command))
