@@ -74,7 +74,7 @@ Railway متغیر `PORT` را خودش می‌سازد. مسیر `/health` پس
 
 ## راه‌اندازی Google Drive برای فایل‌های بزرگ
 
-برای جایگزینی Gofile، ربات از یک Google Cloud service account استفاده می‌کند. فایل موقت پس از مدت `GOOGLE_DRIVE_DELETE_DELAY_SECONDS` (پیش‌فرض یک ساعت) حذف می‌شود.
+ربات از یک Google Cloud service account برای آپلود فایل‌های بزرگ استفاده می‌کند. فایل موقت پس از مدت `GOOGLE_DRIVE_DELETE_DELAY_SECONDS` (پیش‌فرض یک ساعت) حذف می‌شود.
 
 1. وارد [Google Cloud Console](https://console.cloud.google.com/) شوید و یک Project بسازید یا Project موجود را انتخاب کنید.
 2. از بخش **APIs & Services → Library**، API با نام **Google Drive API** را فعال کنید.
