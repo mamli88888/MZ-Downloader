@@ -1,0 +1,1 @@
+- [GitHub pushes](github-pushes.md) — when raw HTTPS Git auth is unavailable, use the project’s official GitHub push flow after confirming the origin.
