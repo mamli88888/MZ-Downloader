@@ -43,6 +43,9 @@ class Settings:
     soundcloud_bot: str
     instagram_youtube_bots: tuple[str, ...]
     tiktok_bots: tuple[str, ...]
+    twitter_bots: tuple[str, ...]
+    spotify_track_bots: tuple[str, ...]
+    spotify_collection_primary_bot: str
     fallback_bots: tuple[str, ...]
     music_finder_bot: str
     download_root: Path
@@ -63,6 +66,8 @@ class Settings:
     proxy_type: str
     proxy_host: str
     proxy_port: int
+    gofile_tokens: tuple[str, ...]
+    gofile_delete_delay: float
 
 
 def _as_bool(value: str | None, default: bool) -> bool:
@@ -156,10 +161,30 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         "allsaverbot,instadowbot,download_it_bot,AllSavesBot",
     )
     tiktok_bots = bot_list("TIKTOK_DOWNLOADER_BOTS", "download_it_bot,AllSavesBot")
+    twitter_bots = bot_list("TWITTER_BOTS", "AllSavesBot,download_it_bot")
+    spotify_track_bots = bot_list(
+        "SPOTIFY_TRACK_BOTS", "SpotSeekBot,Dr_downloader_bot,spotifysavesbot"
+    )
+    spotify_collection_primary_bot = bot_name(
+        "SPOTIFY_COLLECTION_PRIMARY_BOT", "Dr_downloader_bot"
+    )
     music_finder_bot = bot_name("MUSIC_FINDER_BOT", "whatisthismusicbot")
+    gofile_raw = env.get("GOFILE_TOKENS", "").strip()
+    gofile_tokens = (
+        tuple(t.strip() for t in gofile_raw.split(",") if t.strip()) if gofile_raw else ()
+    )
     fallback_bots = tuple(
         dict.fromkeys(
-            (*instagram_youtube_bots, *tiktok_bots, primary_bot, secondary_bot, spotify_bot, soundcloud_bot)
+            (
+                *instagram_youtube_bots,
+                *tiktok_bots,
+                *twitter_bots,
+                *spotify_track_bots,
+                primary_bot,
+                secondary_bot,
+                spotify_bot,
+                soundcloud_bot,
+            )
         )
     )
 
@@ -180,8 +205,13 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         soundcloud_bot=soundcloud_bot,
         instagram_youtube_bots=instagram_youtube_bots,
         tiktok_bots=tiktok_bots,
+        twitter_bots=twitter_bots,
+        spotify_track_bots=spotify_track_bots,
+        spotify_collection_primary_bot=spotify_collection_primary_bot,
         fallback_bots=fallback_bots,
         music_finder_bot=music_finder_bot,
+        gofile_tokens=gofile_tokens,
+        gofile_delete_delay=_as_float(env, "GOFILE_DELETE_DELAY_SECONDS", 3600.0),
         download_root=download_root,
         max_file_size=_as_int(env, "MAX_FILE_SIZE_MB", 30) * 1024 * 1024,
         # Zero disables the application-level source-size cap. Telegram upload

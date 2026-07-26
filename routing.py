@@ -72,10 +72,12 @@ def providers_for_platform(platform: Platform, settings) -> tuple[str, ...]:
         return settings.instagram_youtube_bots
     if platform == Platform.TIKTOK:
         return settings.tiktok_bots
-    if platform in {Platform.TWITTER, Platform.FACEBOOK, Platform.VK}:
+    if platform == Platform.TWITTER:
+        return settings.twitter_bots
+    if platform in {Platform.FACEBOOK, Platform.VK}:
         return (settings.primary_bot,)
     if platform == Platform.SPOTIFY:
-        return (settings.spotify_bot,)
+        return settings.spotify_track_bots
     if platform == Platform.SOUNDCLOUD:
         return (settings.soundcloud_bot,)
     return ()

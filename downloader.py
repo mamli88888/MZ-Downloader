@@ -42,6 +42,10 @@ class InvalidDownload(RuntimeError):
     pass
 
 
+class DrDownloaderError(RuntimeError):
+    pass
+
+
 class DownloadTooLarge(InvalidDownload):
     pass
 
@@ -248,6 +252,7 @@ PROMOTION_MARKERS = (
 )
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac"}
+DR_ALBUM_DOWNLOAD_ALL_MARKERS = ("download all", "دانلود همه")
 EXTERNAL_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 TRUSTED_MEDIA_HOSTS = {"pictube.app"}
 
@@ -1177,3 +1182,137 @@ class DownloaderGateway:
             self.cooldowns.mark_timeout(worker_name, bot_username)
             logger.exception("Downloader selection failed for @%s: %s", bot_username, exc)
             return GatewayResult(status="error", bot_username=bot_username, reason="service_error")
+
+
+# ---------------------------------------------------------------------------
+# Dr_downloader_bot album/playlist flow
+# ---------------------------------------------------------------------------
+
+async def request_dr_downloader_album(
+    client: Any,
+    bot_username: str,
+    url: str,
+    directory: Path,
+    *,
+    wait_timeout: float = 90.0,
+    track_timeout: float = 45.0,
+    max_download_size: int = 0,
+) -> tuple[DownloadedMedia, ...]:
+    """Download a Spotify album/playlist via Dr_downloader_bot.
+
+    Flow
+    ----
+    1. Send the URL.  The bot replies with a GIF whose inline keyboard lists
+       every track (track-name buttons) plus a final "📥 دانلود همه آهنگ‌ها |
+       Download All" button.
+    2. Count all buttons except the last one → total expected tracks.
+    3. Click the Download All button.
+    4. Collect audio messages until the count reaches *total* or *track_timeout*
+       elapses without a new audio arriving.
+    5. Download all collected messages to *directory* and return DownloadedMedia.
+
+    Raises DrDownloaderError on any protocol mismatch or timeout.
+    """
+    async with BotEventStream(client, bot_username) as stream:
+        # ── baseline ──────────────────────────────────────────────────────────
+        latest = await client.get_messages(bot_username, limit=1)
+        if isinstance(latest, (list, tuple)):
+            latest = latest[0] if latest else None
+        baseline = int(getattr(latest, "id", 0) or 0)
+
+        sent = await client.send_message(bot_username, url)
+        sent_id = int(getattr(sent, "id", 0) or 0)
+        after_id = max(baseline, sent_id)
+
+        # ── Step 1: wait for the menu message (GIF + track buttons) ──────────
+        menu_message: Any = None
+        menu_deadline = time.monotonic() + wait_timeout
+        while time.monotonic() < menu_deadline:
+            item = await stream.get(menu_deadline - time.monotonic())
+            if item is None:
+                break
+            msg = item.message
+            if getattr(msg, "out", False):
+                continue
+            msg_id = int(getattr(msg, "id", 0) or 0)
+            if msg_id <= after_id:
+                continue
+            rows = getattr(msg, "buttons", None) or []
+            flat = [btn for row in rows for btn in row]
+            if flat:
+                menu_message = msg
+                break
+
+        if menu_message is None:
+            raise DrDownloaderError(
+                "Dr_downloader_bot did not send a track-list menu within the timeout"
+            )
+
+        # ── Step 2: count tracks and locate Download All button ───────────────
+        rows = getattr(menu_message, "buttons", None) or []
+        flat_buttons = [btn for row in rows for btn in row]
+        if len(flat_buttons) < 2:
+            raise DrDownloaderError(
+                f"Expected at least 2 buttons (tracks + Download All), got {len(flat_buttons)}"
+            )
+
+        last_btn_text = str(getattr(flat_buttons[-1], "text", "") or "").lower()
+        if not any(m in last_btn_text for m in DR_ALBUM_DOWNLOAD_ALL_MARKERS):
+            raise DrDownloaderError(
+                f"Last button does not look like Download All: {last_btn_text!r}"
+            )
+
+        total_tracks = len(flat_buttons) - 1
+        # Row / column of the last button in the keyboard
+        last_row_idx = len(rows) - 1
+        last_col_idx = len(rows[last_row_idx]) - 1
+
+        # ── Step 3: click Download All ────────────────────────────────────────
+        click_baseline = int(getattr(menu_message, "id", 0) or 0)
+        try:
+            await menu_message.click(last_row_idx, last_col_idx)
+        except Exception as exc:
+            raise DrDownloaderError(f"Could not click Download All button: {exc}") from exc
+
+        # ── Step 4: collect audio messages ────────────────────────────────────
+        received: list[Any] = []
+        next_track_deadline = time.monotonic() + track_timeout
+        overall_deadline = time.monotonic() + total_tracks * track_timeout + wait_timeout
+
+        while len(received) < total_tracks:
+            now = time.monotonic()
+            remaining = min(next_track_deadline - now, overall_deadline - now)
+            if remaining <= 0:
+                break
+            item = await stream.get(remaining)
+            if item is None:
+                break
+            msg = item.message
+            if getattr(msg, "out", False):
+                continue
+            msg_id = int(getattr(msg, "id", 0) or 0)
+            if msg_id <= click_baseline:
+                continue
+            kind = message_media_kind(msg)
+            if kind == MediaKind.AUDIO:
+                received.append(msg)
+                next_track_deadline = time.monotonic() + track_timeout
+                continue
+            if kind == MediaKind.DOCUMENT:
+                ext = Path(message_file_name(msg)).suffix.lower()
+                if ext in AUDIO_EXTENSIONS:
+                    received.append(msg)
+                    next_track_deadline = time.monotonic() + track_timeout
+
+        if not received:
+            raise DrDownloaderError("No audio tracks received from Dr_downloader_bot")
+
+        logger.info(
+            "Dr_downloader_bot: received %d/%d tracks for %s",
+            len(received),
+            total_tracks,
+            url,
+        )
+
+        # ── Step 5: download to disk ──────────────────────────────────────────
+        return await download_messages(received, directory, max_download_size, None)

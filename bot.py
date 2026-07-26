@@ -48,12 +48,14 @@ from telethon.sessions import StringSession
 
 from config import ConfigError, PROJECT_DIR, SETTINGS
 import users_db
+from gofile_upload import GofileError, GofileUploader
 from downloader import (
     AccountPool,
     AccountWorker,
     CooldownRegistry,
     DownloadedMedia,
     DownloaderGateway,
+    DrDownloaderError,
     GatewayResult,
     MediaKind,
     PoolUnavailable,
@@ -61,10 +63,11 @@ from downloader import (
     WorkerLease,
     cleanup_request_directory,
     create_attempt_directory,
+    request_dr_downloader_album,
 )
 from instagram_caption import InstagramCaptionError, fetch_instagram_caption
 from routing import Platform, all_providers, detect_platform, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
-from spotisaver import SpotisaverAlbumDownloader
+from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
 from youtube_search import (
     MAX_RESULTS as YOUTUBE_SEARCH_MAX_RESULTS,
     RESULTS_PER_PAGE as YOUTUBE_RESULTS_PER_PAGE,
@@ -183,6 +186,20 @@ MEMBERSHIP_CACHE: dict[int, float] = {}
 REEL_MUSIC_URLS: dict[str, tuple[str, float, int, int]] = {}
 REEL_MUSIC_TTL = 600  # 10 minutes
 ADMIN_USERNAME = "iR0nin"  # only this user can use /broadcast
+
+# gofile.io uploader — None when no tokens are configured
+GOFILE_UPLOADER: GofileUploader | None = (
+    GofileUploader(
+        list(SETTINGS.gofile_tokens),
+        proxy_url=(
+            f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+            if SETTINGS.use_proxy
+            else None
+        ),
+    )
+    if SETTINGS.gofile_tokens
+    else None
+)
 FEEDBACK_STICKER_IDS: tuple[str, ...] = ()
 SELECTION_REAPER_TASK: asyncio.Task[Any] | None = None
 HEALTH_SERVER: asyncio.AbstractServer | None = None
@@ -881,6 +898,13 @@ async def send_regular_file(
         await progress.upload(upload_file, size=item.size, label=upload_label)
 
 
+async def _gofile_delayed_delete(content_id: str, token: str | None) -> None:
+    """Delete a gofile.io content entry after the configured delay."""
+    await asyncio.sleep(SETTINGS.gofile_delete_delay)
+    if GOFILE_UPLOADER is not None:
+        await GOFILE_UPLOADER.delete(content_id, token)
+
+
 async def send_large_file(
     context: ContextTypes.DEFAULT_TYPE,
     status_message: Any,
@@ -892,6 +916,41 @@ async def send_large_file(
     bot_username: str | None = None,
     progress: ProgressReporter | None = None,
 ) -> None:
+    # ── Try gofile.io upload first ────────────────────────────────────────────
+    if GOFILE_UPLOADER is not None:
+        try:
+            if progress is not None:
+                await progress.update(40, "☁️ در حال آپلود روی فضای ابری…", "", force=True)
+            download_url, content_id, used_token = await GOFILE_UPLOADER.upload(item.path)
+
+            async def send_gofile_link() -> None:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=status_card(
+                        "☁️ فایل آماده دانلوده!",
+                        f"حجم: <b>{fmt_size(item.size)}</b>\n\n"
+                        "روی دکمه زیر بزن تا فایل رو دانلود کنی:",
+                        "لینک موقته و بعد از مدتی به‌صورت خودکار پاک می‌شه.",
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("☁️ دانلود فایل از gofile.io", url=download_url)]]
+                    ),
+                    reply_to_message_id=reply_to,
+                    disable_web_page_preview=True,
+                )
+
+            with contextlib.suppress(TelegramError):
+                await telegram_retry(send_gofile_link)
+            asyncio.create_task(
+                _gofile_delayed_delete(content_id, used_token),
+                name=f"gofile-del-{content_id[:8]}",
+            )
+            return
+        except Exception as exc:
+            logger.warning("gofile.io upload failed; falling back to parts: %s", exc)
+
+    # ── Fall back to part splitting ───────────────────────────────────────────
     total_parts = math.ceil(item.size / SETTINGS.max_file_size)
     for index in range(1, total_parts + 1):
         part = await asyncio.to_thread(create_file_part, item.path, SETTINGS.max_file_size, index)
@@ -924,41 +983,47 @@ async def send_large_file(
         finally:
             part.unlink(missing_ok=True)
 
+    # ── Send joining guide for ALL file types ─────────────────────────────────
     extension = item.path.suffix.lower()
-    if extension in {".mp4", ".zip"}:
-        if extension == ".mp4":
-            result_note = "در پایان، فایل ویدیویی <b>MP4</b> دانلود می‌شه و می‌تونی مستقیم پخشش کنی. 🎬"
-        else:
-            result_note = (
-                "در پایان، یک فایل <b>ZIP</b> دانلود می‌شه؛ بعدش می‌تونی خیلی راحت "
-                "با فایل‌منیجر گوشی Extractش کنی و آهنگ‌ها رو برداری. 🎵"
-                "بعضی وقت‌ها فایل‌منیجر گوشی برای Extract کردن آهنگ‌ها ارور می‌ده؛ اگه ارور داد از برنامه ZArchiver استفاده کن."
-            )
-        guide = status_card(
-            "🧩 حالا پارت‌ها رو به فایل اصلی تبدیل کن",
-            f"همه‌ی <b>{total_parts}</b> پارت رو کامل داخل پوشه‌ی Downloads گوشیت ذخیره کن و اسمشون رو تغییر نده.\n\n"
-            "بعد این کارها رو انجام بده:\n"
-            "1️⃣ سایت زیر رو باز کن.\n"
-            "2️⃣ همه‌ی پارت‌ها رو با هم انتخاب و Upload کن.\n"
-            "3️⃣ وقتی آماده شد، دکمه‌ی <b>Save</b> رو بزن و فایل نهایی رو دانلود کن.\n\n"
-            f"{result_note}",
-            "تا وقتی همه‌ی پارت‌ها کامل دانلود نشده‌ن، فایل نهایی ساخته نمی‌شه.",
+    if extension == ".mp4":
+        result_note = "در پایان، فایل ویدیویی <b>MP4</b> دانلود می‌شه و می‌تونی مستقیم پخشش کنی. 🎬"
+    elif extension == ".zip":
+        result_note = (
+            "در پایان، یک فایل <b>ZIP</b> دانلود می‌شه؛ بعدش می‌تونی خیلی راحت "
+            "با فایل‌منیجر گوشی Extractش کنی و آهنگ‌ها رو برداری. 🎵 "
+            "بعضی وقت‌ها فایل‌منیجر گوشی برای Extract کردن آهنگ‌ها ارور می‌ده؛ اگه ارور داد از برنامه ZArchiver استفاده کن."
+        )
+    elif extension in {".mp3", ".m4a", ".aac", ".opus", ".ogg", ".flac"}:
+        result_note = f"در پایان، فایل صوتی <b>{html_escape(extension)}</b> دانلود می‌شه. 🎵"
+    else:
+        ext_label = html_escape(extension) if extension else "اصلی"
+        result_note = f"در پایان، فایل با پسوند <b>{ext_label}</b> دانلود می‌شه."
+
+    guide = status_card(
+        "🧩 حالا پارت‌ها رو به فایل اصلی تبدیل کن",
+        f"همه‌ی <b>{total_parts}</b> پارت رو کامل داخل پوشه‌ی Downloads گوشیت ذخیره کن و اسمشون رو تغییر نده.\n\n"
+        "بعد این کارها رو انجام بده:\n"
+        "1️⃣ سایت زیر رو باز کن.\n"
+        "2️⃣ همه‌ی پارت‌ها رو با هم انتخاب و Upload کن.\n"
+        "3️⃣ وقتی آماده شد، دکمه‌ی <b>Save</b> رو بزن و فایل نهایی رو دانلود کن.\n\n"
+        f"{result_note}",
+        "تا وقتی همه‌ی پارت‌ها کامل دانلود نشده‌ن، فایل نهایی ساخته نمی‌شه.",
+    )
+
+    async def send_join_guide() -> None:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=guide,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🧩 اتصال پارت‌ها و دانلود فایل", url="https://www.toolsley.com/split.html")]]
+            ),
+            reply_to_message_id=reply_to,
+            disable_web_page_preview=True,
         )
 
-        async def send_join_guide() -> None:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=guide,
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("🧩 اتصال پارت‌ها و دانلود فایل", url="https://www.toolsley.com/split.html")]]
-                ),
-                reply_to_message_id=reply_to,
-                disable_web_page_preview=True,
-            )
-
-        with contextlib.suppress(TelegramError):
-            await telegram_retry(send_join_guide)
+    with contextlib.suppress(TelegramError):
+        await telegram_retry(send_join_guide)
 
 
 async def send_result_to_user(
@@ -1313,6 +1378,70 @@ async def _process_url(
     try:
         if is_spotify_collection:
             collection_label = "آلبوم" if spotify_collection_type == "album" else "پلی‌لیست"
+
+            # ── Attempt 1: Dr_downloader_bot (needs a Telethon account) ──────
+            if ACCOUNT_POOL.total > 0 and ACCOUNT_POOL.queue_length < SETTINGS.max_queue_size:
+                dr_lease: WorkerLease | None = None
+                dr_dir: Path | None = None
+                try:
+                    dr_lease = await asyncio.wait_for(ACCOUNT_POOL.acquire(), timeout=15.0)
+                    dr_dir = create_attempt_directory(
+                        SETTINGS.download_root, request_id, f"dr-{spotify_collection_type}"
+                    )
+                    await progress.update(
+                        5,
+                        f"🎵 دارم {collection_label} Spotify رو آماده می‌کنم…",
+                        "دریافت آهنگ‌ها…",
+                        force=True,
+                    )
+                    tracks_media = await request_dr_downloader_album(
+                        dr_lease.worker.client,
+                        SETTINGS.spotify_collection_primary_bot,
+                        url,
+                        dr_dir,
+                        wait_timeout=SETTINGS.wait_timeout,
+                        track_timeout=SETTINGS.wait_timeout,
+                        max_download_size=SETTINGS.max_download_size,
+                    )
+                    ACCOUNT_POOL.release(dr_lease)
+                    dr_lease = None
+                    await progress.update(
+                        82,
+                        f"🎵 دارم {collection_label} Spotify رو آماده می‌کنم…",
+                        "ساخت فایل ZIP…",
+                        force=True,
+                    )
+                    zip_path = dr_dir / f"{collection_label}.zip"
+                    await asyncio.to_thread(_zip_tracks, [m.path for m in tracks_media], zip_path)
+                    dr_media = DownloadedMedia(
+                        path=zip_path,
+                        kind=MediaKind.DOCUMENT,
+                        source_message_id=0,
+                        mime_type="application/zip",
+                        size=zip_path.stat().st_size,
+                    )
+                    await send_result_to_user(
+                        update,
+                        context,
+                        status_message,
+                        GatewayResult(status="ready", bot_username="", media=(dr_media,)),
+                        reply_to=reply_to,
+                        request_id=request_id,
+                        progress=progress,
+                    )
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Dr_downloader_bot collection failed for %s: %s", request_id, exc
+                    )
+                    if dr_lease is not None:
+                        ACCOUNT_POOL.release(dr_lease)
+                    if dr_dir is not None:
+                        cleanup_request_directory(dr_dir, SETTINGS.download_root)
+
+            # ── Attempt 2: Spotisaver website (no Telethon needed) ────────────
             attempt_directory = create_attempt_directory(
                 SETTINGS.download_root,
                 request_id,
@@ -1343,7 +1472,7 @@ async def _process_url(
                     update,
                     context,
                     status_message,
-                    GatewayResult(status="ready", bot_username="spotisaver.net", media=(collection_media,)),
+                    GatewayResult(status="ready", bot_username="", media=(collection_media,)),
                     reply_to=reply_to,
                     request_id=request_id,
                     progress=progress,
@@ -1354,7 +1483,7 @@ async def _process_url(
                         text=status_card(
                             "⚠️ چند ترک پیدا نشد",
                             f"{collection.downloaded_tracks} از {collection.total_tracks} ترک داخل ZIP قرار گرفت.",
-                            "بقیه‌ی ترک‌ها در منبع قابل دریافت نبودند.",
+                            "بقیه‌ی ترک‌ها قابل دریافت نبودند.",
                         ),
                         parse_mode=ParseMode.HTML,
                         reply_to_message_id=reply_to,
