@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && mkdir -p /tmp/mz-downloader \
     && chown -R appuser:appuser /app /tmp/mz-downloader
 
-COPY --chown=appuser:appuser bot.py config.py downloader.py routing.py instagram_caption.py spotisaver.py youtube_search.py users_db.py gofile_uploadv ./
+COPY --chown=appuser:appuser bot.py config.py downloader.py routing.py instagram_caption.py spotisaver.py youtube_search.py users_db.py ./
 
 USER appuser
 
