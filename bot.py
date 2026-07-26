@@ -48,7 +48,7 @@ from telethon.sessions import StringSession
 
 from config import ConfigError, PROJECT_DIR, SETTINGS
 import users_db
-from gofile_upload import GofileError, GofileUploader
+from google_drive_upload import GoogleDriveUploader
 from downloader import (
     AccountPool,
     AccountWorker,
@@ -187,17 +187,13 @@ REEL_MUSIC_URLS: dict[str, tuple[str, float, int, int]] = {}
 REEL_MUSIC_TTL = 600  # 10 minutes
 ADMIN_USERNAME = "iR0nin"  # only this user can use /broadcast
 
-# gofile.io uploader — None when no tokens are configured
-GOFILE_UPLOADER: GofileUploader | None = (
-    GofileUploader(
-        list(SETTINGS.gofile_tokens),
-        proxy_url=(
-            f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
-            if SETTINGS.use_proxy
-            else None
-        ),
+# Google Drive uploader — None when no service-account credential is configured
+GOOGLE_DRIVE_UPLOADER: GoogleDriveUploader | None = (
+    GoogleDriveUploader(
+        SETTINGS.google_drive_service_account_json,
+        folder_id=SETTINGS.google_drive_folder_id,
     )
-    if SETTINGS.gofile_tokens
+    if SETTINGS.google_drive_service_account_json
     else None
 )
 FEEDBACK_STICKER_IDS: tuple[str, ...] = ()
@@ -898,11 +894,11 @@ async def send_regular_file(
         await progress.upload(upload_file, size=item.size, label=upload_label)
 
 
-async def _gofile_delayed_delete(content_id: str, token: str | None) -> None:
-    """Delete a gofile.io content entry after the configured delay."""
-    await asyncio.sleep(SETTINGS.gofile_delete_delay)
-    if GOFILE_UPLOADER is not None:
-        await GOFILE_UPLOADER.delete(content_id, token)
+async def _google_drive_delayed_delete(file_id: str) -> None:
+    """Delete a Google Drive file after the configured delay."""
+    await asyncio.sleep(SETTINGS.google_drive_delete_delay)
+    if GOOGLE_DRIVE_UPLOADER is not None:
+        await GOOGLE_DRIVE_UPLOADER.delete(file_id)
 
 
 async def send_large_file(
@@ -916,14 +912,14 @@ async def send_large_file(
     bot_username: str | None = None,
     progress: ProgressReporter | None = None,
 ) -> None:
-    # ── Try gofile.io upload first ────────────────────────────────────────────
-    if GOFILE_UPLOADER is not None:
+    # ── Try Google Drive upload first ─────────────────────────────────────────
+    if GOOGLE_DRIVE_UPLOADER is not None:
         try:
             if progress is not None:
                 await progress.update(40, "☁️ در حال آپلود روی فضای ابری…", "", force=True)
-            download_url, content_id, used_token = await GOFILE_UPLOADER.upload(item.path)
+            download_url, file_id = await GOOGLE_DRIVE_UPLOADER.upload(item.path)
 
-            async def send_gofile_link() -> None:
+            async def send_google_drive_link() -> None:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=status_card(
@@ -934,21 +930,21 @@ async def send_large_file(
                     ),
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("☁️ دانلود فایل از gofile.io", url=download_url)]]
+                        [[InlineKeyboardButton("☁️ دانلود فایل از Google Drive", url=download_url)]]
                     ),
                     reply_to_message_id=reply_to,
                     disable_web_page_preview=True,
                 )
 
             with contextlib.suppress(TelegramError):
-                await telegram_retry(send_gofile_link)
+                await telegram_retry(send_google_drive_link)
             asyncio.create_task(
-                _gofile_delayed_delete(content_id, used_token),
-                name=f"gofile-del-{content_id[:8]}",
+                _google_drive_delayed_delete(file_id),
+                name=f"google-drive-del-{file_id[:8]}",
             )
             return
         except Exception as exc:
-            logger.warning("gofile.io upload failed; falling back to parts: %s", exc)
+            logger.warning("Google Drive upload failed; falling back to parts: %s", exc)
 
     # ── Fall back to part splitting ───────────────────────────────────────────
     total_parts = math.ceil(item.size / SETTINGS.max_file_size)

@@ -70,7 +70,28 @@ TIKTOK_DOWNLOADER_BOTS=download_it_bot,AllSavesBot
 
 Railway متغیر `PORT` را خودش می‌سازد. مسیر `/health` پس از اتصال حداقل یک اکانت، پاسخ 200 می‌دهد.
 
-`MAX_DOWNLOAD_SIZE_MB=0` فقط سقف داخلی برنامه را غیرفعال می‌کند. فایل بزرگ‌تر از `MAX_FILE_SIZE_MB` بخش‌بندی می‌شود، اما فضای دیسک/زمان اجرای Railway و محدودیت‌های Telegram و بات واسط همچنان واقعی هستند.
+`MAX_DOWNLOAD_SIZE_MB=0` فقط سقف داخلی برنامه را غیرفعال می‌کند. فایل بزرگ‌تر از `MAX_FILE_SIZE_MB` ابتدا به‌صورت resumable روی Google Drive آپلود می‌شود؛ اگر تنظیمات Drive ناقص باشد یا آپلود شکست بخورد، فایل بخش‌بندی می‌شود. فضای دیسک/زمان اجرای Railway و محدودیت‌های Telegram همچنان واقعی هستند.
+
+## راه‌اندازی Google Drive برای فایل‌های بزرگ
+
+برای جایگزینی Gofile، ربات از یک Google Cloud service account استفاده می‌کند. فایل موقت پس از مدت `GOOGLE_DRIVE_DELETE_DELAY_SECONDS` (پیش‌فرض یک ساعت) حذف می‌شود.
+
+1. وارد [Google Cloud Console](https://console.cloud.google.com/) شوید و یک Project بسازید یا Project موجود را انتخاب کنید.
+2. از بخش **APIs & Services → Library**، API با نام **Google Drive API** را فعال کنید.
+3. از بخش **IAM & Admin → Service Accounts** یک Service Account بسازید.
+4. از صفحه Service Account به بخش **Keys → Add key → Create new key → JSON** بروید و فایل JSON را دانلود کنید. این فایل را commit نکنید.
+5. در Google Drive یک پوشه برای فایل‌های موقت بسازید. پوشه را با ایمیل Service Account (فیلد `client_email` در JSON) به‌صورت **Editor** share کنید و ID پوشه را از URL آن بردارید:
+   `https://drive.google.com/drive/folders/<FOLDER_ID>`
+6. مقدار کامل JSON را به‌صورت یک خط در متغیر امن `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` و ID پوشه را در `GOOGLE_DRIVE_FOLDER_ID` قرار دهید. در Railway از **Project → Variables** استفاده کنید.
+7. `GOOGLE_DRIVE_DELETE_DELAY_SECONDS=3600` را نگه دارید یا در صورت نیاز تغییر دهید، سپس سرویس را redeploy/restart کنید.
+
+لینک فایل برای هر کسی که آن را داشته باشد قابل دانلود است، چون ربات برای هر فایل permission عمومیِ reader می‌سازد. بعد از پایان زمان تعیین‌شده، خود فایل از Drive حذف می‌شود. اگر سازمان شما ساخت لینک عمومی را ممنوع کرده باشد، آپلود شکست می‌خورد و ربات طبق رفتار قبلی فایل را به قطعات Telegram تقسیم می‌کند.
+
+نکات مهم:
+
+- فایل JSON، مقدار `client_email` و هر credential را در GitHub، چت یا لاگ عمومی قرار ندهید.
+- Service Account سهمیه و فضای Drive جداگانه دارد؛ برای فایل‌های موقت فضای کافی در نظر بگیرید.
+- اگر می‌خواهید فایل‌ها در Drive شخصی‌تان دیده شوند، پوشه را با Service Account share کنید؛ فایل‌ها مستقیماً در مالکیت حساب عادی شما ساخته نمی‌شوند.
 
 ## امنیت
 
