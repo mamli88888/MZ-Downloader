@@ -66,9 +66,10 @@ class Settings:
     proxy_type: str
     proxy_host: str
     proxy_port: int
-    google_drive_service_account_json: str
-    google_drive_folder_id: str
-    google_drive_delete_delay: float
+    gofile_tokens: tuple[str, ...]
+    gofile_delete_delay: float
+    cloudflare_worker_url: str
+    cloudflare_worker_access_key: str
 
 
 def _as_bool(value: str | None, default: bool) -> bool:
@@ -170,10 +171,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         "SPOTIFY_COLLECTION_PRIMARY_BOT", "Dr_downloader_bot"
     )
     music_finder_bot = bot_name("MUSIC_FINDER_BOT", "whatisthismusicbot")
-    google_drive_service_account_json = env.get(
-        "GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", ""
-    ).strip()
-    google_drive_folder_id = env.get("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+    gofile_raw = env.get("GOFILE_TOKENS", "").strip()
+    gofile_tokens = (
+        tuple(t.strip() for t in gofile_raw.split(",") if t.strip()) if gofile_raw else ()
+    )
     fallback_bots = tuple(
         dict.fromkeys(
             (
@@ -211,11 +212,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         spotify_collection_primary_bot=spotify_collection_primary_bot,
         fallback_bots=fallback_bots,
         music_finder_bot=music_finder_bot,
-        google_drive_service_account_json=google_drive_service_account_json,
-        google_drive_folder_id=google_drive_folder_id,
-        google_drive_delete_delay=_as_float(
-            env, "GOOGLE_DRIVE_DELETE_DELAY_SECONDS", 3600.0
-        ),
+        gofile_tokens=gofile_tokens,
+        gofile_delete_delay=_as_float(env, "GOFILE_DELETE_DELAY_SECONDS", 3600.0),
+        cloudflare_worker_url=env.get("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/"),
+        cloudflare_worker_access_key=env.get("CLOUDFLARE_WORKER_ACCESS_KEY", "").strip(),
         download_root=download_root,
         max_file_size=_as_int(env, "MAX_FILE_SIZE_MB", 30) * 1024 * 1024,
         # Zero disables the application-level source-size cap. Telegram upload

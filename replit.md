@@ -27,11 +27,13 @@ A multi-account Telegram media download bot. Users send links (YouTube, Instagra
 |---|---|
 | `BOT_TOKEN` | Telegram bot token from BotFather |
 | `TELEGRAM_ACCOUNTS` | JSON array of Telethon accounts with `api_id`, `api_hash`, `string_session` |
-| `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` | Google Cloud service-account JSON used for temporary large-file uploads |
+| `GOFILE_TOKENS` | Comma-separated Gofile API tokens used for large-file uploads |
+| `CLOUDFLARE_WORKER_URL` | Public Cloudflare Worker URL used as the download link |
+| `CLOUDFLARE_WORKER_ACCESS_KEY` | Shared secret checked by the Worker and the bot |
 
 See `.env.example` for the full list of optional configuration variables.
 
-Large files use Google Drive when the Drive variables are configured. Uploaded files receive a public download permission and are deleted after `GOOGLE_DRIVE_DELETE_DELAY_SECONDS`; otherwise the existing Telegram part-splitting fallback is used.
+Large files use Gofile through the Cloudflare Worker when the Gofile and Worker variables are configured. The bot deletes uploaded files after `GOFILE_DELETE_DELAY_SECONDS`; otherwise the existing Telegram part-splitting fallback is used.
 
 ## Running locally
 

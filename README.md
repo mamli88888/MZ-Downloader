@@ -70,28 +70,58 @@ TIKTOK_DOWNLOADER_BOTS=download_it_bot,AllSavesBot
 
 Railway متغیر `PORT` را خودش می‌سازد. مسیر `/health` پس از اتصال حداقل یک اکانت، پاسخ 200 می‌دهد.
 
-`MAX_DOWNLOAD_SIZE_MB=0` فقط سقف داخلی برنامه را غیرفعال می‌کند. فایل بزرگ‌تر از `MAX_FILE_SIZE_MB` ابتدا به‌صورت resumable روی Google Drive آپلود می‌شود؛ اگر تنظیمات Drive ناقص باشد یا آپلود شکست بخورد، فایل بخش‌بندی می‌شود. فضای دیسک/زمان اجرای Railway و محدودیت‌های Telegram همچنان واقعی هستند.
+`MAX_DOWNLOAD_SIZE_MB=0` فقط سقف داخلی برنامه را غیرفعال می‌کند. فایل بزرگ‌تر از `MAX_FILE_SIZE_MB` روی Gofile آپلود می‌شود و کاربر لینک Cloudflare Worker را می‌گیرد؛ اگر تنظیمات Gofile/Worker ناقص باشد یا آپلود شکست بخورد، فایل طبق رفتار قبلی بخش‌بندی می‌شود.
 
-## راه‌اندازی Google Drive برای فایل‌های بزرگ
+## راه‌اندازی Gofile با Cloudflare Worker
 
-ربات از یک Google Cloud service account برای آپلود فایل‌های بزرگ استفاده می‌کند. فایل موقت پس از مدت `GOOGLE_DRIVE_DELETE_DELAY_SECONDS` (پیش‌فرض یک ساعت) حذف می‌شود.
+در این روش Gofile همچنان فایل را نگه می‌دارد، اما کاربر هیچ لینک Gofile دریافت نمی‌کند. Worker از مسیر Cloudflare به Gofile وصل می‌شود، لینک مستقیم را می‌گیرد و فایل را به‌صورت streaming به کاربر برمی‌گرداند. حذف خودکار فایل از Gofile توسط خود ربات و پس از `GOFILE_DELETE_DELAY_SECONDS` انجام می‌شود.
 
-1. وارد [Google Cloud Console](https://console.cloud.google.com/) شوید و یک Project بسازید یا Project موجود را انتخاب کنید.
-2. از بخش **APIs & Services → Library**، API با نام **Google Drive API** را فعال کنید.
-3. از بخش **IAM & Admin → Service Accounts** یک Service Account بسازید.
-4. از صفحه Service Account به بخش **Keys → Add key → Create new key → JSON** بروید و فایل JSON را دانلود کنید. این فایل را commit نکنید.
-5. در Google Drive یک پوشه برای فایل‌های موقت بسازید. پوشه را با ایمیل Service Account (فیلد `client_email` در JSON) به‌صورت **Editor** share کنید و ID پوشه را از URL آن بردارید:
-   `https://drive.google.com/drive/folders/<FOLDER_ID>`
-6. مقدار کامل JSON را به‌صورت یک خط در متغیر امن `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` و ID پوشه را در `GOOGLE_DRIVE_FOLDER_ID` قرار دهید. در Railway از **Project → Variables** استفاده کنید.
-7. `GOOGLE_DRIVE_DELETE_DELAY_SECONDS=3600` را نگه دارید یا در صورت نیاز تغییر دهید، سپس سرویس را redeploy/restart کنید.
+### ۱) ساخت Worker
 
-لینک فایل برای هر کسی که آن را داشته باشد قابل دانلود است، چون ربات برای هر فایل permission عمومیِ reader می‌سازد. بعد از پایان زمان تعیین‌شده، خود فایل از Drive حذف می‌شود. اگر سازمان شما ساخت لینک عمومی را ممنوع کرده باشد، آپلود شکست می‌خورد و ربات طبق رفتار قبلی فایل را به قطعات Telegram تقسیم می‌کند.
+1. در Cloudflare یک حساب بسازید یا وارد شوید.
+2. از بخش **Workers & Pages → Create application → Create Worker** یک Worker بسازید.
+3. فایل `cloudflare_worker/src/index.js` همین repository را به‌عنوان کد Worker قرار دهید.
+4. در بخش **Settings → Variables and Secrets** این دو Secret را بسازید:
 
-نکات مهم:
+```text
+GOFILE_API_TOKEN=توکن API حساب Gofile
+WORKER_ACCESS_KEY=یک کلید تصادفی طولانی
+```
 
-- فایل JSON، مقدار `client_email` و هر credential را در GitHub، چت یا لاگ عمومی قرار ندهید.
-- Service Account سهمیه و فضای Drive جداگانه دارد؛ برای فایل‌های موقت فضای کافی در نظر بگیرید.
-- اگر می‌خواهید فایل‌ها در Drive شخصی‌تان دیده شوند، پوشه را با Service Account share کنید؛ فایل‌ها مستقیماً در مالکیت حساب عادی شما ساخته نمی‌شوند.
+برای ساخت کلید تصادفی می‌توانید از `openssl rand -hex 32` استفاده کنید. مقدار Secret را در GitHub یا چت قرار ندهید.
+
+5. Worker را Deploy کنید و URL آن را کپی کنید؛ معمولاً شبیه این است:
+   `https://mz-gofile-proxy.<account>.workers.dev`
+
+### ۲) تنظیم ربات
+
+در Railway یا Replit این متغیرها را تنظیم کنید:
+
+```text
+GOFILE_TOKENS=توکن-اول,توکن-دوم
+GOFILE_DELETE_DELAY_SECONDS=3600
+CLOUDFLARE_WORKER_URL=https://mz-gofile-proxy.example.workers.dev
+CLOUDFLARE_WORKER_ACCESS_KEY=همان-WORKER_ACCESS_KEY
+```
+
+`CLOUDFLARE_WORKER_ACCESS_KEY` باید دقیقاً با `WORKER_ACCESS_KEY` داخل Cloudflare یکی باشد. `CLOUDFLARE_WORKER_URL` را بدون `/` پایانی وارد کنید.
+
+### ۳) تنظیم حساب Gofile
+
+از حساب Gofile به صفحه Profile/API بروید و API token بسازید. API token را فقط در Secretهای Worker و متغیر `GOFILE_TOKENS` سرویس ربات قرار دهید. اگر چند token دارید، با کاما جدا کنید تا ربات بین آن‌ها چرخش کند.
+
+### رفتار حذف و خطا
+
+- ربات فایل را روی Gofile آپلود می‌کند.
+- لینک ارسالی به کاربر فقط `CLOUDFLARE_WORKER_URL/download/<contentId>` است.
+- Worker با token امن خودش لینک مستقیم Gofile را می‌گیرد و پاسخ را stream می‌کند؛ فایل روی Worker ذخیره نمی‌شود.
+- پس از زمان `GOFILE_DELETE_DELAY_SECONDS`، ربات فایل Gofile را حذف می‌کند و لینک دیگر کار نمی‌کند.
+- اگر Worker یا Gofile تنظیم نشده باشد، ربات به‌صورت خودکار به ارسال پارت‌های Telegram برمی‌گردد.
+- Worker برای هر درخواست کلید مشترک را بررسی می‌کند و از دسترسی تصادفی به شناسه فایل جلوگیری می‌شود.
+
+### تست نهایی
+
+یک فایل بزرگ‌تر از ۳۰ مگابایت بفرستید. باید پیام لینک دانلود با دامنه `workers.dev` دریافت کنید. لینک را بدون VPN/فیلترشکن در مرورگر باز کنید. سپس بعد از زمان تعیین‌شده، حذف فایل را با باز کردن دوباره لینک بررسی کنید.
 
 ## امنیت
 
