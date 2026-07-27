@@ -2627,9 +2627,9 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
 
                 # Special handling for @Musicfindmhdbot which requires a button click
                 if result.status == "needs_selection" and bot_username.lower() == "musicfindmhdbot":
-                    # Look for "شناسایی موزیک" button
+                    # Look for "شناسایی موسیقی" button
                     option = next(
-                        (opt for opt in result.options if "شناسایی موزیک" in opt.label),
+                        (opt for opt in result.options if "شناسایی موسیقی" in opt.label),
                         None
                     )
                     if option:
