@@ -2095,7 +2095,10 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    text = " ".join(context.args).strip() if context.args else ""
+    # Use the full text from the message to preserve newlines, excluding the command itself
+    raw_text = update.effective_message.text or ""
+    parts = raw_text.split(None, 1)
+    text = parts[1].strip() if len(parts) > 1 else ""
     if not text:
         await update.effective_message.reply_text(
             status_card(
