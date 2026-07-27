@@ -639,22 +639,27 @@ async def await_response_decision(
         if item is None:
             continue
         message = item.message
-        # If we are waiting for a button click result, ignore EDITS to previous messages.
-        # This prevents picking up the original video message when it's edited with new buttons.
-        effective_is_edit = item.is_edit
+        # CRITICAL FIX for @Musicfindmhdbot:
+        # If we just clicked a button, we must be extremely aggressive in picking up the NEXT message.
+        # We ignore all correlation checks (reply_to, etc.) because some bots send the result 
+        # as a completely new un-replied message.
         if expected_option is not None:
-            effective_is_edit = False
+            # Ignore edits entirely
             if item.is_edit:
                 continue
-
-        if not is_correlated_message(
-            message,
-            after_id=after_id,
-            reply_targets=targets,
-            is_edit=effective_is_edit,
-            allowed_edit_ids=allowed_edit_ids,
-        ):
-            continue
+            # Ignore messages without media (ads/text)
+            if kind == MediaKind.NONE:
+                continue
+        else:
+            # Normal correlation for non-button requests
+            if not is_correlated_message(
+                message,
+                after_id=after_id,
+                reply_targets=targets,
+                is_edit=item.is_edit,
+                allowed_edit_ids=allowed_edit_ids,
+            ):
+                continue
         if message_reply_to_id(message) in targets:
             correlation = "reply"
 
