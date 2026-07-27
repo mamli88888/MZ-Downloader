@@ -2643,7 +2643,6 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
                             option=option,
                             attempt_directory=attempt_directory,
                             progress_callback=progress.download,
-                            expected_kind_override=MediaKind.AUDIO,
                         )
 
                 if result.status == "ready":
