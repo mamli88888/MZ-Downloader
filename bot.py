@@ -2706,7 +2706,6 @@ async def post_init(application: Application) -> None:
         BotCommand("search", "جست‌وجو در YouTube"),
         BotCommand("cancel", "توقف دانلودهای من"),
         BotCommand("dl", "دانلود لینک"),
-        BotCommand("broadcast", "ارسال پیام همگانی (فقط ادمین)"),
     ]
     group_commands = [
         BotCommand("dl", "دانلود لینک یا پیام ریپلای‌شده"),
