@@ -48,7 +48,6 @@ from telethon.sessions import StringSession
 
 from config import ConfigError, PROJECT_DIR, SETTINGS
 import users_db
-from gofile_upload import GofileUploader, build_worker_url
 from pixeldrain_upload import PixeldrainUploader, build_pixeldrain_worker_url
 from downloader import (
     AccountPool,
@@ -198,19 +197,7 @@ PIXELDRAIN_UPLOADER = PixeldrainUploader(
     ),
 )
 
-# gofile.io uploader — None when no tokens are configured
-GOFILE_UPLOADER: GofileUploader | None = (
-    GofileUploader(
-        list(SETTINGS.gofile_tokens),
-        proxy_url=(
-            f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
-            if SETTINGS.use_proxy
-            else None
-        ),
-    )
-    if SETTINGS.gofile_tokens
-    else None
-)
+
 FEEDBACK_STICKER_IDS: tuple[str, ...] = ()
 SELECTION_REAPER_TASK: asyncio.Task[Any] | None = None
 HEALTH_SERVER: asyncio.AbstractServer | None = None
@@ -909,17 +896,12 @@ async def send_regular_file(
         await progress.upload(upload_file, size=item.size, label=upload_label)
 
 
-async def _gofile_delayed_delete(content_id: str, token: str | None) -> None:
-    """Delete a Gofile content entry after the configured delay."""
-    await asyncio.sleep(SETTINGS.gofile_delete_delay)
-    if GOFILE_UPLOADER is not None:
-        await GOFILE_UPLOADER.delete(content_id, token)
+
 
 
 async def _pixeldrain_delayed_delete(file_id: str) -> None:
     """Delete a Pixeldrain file after the configured delay."""
-    # We reuse the same delay as Gofile for consistency
-    await asyncio.sleep(SETTINGS.gofile_delete_delay)
+    await asyncio.sleep(SETTINGS.pixeldrain_delete_delay)
     if PIXELDRAIN_UPLOADER is not None:
         await PIXELDRAIN_UPLOADER.delete(file_id)
 
@@ -972,43 +954,7 @@ async def send_large_file(
             )
             return
         except Exception as exc:
-            logger.warning("Pixeldrain upload failed; falling back to Gofile or parts: %s", exc)
-
-    # ── Try Gofile upload through the Cloudflare Worker ───────────────────────
-    if GOFILE_UPLOADER is not None and SETTINGS.cloudflare_worker_url:
-        try:
-            if progress is not None:
-                await progress.update(45, "☁️ در حال آپلود روی Gofile…", "", force=True)
-            _, content_id, folder_id, used_token = await GOFILE_UPLOADER.upload(item.path)
-            # Use direct Gofile link since worker proxying for free Gofile is broken
-            download_url = f"https://gofile.io/d/{content_id}"
-
-            async def send_gofile_link() -> None:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=status_card(
-                        "☁️ فایل آماده دانلوده! (Gofile)",
-                        f"حجم: <b>{fmt_size(item.size)}</b>\n\n"
-                        "روی دکمه زیر بزن تا فایل رو دانلود کنی:",
-                        "نکته: برای باز کردن لینک Gofile ممکن است به فیلترشکن نیاز داشته باشید.",
-                    ),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("☁️ دانلود از Gofile", url=download_url)]]
-                    ),
-                    reply_to_message_id=reply_to,
-                    disable_web_page_preview=True,
-                )
-
-            with contextlib.suppress(TelegramError):
-                await telegram_retry(send_gofile_link)
-            asyncio.create_task(
-                _gofile_delayed_delete(content_id, used_token),
-                name=f"gofile-del-{content_id[:8]}",
-            )
-            return
-        except Exception as exc:
-            logger.warning("Gofile upload failed; falling back to parts: %s", exc)
+            logger.warning("Pixeldrain upload failed; falling back to parts: %s", exc)
 
     # ── Fall back to part splitting ───────────────────────────────────────────
     total_parts = math.ceil(item.size / SETTINGS.max_file_size)
