@@ -78,7 +78,7 @@ class GofileUploader:
                 raise GofileError(f"Gofile response missing file ID: {data}")
             if not folder_id:
                 raise GofileError(f"Gofile response missing folder ID: {data}")
-            return f"https://gofile.io/d/{quote(folder_id)}", content_id, folder_id, token
+            return f"https://gofile.io/d/{quote(content_id)}", content_id, folder_id, token
 
     async def delete(self, content_id: str, token: str | None) -> None:
         """Delete a Gofile content entry (best effort)."""
