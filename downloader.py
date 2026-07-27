@@ -193,7 +193,7 @@ QUALITY_PATTERN = re.compile(
 RESOLUTION_PATTERN = re.compile(r"\b(\d{3,4})p(?:\d{2,3})?\b", re.IGNORECASE)
 BITRATE_PATTERN = re.compile(r"\b(\d{2,3})\s*kbps\b", re.IGNORECASE)
 AUDIO_PATTERN = re.compile(
-    r"\b(?:mp3|m4a|aac|opus|ogg|audio|music|\d{2,3}\s*kbps)\b",
+    r"\b(?:mp3|m4a|aac|opus|ogg|audio|music|voice|\d{2,3}\s*kbps)\b",
     re.IGNORECASE,
 )
 DENIED_BUTTON_TEXT = {
@@ -702,6 +702,12 @@ async def await_response_decision(
                 )
             if _contains_marker(text, ERROR_MARKERS):
                 return ResponseDecision(status="error", reason="service_rejected")
+            
+            # If we clicked a button, ignore text-only messages (likely ads or progress)
+            # unless we specifically asked for a caption.
+            if expected_option is not None and expected_option.action != "caption":
+                continue
+
             if (
                 expected_option is not None
                 and expected_option.action == "caption"
