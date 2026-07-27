@@ -39,38 +39,85 @@ function findUrl(value) {
   return "";
 }
 
-async function getGofileDirectLink(contentId, token) {
+async function getWebToken() {
+  const response = await fetch("https://gofile.io/dist/js/global.js");
+  if (!response.ok) {
+    throw new Error(`Gofile global.js returned ${response.status}`);
+  }
+  const script = await response.text();
+  const match = script.match(/appdata\.wt\s*=\s*['"]([^'"]+)['"]/);
+  if (!match) {
+    throw new Error("Gofile web token was not found");
+  }
+  return match[1];
+}
+
+function gofileTokens(env) {
+  return String(env.GOFILE_API_TOKENS || env.GOFILE_API_TOKEN || "")
+    .split(",")
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+async function getFileLink(folderId, fileId, token, wt) {
+  const params = new URLSearchParams({
+    wt,
+    contentFilter: "",
+    page: "1",
+    pageSize: "1000",
+    sortField: "createTime",
+    sortDirection: "-1",
+  });
   const response = await fetch(
-    `https://api.gofile.io/contents/${encodeURIComponent(contentId)}/directlinks`,
+    `https://api.gofile.io/contents/${encodeURIComponent(folderId)}?${params}`,
     {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({}),
+      headers: { Authorization: `Bearer ${token}` },
     },
   );
   if (!response.ok) {
-    throw new Error(`Gofile direct-link API returned ${response.status}`);
+    throw new Error(`Gofile contents API returned ${response.status}`);
   }
   const payload = await response.json();
-  const directLink = findUrl(payload);
-  if (!directLink) {
-    throw new Error("Gofile response did not include a direct link");
+  if (payload.status && payload.status !== "ok") {
+    throw new Error(`Gofile contents API returned ${payload.status}`);
   }
-  return directLink;
+  const children = payload.data?.children;
+  if (!children || typeof children !== "object") {
+    throw new Error("Gofile folder response has no children");
+  }
+  const child = children[fileId] ||
+    Object.values(children).find((item) => item?.id === fileId);
+  const link = child?.link || child?.directLink || child?.downloadUrl;
+  if (!link) {
+    throw new Error("Gofile file link was not found in folder contents");
+  }
+  return link;
+}
+
+async function getGofileDirectLink(folderId, fileId, env) {
+  const tokens = gofileTokens(env);
+  if (!tokens.length) throw new Error("No Gofile API token configured");
+  const wt = await getWebToken();
+  let lastError;
+  for (const token of tokens) {
+    try {
+      return await getFileLink(folderId, fileId, token, wt);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("Gofile file lookup failed");
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const match = url.pathname.match(/^\/download\/([^/]+)$/);
+    const match = url.pathname.match(/^\/download\/([^/]+)\/([^/]+)$/);
     if (request.method !== "GET" || !match) {
       return json({ error: "Not found" }, 404);
     }
 
-    if (!env.GOFILE_API_TOKEN) {
+    if (!gofileTokens(env).length) {
       return json({ error: "Worker is not configured" }, 500);
     }
     if (
@@ -81,7 +128,7 @@ export default {
     }
 
     try {
-      const directLink = await getGofileDirectLink(match[1], env.GOFILE_API_TOKEN);
+      const directLink = await getGofileDirectLink(match[1], match[2], env);
       const upstream = await fetch(directLink, {
         headers: {
           Range: request.headers.get("Range") || "",

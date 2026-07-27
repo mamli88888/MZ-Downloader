@@ -113,7 +113,7 @@ CLOUDFLARE_WORKER_ACCESS_KEY=همان-WORKER_ACCESS_KEY
 ### رفتار حذف و خطا
 
 - ربات فایل را روی Gofile آپلود می‌کند.
-- لینک ارسالی به کاربر فقط `CLOUDFLARE_WORKER_URL/download/<contentId>` است.
+- لینک ارسالی به کاربر فقط `CLOUDFLARE_WORKER_URL/download/<folderId>/<fileId>` است.
 - Worker با token امن خودش لینک مستقیم Gofile را می‌گیرد و پاسخ را stream می‌کند؛ فایل روی Worker ذخیره نمی‌شود.
 - پس از زمان `GOFILE_DELETE_DELAY_SECONDS`، ربات فایل Gofile را حذف می‌کند و لینک دیگر کار نمی‌کند.
 - اگر Worker یا Gofile تنظیم نشده باشد، ربات به‌صورت خودکار به ارسال پارت‌های Telegram برمی‌گردد.

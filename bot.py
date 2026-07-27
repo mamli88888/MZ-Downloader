@@ -921,9 +921,10 @@ async def send_large_file(
         try:
             if progress is not None:
                 await progress.update(40, "☁️ در حال آپلود روی فضای ابری…", "", force=True)
-            _, content_id, used_token = await GOFILE_UPLOADER.upload(item.path)
+            _, content_id, folder_id, used_token = await GOFILE_UPLOADER.upload(item.path)
             download_url = build_worker_url(
                 SETTINGS.cloudflare_worker_url,
+                folder_id,
                 content_id,
                 SETTINGS.cloudflare_worker_access_key,
             )
