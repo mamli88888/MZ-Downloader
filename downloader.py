@@ -1086,6 +1086,7 @@ class DownloaderGateway:
         option: QualityOption,
         attempt_directory: Path,
         progress_callback: ProgressCallback | None = None,
+        expected_kind_override: MediaKind | None = None,
     ) -> GatewayResult:
         if self.cooldowns.remaining(worker_name, bot_username) > 0:
             return GatewayResult(status="error", bot_username=bot_username, reason="cooldown")
@@ -1117,7 +1118,7 @@ class DownloaderGateway:
                     timeout=self.wait_timeout,
                     preview_grace=self.preview_grace,
                     album_window=self.album_window,
-                    expected_kind=option.expected_kind,
+                    expected_kind=expected_kind_override or option.expected_kind,
                     expected_option=option,
                     allowed_edit_ids={menu_message_id},
                 )
