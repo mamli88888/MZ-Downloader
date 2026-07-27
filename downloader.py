@@ -734,7 +734,7 @@ async def await_response_decision(
 
         if kind == MediaKind.PHOTO:
             # A photo may be the real result or a preview for a later quality menu/file.
-            if expected_kind is not None:
+            if expected_kind is not None and expected_option is None:
                 continue
             if candidate_group_id is not None:
                 continue
@@ -743,6 +743,13 @@ async def await_response_decision(
             # response has been quiet for the collection window.
             candidates[message_id] = message
             candidate_deadline = time.monotonic() + max(preview_grace, album_window)
+            continue
+
+        # If we are waiting for a specific button click result, 
+        # we want to capture the absolute latest message that matches.
+        if expected_option is not None:
+            candidates[message_id] = message
+            candidate_deadline = time.monotonic() + album_window
             continue
 
         return ResponseDecision(
