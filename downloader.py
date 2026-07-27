@@ -639,11 +639,19 @@ async def await_response_decision(
         if item is None:
             continue
         message = item.message
+        # If we are waiting for a button click result, ignore EDITS to previous messages.
+        # This prevents picking up the original video message when it's edited with new buttons.
+        effective_is_edit = item.is_edit
+        if expected_option is not None:
+            effective_is_edit = False
+            if item.is_edit:
+                continue
+
         if not is_correlated_message(
             message,
             after_id=after_id,
             reply_targets=targets,
-            is_edit=item.is_edit,
+            is_edit=effective_is_edit,
             allowed_edit_ids=allowed_edit_ids,
         ):
             continue
