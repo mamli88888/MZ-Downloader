@@ -916,6 +916,14 @@ async def _gofile_delayed_delete(content_id: str, token: str | None) -> None:
         await GOFILE_UPLOADER.delete(content_id, token)
 
 
+async def _pixeldrain_delayed_delete(file_id: str) -> None:
+    """Delete a Pixeldrain file after the configured delay."""
+    # We reuse the same delay as Gofile for consistency
+    await asyncio.sleep(SETTINGS.gofile_delete_delay)
+    if PIXELDRAIN_UPLOADER is not None:
+        await PIXELDRAIN_UPLOADER.delete(file_id)
+
+
 async def send_large_file(
     context: ContextTypes.DEFAULT_TYPE,
     status_message: Any,
@@ -927,18 +935,15 @@ async def send_large_file(
     bot_username: str | None = None,
     progress: ProgressReporter | None = None,
 ) -> None:
-    # ── Try Pixeldrain upload through the Cloudflare Worker ───────────────────
-    if PIXELDRAIN_UPLOADER is not None and SETTINGS.cloudflare_worker_url:
+    # ── Try Pixeldrain upload (Direct Link) ───────────────────────────────────
+    if PIXELDRAIN_UPLOADER is not None:
         try:
             if progress is not None:
                 await progress.update(40, "☁️ در حال آپلود روی فضای ابری…", "", force=True)
             
             file_id = await PIXELDRAIN_UPLOADER.upload(item.path)
-            download_url = build_pixeldrain_worker_url(
-                SETTINGS.cloudflare_worker_url,
-                file_id,
-                SETTINGS.cloudflare_worker_access_key,
-            )
+            # Direct link to Pixeldrain download page
+            download_url = f"https://pixeldrain.com/u/{file_id}"
 
             async def send_pixeldrain_link() -> None:
                 await context.bot.send_message(
@@ -959,9 +964,15 @@ async def send_large_file(
 
             with contextlib.suppress(TelegramError):
                 await telegram_retry(send_pixeldrain_link)
+            
+            # Start delayed delete task
+            asyncio.create_task(
+                _pixeldrain_delayed_delete(file_id),
+                name=f"pixeldrain-del-{file_id[:8]}",
+            )
             return
         except Exception as exc:
-            logger.warning("Pixeldrain/Cloudflare upload failed; falling back to Gofile or parts: %s", exc)
+            logger.warning("Pixeldrain upload failed; falling back to Gofile or parts: %s", exc)
 
     # ── Try Gofile upload through the Cloudflare Worker ───────────────────────
     if GOFILE_UPLOADER is not None and SETTINGS.cloudflare_worker_url:
