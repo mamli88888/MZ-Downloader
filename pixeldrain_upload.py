@@ -52,6 +52,33 @@ class PixeldrainUploader:
                 
             return data.get("id")
 
+    async def delete(self, file_id: str) -> None:
+        """Delete a Pixeldrain file (best effort)."""
+        if not file_id:
+            return
+        
+        auth = None
+        if self.api_key:
+            auth = ("", self.api_key)
+
+        try:
+            async with httpx.AsyncClient(
+                proxy=self.proxy_url,
+                timeout=httpx.Timeout(30.0, connect=10.0),
+            ) as client:
+                response = await client.delete(
+                    f"{PIXELDRAIN_API}/file/{file_id}",
+                    auth=auth,
+                )
+                if response.status_code not in {200, 204, 404}:
+                    logger.warning(
+                        "Pixeldrain DELETE %s returned %s",
+                        file_id,
+                        response.status_code,
+                    )
+        except Exception as exc:
+            logger.warning("Pixeldrain delete failed for %s: %s", file_id, exc)
+
 def build_pixeldrain_worker_url(
     worker_url: str,
     file_id: str,
