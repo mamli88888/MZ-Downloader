@@ -1134,48 +1134,56 @@ class DownloaderGateway:
             if current is None:
                 return GatewayResult(status="error", bot_username=bot_username, reason="menu_changed")
 
-            # Click the button
-            await menu.click(option.row, option.column)
-            
-            # Special logic for @Musicfindmhdbot: Wait a bit and check the last 3 messages
-            # as requested by the user to avoid complex correlation issues.
-            await asyncio.sleep(5.0) # Give the bot some time to respond/edit
-            
-            # Fetch the last 3 messages in the chat
-            last_messages = await client.get_messages(bot_username, limit=3)
-            
-            target_message = None
-            for msg in last_messages:
-                kind = message_media_kind(msg)
-                # We want anything that is NOT a video, NOT a photo (unless it's the only thing), 
-                # and NOT empty text. Primarily we want Audio or Document (m4a/mp3).
-                if kind in {MediaKind.AUDIO, MediaKind.DOCUMENT}:
-                    target_message = msg
-                    break
-            
-            if not target_message:
-                # Fallback to the original decision logic if the "last 3" didn't find a clear audio file
-                async with BotEventStream(client, bot_username) as stream:
-                    decision = await await_response_decision(
-                        stream,
-                        after_id=menu_message_id,
-                        reply_targets={request_message_id, menu_message_id},
-                        timeout=10.0, # Shorter timeout for fallback
-                        preview_grace=self.preview_grace,
-                        album_window=self.album_window,
-                        expected_kind=expected_kind_override or option.expected_kind,
-                        expected_option=option,
-                        allowed_edit_ids={menu_message_id},
-                    )
-                if decision.status != "media":
-                    self.cooldowns.mark_timeout(worker_name, bot_username)
-                    return GatewayResult(status="error", bot_username=bot_username, reason="last_3_failed")
-                target_messages = decision.messages
-            else:
-                target_messages = (target_message,)
-
+            async with BotEventStream(client, bot_username) as stream:
+                baseline = await self._latest_message_id(client, bot_username)
+                await menu.click(option.row, option.column)
+                decision = await await_response_decision(
+                    stream,
+                    after_id=max(baseline, menu_message_id),
+                    reply_targets={request_message_id, menu_message_id},
+                    timeout=self.wait_timeout,
+                    preview_grace=self.preview_grace,
+                    album_window=self.album_window,
+                    expected_kind=expected_kind_override or option.expected_kind,
+                    expected_option=option,
+                    allowed_edit_ids={menu_message_id},
+                )
+            if decision.status == "timeout":
+                self.cooldowns.mark_timeout(worker_name, bot_username)
+                return GatewayResult(status="error", bot_username=bot_username, reason="timeout")
+            if decision.status == "text":
+                self.cooldowns.clear(worker_name, bot_username)
+                return GatewayResult(
+                    status="text",
+                    bot_username=bot_username,
+                    text=decision.text,
+                    request_message_id=request_message_id,
+                    menu_message_id=menu_message_id,
+                    correlation=decision.correlation,
+                )
+            if decision.status == "external_url":
+                media = await download_trusted_external_media(
+                    decision.external_url,
+                    attempt_directory,
+                    self.max_download_size,
+                    option.expected_kind,
+                    self.http_proxy_url,
+                    progress_callback,
+                )
+                self.cooldowns.clear(worker_name, bot_username)
+                return GatewayResult(
+                    status="ready",
+                    bot_username=bot_username,
+                    media=media,
+                    request_message_id=request_message_id,
+                    menu_message_id=menu_message_id,
+                    correlation=decision.correlation,
+                )
+            if decision.status != "media":
+                self.cooldowns.mark_timeout(worker_name, bot_username)
+                return GatewayResult(status="error", bot_username=bot_username, reason=decision.reason or "invalid_output")
             media = await download_messages(
-                target_messages,
+                decision.messages,
                 attempt_directory,
                 self.max_download_size,
                 progress_callback,
