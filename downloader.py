@@ -307,7 +307,7 @@ def extract_quality_options(message: Any) -> tuple[QualityOption, ...]:
                     )
                 )
                 continue
-            if not QUALITY_PATTERN.search(label) and "شناسایی موزیک" not in label:
+            if not QUALITY_PATTERN.search(label) and "شناسایی موسیقی" not in label:
                 continue
             expected = MediaKind.AUDIO if AUDIO_PATTERN.search(label) else MediaKind.VIDEO
             resolution_match = RESOLUTION_PATTERN.search(label)
