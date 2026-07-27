@@ -66,10 +66,7 @@ class Settings:
     proxy_type: str
     proxy_host: str
     proxy_port: int
-    gofile_tokens: tuple[str, ...]
-    gofile_delete_delay: float
-    cloudflare_worker_url: str
-    cloudflare_worker_access_key: str
+    pixeldrain_delete_delay: float
     pixeldrain_api_key: str | None
 
 
@@ -172,10 +169,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         "SPOTIFY_COLLECTION_PRIMARY_BOT", "Dr_downloader_bot"
     )
     music_finder_bot = bot_name("MUSIC_FINDER_BOT", "whatisthismusicbot")
-    gofile_raw = env.get("GOFILE_TOKENS", "").strip()
-    gofile_tokens = (
-        tuple(t.strip() for t in gofile_raw.split(",") if t.strip()) if gofile_raw else ()
-    )
+
     fallback_bots = tuple(
         dict.fromkeys(
             (
@@ -213,10 +207,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         spotify_collection_primary_bot=spotify_collection_primary_bot,
         fallback_bots=fallback_bots,
         music_finder_bot=music_finder_bot,
-        gofile_tokens=gofile_tokens,
-        gofile_delete_delay=_as_float(env, "GOFILE_DELETE_DELAY_SECONDS", 3600.0),
-        cloudflare_worker_url=env.get("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/"),
-        cloudflare_worker_access_key=env.get("CLOUDFLARE_WORKER_ACCESS_KEY", "").strip(),
+        pixeldrain_delete_delay=_as_float(env, "PIXELDRAIN_DELETE_DELAY_SECONDS", 3600.0),
         pixeldrain_api_key=env.get("PIXELDRAIN_API_KEY", "").strip() or None,
         download_root=download_root,
         max_file_size=_as_int(env, "MAX_FILE_SIZE_MB", 30) * 1024 * 1024,
