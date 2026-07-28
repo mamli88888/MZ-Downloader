@@ -168,7 +168,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     spotify_collection_primary_bot = bot_name(
         "SPOTIFY_COLLECTION_PRIMARY_BOT", "Dr_downloader_bot"
     )
-    music_finder_bots = bot_list("MUSIC_FINDER_BOTS", "NextSaverBot,whatisthismusicbot")
+    music_finder_bots = bot_list("MUSIC_FINDER_BOTS", "whatisthismusicbot")
 
     fallback_bots = tuple(
         dict.fromkeys(

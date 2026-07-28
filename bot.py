@@ -2370,18 +2370,6 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     query = update.callback_query
     data = query.data or ""
     
-    if data.startswith("wrong_song:"):
-        await query.answer("🔄 دارم لینک مستقیم رو برای ربات دوم می‌فرستم…")
-        parts = data.split(":")
-        request_id = parts[1]
-        url = ":".join(parts[2:])
-        
-        # Directly trigger the second bot search
-        context.application.create_task(
-            on_reel_music_callback(update, context, force_url=url, force_request_id=request_id, force_second_bot=True)
-        )
-        return
-
     if not (
         data.startswith("sel:")
         or data.startswith("cancel:")
@@ -2563,7 +2551,7 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @membership_required
-async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, force_url: str = None, force_request_id: str = None, force_second_bot: bool = False) -> None:
+async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, force_url: str = None, force_request_id: str = None) -> None:
     """Handle 🎵 موزیک ریلز button presses."""
     query = update.callback_query
     data = query.data or ""
@@ -2630,11 +2618,7 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
             timeout=SETTINGS.worker_acquire_timeout,
         )
 
-        bots_to_try = SETTINGS.music_finder_bots
-        if force_second_bot and len(bots_to_try) > 1:
-            bots_to_try = bots_to_try[1:] # Skip @Musicfindmhdbot
-
-        for bot_username in bots_to_try:
+        for bot_username in SETTINGS.music_finder_bots:
             try:
                 attempt_directory = create_attempt_directory(
                     SETTINGS.download_root,
@@ -2647,7 +2631,6 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
                     force=True,
                 )
 
-                is_nextsaver = bot_username.lower() == "nextsaverbot"
                 result = await GATEWAY.request(
                     client=lease.worker.client,
                     worker_name=lease.worker.name,
@@ -2656,54 +2639,9 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
                     attempt_directory=attempt_directory,
                     progress_callback=progress.download,
                     expected_kind_override=MediaKind.AUDIO,
-                    # NextSaverBot uses non-standard button labels; accept any button as a menu trigger
-                    accept_any_button=is_nextsaver,
                 )
 
-                # Step 1: Identify with @NextSaverBot
-                if is_nextsaver:
-                    # Step 1.1: The bot sends a video with a single button (any label, e.g. emoji)
-                    if result.status == "needs_selection" and result.options:
-                        await progress.update(30, "🔍 دارم درخواست شناسایی رو می‌فرستم…", force=True)
-                        result = await GATEWAY.select(
-                            client=lease.worker.client,
-                            worker_name=lease.worker.name,
-                            bot_username=bot_username,
-                            request_message_id=result.request_message_id,
-                            menu_message_id=result.menu_message_id,
-                            option=result.options[0],  # The only button
-                            attempt_directory=attempt_directory,
-                            progress_callback=progress.download,
-                            # After click, bot sends a second menu (image + "1","2","3" buttons)
-                            accept_any_button=True,
-                            # Do not download the cover: wait for the delayed button
-                            # update, then choose the numbered result menu.
-                            wait_for_followup_menu=True,
-                        )
-                        
-                        # Step 1.2: After clicking, it sends an image with multiple buttons (1, 2, 3...)
-                        if result.status == "needs_selection" and result.options:
-                            # Find the button with text "1"
-                            option_1 = next((opt for opt in result.options if opt.label.strip() == "1"), None)
-                            if option_1:
-                                await progress.update(60, "⬇️ دارم آهنگ رو استخراج می‌کنم…", force=True)
-                                result = await GATEWAY.select(
-                                    client=lease.worker.client,
-                                    worker_name=lease.worker.name,
-                                    bot_username=bot_username,
-                                    request_message_id=result.request_message_id,
-                                    menu_message_id=result.menu_message_id,
-                                    option=option_1,
-                                    attempt_directory=attempt_directory,
-                                    progress_callback=progress.download,
-                                    expected_kind_override=MediaKind.AUDIO,
-                                )
-
                 if result.status == "ready":
-                    # Add "Wrong song" button
-                    wrong_song_markup = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("❌ آهنگ اشتباهه، دانلود دوباره", callback_data=f"wrong_song:{request_id}:{url}")
-                    ]]) if bot_username.lower() == "nextsaverbot" else None
                     await send_result_to_user(
                         update,
                         context,
@@ -2712,7 +2650,6 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
                         reply_to=reply_to,
                         request_id=request_id,
                         progress=progress,
-                        extra_markup=wrong_song_markup
                     )
                     return
 
