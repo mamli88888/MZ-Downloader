@@ -2011,6 +2011,7 @@ WELCOME_PRIVATE = status_card(
     "🎧 آهنگ تکی، آلبوم و پلی‌لیست ZIP\n"
     "📸 کپشن پست‌های Instagram\n"
     "🖼 پیش‌نمایش، فقط صدا و دانلود چندتایی\n"
+    "🎶 تشخیص موزیک ریلز اینستاگرام\n"
     "📦 ارسال مرتب عکس‌ها به‌صورت پک",
     "برای جست‌وجو عبارت را بنویس یا /search را بزن • راهنما: /help",
 )
@@ -2156,6 +2157,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• <code>/dl لینک</code>\n"
         "• ریپلای روی پیام لینک‌دار و ارسال <code>/dl</code>\n"
         "• منشن ربات در کنار لینک\n\n"
+        "• برای افزودن بات به گروه روی پروفایل بات بزن و گزینه Add to Group or Channel رو بزن و گروه موردنظرت رو انتخاب کن؛ بعدش بات رو به‌عنوان ادمین به گروه اضافه کن.\n\n"
         "<b>فرمان‌ها</b>\n"
         "<code>/search عبارت</code> جست‌وجوی YouTube\n"
         "<code>/cancel</code> توقف دانلودهای خودت\n"
@@ -2164,7 +2166,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<code>/stats</code> آمار همین اجرا\n\n"
         "<code>/caption لینک</code> فقط کپشن Instagram رو می‌فرسته.\n\n"
         "توی منوی ویدیو هم می‌تونی بهترین کیفیت، فقط صدا یا کپشن رو انتخاب کنی.\n\n"
-        f"فایل‌های بزرگ‌تر از {max_mb} مگابایت به بخش‌های <code>.part</code> تقسیم می‌شن.",
+        f"فایل‌های بزرگ‌تر از {max_mb} مگابایت در فضای ابری آپلود می‌شن و لینک دانلود برات ارسال می‌شه.",
         "محدودیت داخلی حجم دانلود خاموشه؛ محدودیت‌های فنی Telegram و فضای سرور همچنان وجود دارن.",
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -2627,7 +2629,7 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 await progress.update(
                     10,
-                    f"🎵 دارم آهنگ رو از ربات @{bot_username} دریافت می‌کنم…",
+                    f"🎵 دارم آهنگ رو دریات دریافت می‌کنم…",
                     force=True,
                 )
 
@@ -2728,7 +2730,6 @@ async def post_init(application: Application) -> None:
         BotCommand("search", "جست‌وجو در YouTube"),
         BotCommand("cancel", "توقف دانلودهای من"),
         BotCommand("dl", "دانلود لینک"),
-        BotCommand("broadcast", "ارسال پیام همگانی (فقط ادمین)"),
     ]
     group_commands = [
         BotCommand("dl", "دانلود لینک یا پیام ریپلای‌شده"),
