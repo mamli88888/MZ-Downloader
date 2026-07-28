@@ -2676,6 +2676,9 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
                             progress_callback=progress.download,
                             # After click, bot sends a second menu (image + "1","2","3" buttons)
                             accept_any_button=True,
+                            # Do not download the cover: wait for the delayed button
+                            # update, then choose the numbered result menu.
+                            wait_for_followup_menu=True,
                         )
                         
                         # Step 1.2: After clicking, it sends an image with multiple buttons (1, 2, 3...)

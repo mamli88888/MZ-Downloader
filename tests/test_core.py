@@ -299,6 +299,37 @@ class ClassificationTests(unittest.TestCase):
 
 
 class DecisionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_nextsaver_cover_waits_for_delayed_numbered_menu(self) -> None:
+        cover = FakeMessage(101, kind=MediaKind.PHOTO)
+        numbered_cover = FakeMessage(
+            101,
+            kind=MediaKind.PHOTO,
+            buttons=[[FakeButton("1", b"song-1"), FakeButton("2", b"song-2")]],
+        )
+        stream = FakeStream(cover)
+        stream.client = SimpleNamespace(
+            get_messages=lambda _bot, ids: asyncio.sleep(0, result=numbered_cover)
+        )
+        stream.bot_username = "NextSaverBot"
+
+        decision = await await_response_decision(
+            stream,
+            after_id=100,
+            reply_targets={100},
+            timeout=2,
+            preview_grace=0.01,
+            album_window=0.01,
+            expected_option=extract_quality_options(
+                FakeMessage(90, buttons=[[FakeButton("Audio", b"identify")]])
+            )[0],
+            accept_any_button=True,
+            wait_for_followup_menu=True,
+        )
+
+        self.assertEqual(decision.status, "menu")
+        self.assertEqual(decision.menu_message_id, 101)
+        self.assertEqual([option.label for option in decision.options], ["1", "2"])
+
     async def test_ad_gate_is_rejected_immediately(self) -> None:
         decision = await await_response_decision(
             FakeStream(FakeMessage(101, text="Watch ad to continue", reply_to=100)),

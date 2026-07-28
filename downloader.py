@@ -654,6 +654,7 @@ async def await_response_decision(
     expected_option: QualityOption | None = None,
     allowed_edit_ids: Iterable[int] = (),
     accept_any_button: bool = False,
+    wait_for_followup_menu: bool = False,
 ) -> ResponseDecision:
     started = time.monotonic()
     deadline = started + timeout
@@ -695,11 +696,10 @@ async def await_response_decision(
         # We ignore correlation checks because some bots send the result as a completely
         # new un-replied message.
         if expected_option is not None:
-            # Ignore edits entirely
-            if item.is_edit:
-                continue
-            # Ignore messages without media (ads/text)
-            if kind == MediaKind.NONE:
+            # For ordinary button clicks, edits are status/progress updates. The
+            # NextSaverBot identification flow is different: it sends the song
+            # cover first and attaches its numbered buttons in a later edit.
+            if item.is_edit and not wait_for_followup_menu:
                 continue
             # When accept_any_button=True, detect a NEW menu sent after a button click
             # (e.g. NextSaverBot sends a second image+buttons after the first click).
@@ -713,6 +713,29 @@ async def await_response_decision(
                         correlation=correlation,
                         text=message_text(message).strip(),
                     )
+            if wait_for_followup_menu and kind == MediaKind.PHOTO:
+                # The cover is not a download result. NextSaverBot usually adds
+                # its numbered buttons shortly after sending it, so wait before
+                # reloading that same message rather than downloading the cover.
+                await asyncio.sleep(1.5)
+                refreshed = await stream.client.get_messages(
+                    stream.bot_username,
+                    ids=int(getattr(message, "id", 0) or 0),
+                )
+                if refreshed:
+                    new_options = extract_eligible_buttons(refreshed)
+                    if new_options:
+                        return ResponseDecision(
+                            status="menu",
+                            options=new_options,
+                            menu_message_id=int(getattr(refreshed, "id", 0) or 0),
+                            correlation=correlation,
+                            text=message_text(refreshed).strip(),
+                        )
+                # The delayed button edit may arrive after this refresh; stay in
+                # the event loop and process that update instead of treating the
+                # cover as the requested audio.
+                continue
         else:
             # Normal correlation for non-button requests
             if not is_correlated_message(
@@ -1186,6 +1209,7 @@ class DownloaderGateway:
         progress_callback: ProgressCallback | None = None,
         expected_kind_override: MediaKind | None = None,
         accept_any_button: bool = False,
+        wait_for_followup_menu: bool = False,
     ) -> GatewayResult:
         if self.cooldowns.remaining(worker_name, bot_username) > 0:
             return GatewayResult(status="error", bot_username=bot_username, reason="cooldown")
@@ -1222,6 +1246,7 @@ class DownloaderGateway:
                     expected_option=option,
                     allowed_edit_ids={menu_message_id},
                     accept_any_button=accept_any_button,
+                    wait_for_followup_menu=wait_for_followup_menu,
                 )
             if decision.status == "timeout":
                 self.cooldowns.mark_timeout(worker_name, bot_username)
