@@ -2647,6 +2647,7 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
                     force=True,
                 )
 
+                is_nextsaver = bot_username.lower() == "nextsaverbot"
                 result = await GATEWAY.request(
                     client=lease.worker.client,
                     worker_name=lease.worker.name,
@@ -2655,11 +2656,13 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
                     attempt_directory=attempt_directory,
                     progress_callback=progress.download,
                     expected_kind_override=MediaKind.AUDIO,
+                    # NextSaverBot uses non-standard button labels; accept any button as a menu trigger
+                    accept_any_button=is_nextsaver,
                 )
 
                 # Step 1: Identify with @NextSaverBot
-                if bot_username.lower() == "nextsaverbot":
-                    # Step 1.1: The bot sends a video with a single glass button
+                if is_nextsaver:
+                    # Step 1.1: The bot sends a video with a single button (any label, e.g. emoji)
                     if result.status == "needs_selection" and result.options:
                         await progress.update(30, "🔍 دارم درخواست شناسایی رو می‌فرستم…", force=True)
                         result = await GATEWAY.select(
@@ -2668,9 +2671,11 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
                             bot_username=bot_username,
                             request_message_id=result.request_message_id,
                             menu_message_id=result.menu_message_id,
-                            option=result.options[0], # The only button
+                            option=result.options[0],  # The only button
                             attempt_directory=attempt_directory,
                             progress_callback=progress.download,
+                            # After click, bot sends a second menu (image + "1","2","3" buttons)
+                            accept_any_button=True,
                         )
                         
                         # Step 1.2: After clicking, it sends an image with multiple buttons (1, 2, 3...)
@@ -2688,6 +2693,7 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
                                     option=option_1,
                                     attempt_directory=attempt_directory,
                                     progress_callback=progress.download,
+                                    expected_kind_override=MediaKind.AUDIO,
                                 )
 
                 if result.status == "ready":

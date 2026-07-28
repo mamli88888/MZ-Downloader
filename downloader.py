@@ -284,6 +284,55 @@ def button_fingerprint(button: Any, row: int, column: int) -> str:
     return hashlib.sha256(material).hexdigest()[:20]
 
 
+def extract_eligible_buttons(message: Any) -> tuple[QualityOption, ...]:
+    """Accept ANY non-denied inline keyboard button as a quality option.
+
+    Used for bots like NextSaverBot whose button labels don't match QUALITY_PATTERN
+    but are still legitimate action buttons (e.g. emoji-only or short-text buttons).
+    """
+    rows = getattr(message, "buttons", None) or ()
+    options: list[QualityOption] = []
+    for row_index, row in enumerate(rows):
+        for column_index, button in enumerate(row):
+            label = str(getattr(button, "text", "") or "").strip()
+            lowered_label = label.lower()
+            if not label or lowered_label in DENIED_BUTTON_TEXT:
+                continue
+            if _button_url(button) or any(marker in lowered_label for marker in DENIED_BUTTON_MARKERS):
+                continue
+            if CAPTION_BUTTON_PATTERN.search(label):
+                options.append(
+                    QualityOption(
+                        label=label,
+                        row=row_index,
+                        column=column_index,
+                        fingerprint=button_fingerprint(button, row_index, column_index),
+                        expected_kind=None,
+                        action="caption",
+                    )
+                )
+                continue
+            # Use quality patterns where possible, otherwise treat as generic media
+            expected = MediaKind.AUDIO if AUDIO_PATTERN.search(label) else (
+                MediaKind.VIDEO if QUALITY_PATTERN.search(label) else None
+            )
+            resolution_match = RESOLUTION_PATTERN.search(label)
+            bitrate_match = BITRATE_PATTERN.search(label)
+            height = int(resolution_match.group(1)) if resolution_match else None
+            options.append(
+                QualityOption(
+                    label=label,
+                    row=row_index,
+                    column=column_index,
+                    fingerprint=button_fingerprint(button, row_index, column_index),
+                    expected_kind=expected,
+                    expected_height=height,
+                    expected_bitrate_kbps=int(bitrate_match.group(1)) if bitrate_match else None,
+                )
+            )
+    return tuple(options)
+
+
 def extract_quality_options(message: Any) -> tuple[QualityOption, ...]:
     rows = getattr(message, "buttons", None) or ()
     options: list[QualityOption] = []
@@ -604,6 +653,7 @@ async def await_response_decision(
     expected_kind: MediaKind | None = None,
     expected_option: QualityOption | None = None,
     allowed_edit_ids: Iterable[int] = (),
+    accept_any_button: bool = False,
 ) -> ResponseDecision:
     started = time.monotonic()
     deadline = started + timeout
@@ -639,10 +689,11 @@ async def await_response_decision(
         if item is None:
             continue
         message = item.message
-        # CRITICAL FIX for @Musicfindmhdbot:
-        # If we just clicked a button, we must be extremely aggressive in picking up the NEXT message.
-        # We ignore all correlation checks (reply_to, etc.) because some bots send the result 
-        # as a completely new un-replied message.
+        # Compute kind early so it's available for all checks below (fixes NameError).
+        kind = message_media_kind(message)
+        # If we just clicked a button, we must be aggressive in picking up the NEXT message.
+        # We ignore correlation checks because some bots send the result as a completely
+        # new un-replied message.
         if expected_option is not None:
             # Ignore edits entirely
             if item.is_edit:
@@ -650,6 +701,18 @@ async def await_response_decision(
             # Ignore messages without media (ads/text)
             if kind == MediaKind.NONE:
                 continue
+            # When accept_any_button=True, detect a NEW menu sent after a button click
+            # (e.g. NextSaverBot sends a second image+buttons after the first click).
+            if accept_any_button:
+                new_options = extract_eligible_buttons(message)
+                if new_options:
+                    return ResponseDecision(
+                        status="menu",
+                        options=new_options,
+                        menu_message_id=int(getattr(message, "id", 0) or 0),
+                        correlation=correlation,
+                        text=message_text(message).strip(),
+                    )
         else:
             # Normal correlation for non-button requests
             if not is_correlated_message(
@@ -664,7 +727,6 @@ async def await_response_decision(
             correlation = "reply"
 
         text = message_text(message)
-        kind = message_media_kind(message)
         message_id = int(getattr(message, "id", 0) or 0)
         targets.add(message_id)
         button_text = " ".join(
@@ -679,7 +741,8 @@ async def await_response_decision(
         # After a quality click, media wins over post-processing buttons such as
         # "Extract audio" or "Edit video".
         if expected_option is None or expected_option.action == "caption":
-            options = extract_quality_options(message)
+            option_extractor = extract_eligible_buttons if accept_any_button else extract_quality_options
+            options = option_extractor(message)
             if options and expected_option is None:
                 previews = dict(candidates)
                 if kind == MediaKind.PHOTO:
@@ -1017,6 +1080,7 @@ class DownloaderGateway:
         attempt_directory: Path,
         progress_callback: ProgressCallback | None = None,
         expected_kind_override: MediaKind | None = None,
+        accept_any_button: bool = False,
     ) -> GatewayResult:
         if self.cooldowns.remaining(worker_name, bot_username) > 0:
             return GatewayResult(status="error", bot_username=bot_username, reason="cooldown")
@@ -1038,6 +1102,7 @@ class DownloaderGateway:
                     preview_grace=self.preview_grace,
                     album_window=self.album_window,
                     expected_kind=effective_kind,
+                    accept_any_button=accept_any_button,
                 )
             if decision.status == "timeout":
                 self.cooldowns.mark_timeout(worker_name, bot_username)
@@ -1120,6 +1185,7 @@ class DownloaderGateway:
         attempt_directory: Path,
         progress_callback: ProgressCallback | None = None,
         expected_kind_override: MediaKind | None = None,
+        accept_any_button: bool = False,
     ) -> GatewayResult:
         if self.cooldowns.remaining(worker_name, bot_username) > 0:
             return GatewayResult(status="error", bot_username=bot_username, reason="cooldown")
@@ -1127,7 +1193,8 @@ class DownloaderGateway:
             menu = await client.get_messages(bot_username, ids=menu_message_id)
             if not menu or not getattr(menu, "buttons", None):
                 return GatewayResult(status="error", bot_username=bot_username, reason="menu_missing")
-            current_options = extract_quality_options(menu)
+            option_extractor = extract_eligible_buttons if accept_any_button else extract_quality_options
+            current_options = option_extractor(menu)
             current = next(
                 (
                     item
@@ -1154,10 +1221,24 @@ class DownloaderGateway:
                     expected_kind=expected_kind_override or option.expected_kind,
                     expected_option=option,
                     allowed_edit_ids={menu_message_id},
+                    accept_any_button=accept_any_button,
                 )
             if decision.status == "timeout":
                 self.cooldowns.mark_timeout(worker_name, bot_username)
                 return GatewayResult(status="error", bot_username=bot_username, reason="timeout")
+            if decision.status == "menu":
+                # A new menu appeared after the button click (e.g. NextSaverBot sends a
+                # second menu with numbered choices after the identification step).
+                self.cooldowns.clear(worker_name, bot_username)
+                return GatewayResult(
+                    status="needs_selection",
+                    bot_username=bot_username,
+                    options=decision.options,
+                    menu_message_id=decision.menu_message_id,
+                    request_message_id=request_message_id,
+                    correlation=decision.correlation,
+                    text=decision.text,
+                )
             if decision.status == "text":
                 self.cooldowns.clear(worker_name, bot_username)
                 return GatewayResult(
