@@ -2629,7 +2629,7 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 await progress.update(
                     10,
-                    f"🎵 دارم آهنگ رو دریات دریافت می‌کنم…",
+                    f"🎵 دارم آهنگ رو دریافت می‌کنم…",
                     force=True,
                 )
 
