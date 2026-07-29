@@ -1,0 +1,2 @@
+- [GitHub pushes](github-pushes.md) — when raw HTTPS Git auth is unavailable, use the project’s official GitHub push flow after confirming the origin.
+- [YouTube quality-button file sizes](youtube-size-estimation.md) — sizes are YouTube-only (via yt-dlp) and approximate; other platforms have no size source at all.
