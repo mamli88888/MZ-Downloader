@@ -941,7 +941,7 @@ async def send_large_file(
                         "☁️ فایل آماده دانلوده!",
                         f"حجم: <b>{fmt_size(item.size)}</b>\n\n"
                         "روی دکمه زیر بزن تا فایل رو دانلود کنی:",
-                        "لینک موقته و بعد از مدتی به‌صورت خودکار پاک می‌شه.",
+                        "لینک موقته و بعد از ۳۰ دقیقه به‌صورت خودکار پاک می‌شه.",
                     ),
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(
