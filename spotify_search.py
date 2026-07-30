@@ -1,4 +1,4 @@
-"""Spotify search via Browser Automation on Chosic.com."""
+"""Spotify search via Deezer and Odesli mapping (Pure Python)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import io
 import logging
 import json
 import re
+from urllib.parse import quote
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -57,84 +58,90 @@ class SpotifySearchService:
         self._page_slots = asyncio.Semaphore(MAX_CONCURRENT_PAGE_BUILDS)
 
     async def search(self, query: str) -> tuple[SpotifySearchResult, ...]:
-        """Search Spotify using browser automation on Chosic.com."""
-        from bot import browser_navigate, browser_input, browser_console_exec
-        
+        """Search Spotify using Deezer API and Odesli mapping."""
         normalized = normalize_search_query(query)
         results = []
         
-        try:
-            # 1. Navigate to Chosic
-            await browser_navigate(
-                brief=f"Searching for '{normalized}' on Chosic",
-                url=f"https://www.chosic.com/find-song-by-lyrics/?query={quote(normalized)}",
-                intent="informational"
-            )
-            
-            # Wait for Google CSE and Chosic scripts to load
-            await asyncio.sleep(5)
-            
-            # 2. Extract data using browser console
-            # We use a script that simulates clicking the Spotify icon and grabbing the ID
-            extraction_script = """
-            (async () => {
-                const items = [];
-                const titleElements = document.querySelectorAll(".gsc-thumbnail-inside a.gs-title");
-                
-                // Limit to 30 results
-                const count = Math.min(titleElements.length, 30);
-                
-                for (let i = 0; i < count; i++) {
-                    let fullTitle = titleElements[i].innerText;
-                    if (!fullTitle) continue;
+        async with httpx.AsyncClient(timeout=20.0, proxy=self.proxy_url, follow_redirects=True) as client:
+            try:
+                # 1. Search Deezer (Reliable, no auth, gives good metadata)
+                deezer_res = await client.get(f"https://api.deezer.com/search?q={quote(normalized)}&limit=30")
+                if deezer_res.status_code == 200:
+                    deezer_data = deezer_res.json().get("data", [])
                     
-                    // Cleanup title
-                    let title = fullTitle.split("Lyrics")[0].replace(" | Genius", "").replace(" | Musixmatch", "").trim();
+                    # We process items in parallel to speed up mapping
+                    tasks = []
+                    for item in deezer_data:
+                        tasks.append(self._map_to_spotify(client, item))
                     
-                    // We call Chosic's internal API from the browser context to avoid 401/403
-                    const apiUrl = window.location.protocol + "//" + window.location.host + '/api/tools/search?q=' + encodeURIComponent(title) + '&type=track&limit=1';
-                    try {
-                        const r = await fetch(apiUrl);
-                        if (r.ok) {
-                            const d = await r.json();
-                            if (d.tracks && d.tracks.items && d.tracks.items.length > 0) {
-                                const item = d.tracks.items[0];
-                                items.push({
-                                    track_id: item.id,
-                                    title: item.name,
-                                    artist: item.artist,
-                                    url: "https://open.spotify.com/track/" + item.id,
-                                    thumbnail_url: item.image
-                                });
-                            }
-                        }
-                    } catch(e) {}
-                }
-                return JSON.stringify(items);
-            })();
-            """
-            
-            res_json = await browser_console_exec(
-                brief="Extracting Spotify data from Chosic",
-                javascript=extraction_script
-            )
-            
-            if res_json and isinstance(res_json, str):
-                try:
-                    extracted = json.loads(res_json)
-                    for item in extracted:
-                        results.append(SpotifySearchResult(**item))
-                except Exception as e:
-                    logger.error(f"Failed to parse extracted JSON: {e}")
+                    mapped_results = await asyncio.gather(*tasks)
+                    results = [r for r in mapped_results if r is not None]
+            except Exception as e:
+                logger.error(f"Deezer search failed: {e}")
 
-        except Exception as exc:
-            logger.error(f"Browser-based search failed: {exc}")
-            
         if not results:
-            # Last ditch effort: Try a simple regex search in the page source if console failed
-            raise SpotifySearchError("متأسفانه نتیجه‌ای پیدا نشد. لطفاً عبارت دیگری را امتحان کنید.")
+            # Final fallback: iTunes (if Deezer is down)
+            try:
+                async with httpx.AsyncClient(timeout=15.0, proxy=self.proxy_url) as client:
+                    itunes_res = await client.get(
+                        "https://itunes.apple.com/search",
+                        params={"term": normalized, "media": "music", "limit": 15}
+                    )
+                    if itunes_res.status_code == 200:
+                        itunes_data = itunes_res.json().get("results", [])
+                        for item in itunes_data:
+                            # Construct a search URL as a fallback if mapping is too slow
+                            results.append(
+                                SpotifySearchResult(
+                                    track_id=str(item.get("trackId")),
+                                    title=item.get("trackName", "Unknown"),
+                                    artist=item.get("artistName", "Unknown"),
+                                    url=f"https://open.spotify.com/search/{quote(item.get('trackName', '') + ' ' + item.get('artistName', ''))}",
+                                    thumbnail_url=item.get("artworkUrl100", "").replace("100x100", "600x600"),
+                                )
+                            )
+            except Exception as e:
+                logger.error(f"iTunes fallback failed: {e}")
+
+        if not results:
+            raise SpotifySearchError("هیچ نتیجه‌ای پیدا نشد. لطفاً دوباره تلاش کنید.")
 
         return tuple(results[:MAX_RESULTS])
+
+    async def _map_to_spotify(self, client: httpx.AsyncClient, deezer_item: dict) -> SpotifySearchResult | None:
+        """Map a Deezer track to a Spotify track using Odesli or ISRC."""
+        try:
+            title = deezer_item.get("title", "Unknown")
+            artist = deezer_item.get("artist", {}).get("name", "Unknown")
+            thumbnail = deezer_item.get("album", {}).get("cover_xl") or deezer_item.get("album", {}).get("cover_medium")
+            deezer_url = deezer_item.get("link")
+            
+            # Use Odesli to find Spotify link
+            odesli_res = await client.get(f"https://api.song.link/v1-alpha.1/links?url={quote(deezer_url)}")
+            if odesli_res.status_code == 200:
+                spotify_data = odesli_res.json().get("linksByPlatform", {}).get("spotify")
+                if spotify_data:
+                    spotify_url = spotify_data.get("url")
+                    track_id_match = re.search(r"track/([a-zA-Z0-9]+)", spotify_url)
+                    track_id = track_id_match.group(1) if track_id_match else "unknown"
+                    return SpotifySearchResult(
+                        track_id=track_id,
+                        title=title,
+                        artist=artist,
+                        url=spotify_url,
+                        thumbnail_url=thumbnail
+                    )
+            
+            # Fallback: Just return a search URL if mapping fails
+            return SpotifySearchResult(
+                track_id=f"search_{deezer_item.get('id')}",
+                title=title,
+                artist=artist,
+                url=f"https://open.spotify.com/search/{quote(title + ' ' + artist)}",
+                thumbnail_url=thumbnail
+            )
+        except Exception:
+            return None
 
     async def _download_thumbnail(self, client: httpx.AsyncClient, result: SpotifySearchResult) -> bytes | None:
         if not result.thumbnail_url:
@@ -165,7 +172,7 @@ class SpotifySearchService:
         async with self._page_slots:
             client_options: dict[str, Any] = {
                 "follow_redirects": True,
-                "timeout": httpx.Timeout(12.0, connect=8.0),
+                "timeout": httpx.Timeout(15.0, connect=10.0),
                 "headers": {"User-Agent": "MZDownloader/1.0"},
             }
             if self.proxy_url:
@@ -239,8 +246,3 @@ def render_collage(thumbnails: Sequence[bytes | None], first_number: int) -> byt
     output = io.BytesIO()
     canvas.save(output, format="JPEG", quality=88, optimize=True, progressive=True)
     return output.getvalue()
-
-
-def quote(text: str) -> str:
-    from urllib.parse import quote as url_quote
-    return url_quote(text)
