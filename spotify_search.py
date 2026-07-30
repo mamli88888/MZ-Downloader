@@ -1,4 +1,4 @@
-"""Spotify search via Chosic API with robust fallback."""
+"""Spotify search via Chosic API with direct track links."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 import io
 import logging
 import json
-import re
 from urllib.parse import quote
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -66,64 +65,45 @@ class SpotifySearchService:
         }
 
     async def search(self, query: str) -> tuple[SpotifySearchResult, ...]:
-        """Search Spotify using Chosic API or iTunes fallback."""
+        """Search Spotify using Chosic API to get direct track links."""
         normalized = normalize_search_query(query)
         results = []
 
-        # Try Chosic API first (as requested by user)
         try:
-            async with httpx.AsyncClient(timeout=10.0, proxy=self.proxy_url, follow_redirects=True) as client:
-                # We use the search endpoint that returns up to 30 results
+            async with httpx.AsyncClient(timeout=15.0, proxy=self.proxy_url, follow_redirects=True) as client:
+                # Direct call to Chosic search API which returns Spotify IDs
                 response = await client.get(
                     f"https://www.chosic.com/api/tools/search?q={quote(normalized)}&type=track&limit=30",
                     headers=self.headers
                 )
+                
                 if response.status_code == 200:
                     data = response.json()
                     if "tracks" in data and "items" in data["tracks"]:
                         for item in data["tracks"]["items"]:
+                            track_id = item.get("id")
+                            if not track_id:
+                                continue
+                                
                             results.append(
                                 SpotifySearchResult(
-                                    track_id=item["id"],
-                                    title=item["name"],
-                                    artist=item["artist"],
-                                    url=f"https://open.spotify.com/track/{item['id']}",
+                                    track_id=track_id,
+                                    title=item.get("name", "Unknown"),
+                                    artist=item.get("artist", "Unknown"),
+                                    url=f"https://open.spotify.com/track/{track_id}",
                                     thumbnail_url=item.get("image", ""),
                                 )
                             )
+                else:
+                    logger.error(f"Chosic API returned status {response.status_code}")
+                    
         except Exception as exc:
-            logger.warning("Chosic API failed, falling back to iTunes: %s", exc)
-
-        # Fallback to iTunes API if Chosic failed or returned no results
-        if not results:
-            try:
-                async with httpx.AsyncClient(timeout=10.0, proxy=self.proxy_url) as client:
-                    response = await client.get(
-                        "https://itunes.apple.com/search",
-                        params={"term": normalized, "media": "music", "limit": 30}
-                    )
-                    if response.status_code == 200:
-                        data = response.json()
-                        for item in data.get("results", []):
-                            # Construct a "best effort" Spotify search link or use a mapper
-                            # For the sake of the bot, we'll use the title/artist to construct a search URL
-                            # that the bot's download logic can potentially handle or just show.
-                            # But we really want a track ID.
-                            # Since we don't have a Spotify ID from iTunes, we'll mark it for later.
-                            results.append(
-                                SpotifySearchResult(
-                                    track_id=item.get("trackId", ""),
-                                    title=item.get("trackName", "Unknown"),
-                                    artist=item.get("artistName", "Unknown"),
-                                    url=f"https://open.spotify.com/search/{quote(item.get('trackName', '') + ' ' + item.get('artistName', ''))}",
-                                    thumbnail_url=item.get("artworkUrl100", "").replace("100x100", "600x600"),
-                                )
-                            )
-            except Exception as exc:
-                logger.error("iTunes fallback failed: %s", exc)
+            logger.error("Chosic API request failed: %s", exc)
 
         if not results:
-            raise SpotifySearchError("هیچ نتیجه‌ای پیدا نشد.")
+            # If API failed, we can't get direct track IDs reliably without a scraper.
+            # But the user wants direct links, so we must not return search links.
+            raise SpotifySearchError("متأسفانه نتیجه‌ای با لینک مستقیم پیدا نشد. لطفاً دوباره تلاش کنید.")
 
         return tuple(results[:MAX_RESULTS])
 
