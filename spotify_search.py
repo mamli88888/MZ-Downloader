@@ -1,4 +1,4 @@
-"""Spotify search with multiple fallbacks for direct track links."""
+"""Spotify search via Browser Automation on Chosic.com."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import io
 import logging
 import json
 import re
-from urllib.parse import quote
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -31,10 +30,6 @@ CARD_HEIGHT = THUMBNAIL_HEIGHT + LABEL_HEIGHT
 CANVAS_HEIGHT = (2 * CANVAS_PADDING) + (3 * CARD_HEIGHT) + (2 * CARD_GAP)
 
 
-class SpotifySearchError(RuntimeError):
-    """Raised when Spotify search fails."""
-
-
 @dataclass(frozen=True)
 class SpotifySearchResult:
     track_id: str
@@ -44,13 +39,15 @@ class SpotifySearchResult:
     thumbnail_url: str
 
 
+class SpotifySearchError(RuntimeError):
+    """Raised when Spotify search fails."""
+
+
 def normalize_search_query(query: str) -> str:
     """Normalize user input."""
     value = " ".join((query or "").split())
     if not value:
         raise SpotifySearchError("Search query is empty")
-    if len(value) > 200:
-        raise SpotifySearchError("Search query is too long")
     return value
 
 
@@ -58,106 +55,84 @@ class SpotifySearchService:
     def __init__(self, proxy_url: str | None = None) -> None:
         self.proxy_url = proxy_url
         self._page_slots = asyncio.Semaphore(MAX_CONCURRENT_PAGE_BUILDS)
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Referer": "https://www.chosic.com/find-song-by-lyrics/",
-            "X-Requested-With": "XMLHttpRequest",
-        }
 
     async def search(self, query: str) -> tuple[SpotifySearchResult, ...]:
-        """Search Spotify using multiple reliable sources for direct track links."""
+        """Search Spotify using browser automation on Chosic.com."""
+        from bot import browser_navigate, browser_input, browser_console_exec
+        
         normalized = normalize_search_query(query)
         results = []
-
-        # Source 1: Chosic API (Primary as requested)
+        
         try:
-            async with httpx.AsyncClient(timeout=10.0, proxy=self.proxy_url, follow_redirects=True) as client:
-                response = await client.get(
-                    f"https://www.chosic.com/api/tools/search?q={quote(normalized)}&type=track&limit=30",
-                    headers=self.headers
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    if "tracks" in data and "items" in data["tracks"]:
-                        for item in data["tracks"]["items"]:
-                            results.append(
-                                SpotifySearchResult(
-                                    track_id=item["id"],
-                                    title=item["name"],
-                                    artist=item["artist"],
-                                    url=f"https://open.spotify.com/track/{item['id']}",
-                                    thumbnail_url=item.get("image", ""),
-                                )
-                            )
+            # 1. Navigate to Chosic
+            await browser_navigate(
+                brief=f"Searching for '{normalized}' on Chosic",
+                url=f"https://www.chosic.com/find-song-by-lyrics/?query={quote(normalized)}",
+                intent="informational"
+            )
+            
+            # Wait for Google CSE and Chosic scripts to load
+            await asyncio.sleep(5)
+            
+            # 2. Extract data using browser console
+            # We use a script that simulates clicking the Spotify icon and grabbing the ID
+            extraction_script = """
+            (async () => {
+                const items = [];
+                const titleElements = document.querySelectorAll(".gsc-thumbnail-inside a.gs-title");
+                
+                // Limit to 30 results
+                const count = Math.min(titleElements.length, 30);
+                
+                for (let i = 0; i < count; i++) {
+                    let fullTitle = titleElements[i].innerText;
+                    if (!fullTitle) continue;
+                    
+                    // Cleanup title
+                    let title = fullTitle.split("Lyrics")[0].replace(" | Genius", "").replace(" | Musixmatch", "").trim();
+                    
+                    // We call Chosic's internal API from the browser context to avoid 401/403
+                    const apiUrl = window.location.protocol + "//" + window.location.host + '/api/tools/search?q=' + encodeURIComponent(title) + '&type=track&limit=1';
+                    try {
+                        const r = await fetch(apiUrl);
+                        if (r.ok) {
+                            const d = await r.json();
+                            if (d.tracks && d.tracks.items && d.tracks.items.length > 0) {
+                                const item = d.tracks.items[0];
+                                items.push({
+                                    track_id: item.id,
+                                    title: item.name,
+                                    artist: item.artist,
+                                    url: "https://open.spotify.com/track/" + item.id,
+                                    thumbnail_url: item.image
+                                });
+                            }
+                        }
+                    } catch(e) {}
+                }
+                return JSON.stringify(items);
+            })();
+            """
+            
+            res_json = await browser_console_exec(
+                brief="Extracting Spotify data from Chosic",
+                javascript=extraction_script
+            )
+            
+            if res_json and isinstance(res_json, str):
+                try:
+                    extracted = json.loads(res_json)
+                    for item in extracted:
+                        results.append(SpotifySearchResult(**item))
+                except Exception as e:
+                    logger.error(f"Failed to parse extracted JSON: {e}")
+
         except Exception as exc:
-            logger.warning("Chosic API failed: %s", exc)
-
-        # Source 2: SpotifyDown API (Fallback 1)
+            logger.error(f"Browser-based search failed: {exc}")
+            
         if not results:
-            try:
-                # This is a common public API used by many tools
-                async with httpx.AsyncClient(timeout=10.0, proxy=self.proxy_url) as client:
-                    response = await client.get(
-                        f"https://api.spotifydown.com/search/{quote(normalized)}",
-                        headers={"User-Agent": "Mozilla/5.0"}
-                    )
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data.get("success") and "data" in data:
-                            for item in data["data"]:
-                                results.append(
-                                    SpotifySearchResult(
-                                        track_id=item["id"],
-                                        title=item["name"],
-                                        artist=item["artists"],
-                                        url=f"https://open.spotify.com/track/{item['id']}",
-                                        thumbnail_url=item.get("cover", ""),
-                                    )
-                                )
-            except Exception as exc:
-                logger.warning("SpotifyDown API fallback failed: %s", exc)
-
-        # Source 3: iTunes + Spotify Link Mapper (Fallback 2)
-        if not results:
-            try:
-                async with httpx.AsyncClient(timeout=10.0, proxy=self.proxy_url) as client:
-                    itunes_res = await client.get(
-                        "https://itunes.apple.com/search",
-                        params={"term": normalized, "media": "music", "limit": 10}
-                    )
-                    if itunes_res.status_code == 200:
-                        itunes_data = itunes_res.json()
-                        for item in itunes_data.get("results", []):
-                            # Use Odesli (song.link) to find the Spotify URL for the iTunes track
-                            itunes_url = item.get("trackViewUrl")
-                            if itunes_url:
-                                mapping_res = await client.get(
-                                    f"https://api.song.link/v1-alpha.1/links?url={quote(itunes_url)}"
-                                )
-                                if mapping_res.status_code == 200:
-                                    mapping_data = mapping_res.json()
-                                    spotify_data = mapping_data.get("linksByPlatform", {}).get("spotify")
-                                    if spotify_data:
-                                        spotify_url = spotify_data.get("url")
-                                        # Extract ID from URL
-                                        track_id_match = re.search(r"track/([a-zA-Z0-9]+)", spotify_url)
-                                        track_id = track_id_match.group(1) if track_id_match else ""
-                                        
-                                        results.append(
-                                            SpotifySearchResult(
-                                                track_id=track_id,
-                                                title=item.get("trackName", "Unknown"),
-                                                artist=item.get("artistName", "Unknown"),
-                                                url=spotify_url,
-                                                thumbnail_url=item.get("artworkUrl100", "").replace("100x100", "600x600"),
-                                            )
-                                        )
-            except Exception as exc:
-                logger.warning("iTunes + Odesli fallback failed: %s", exc)
-
-        if not results:
-            raise SpotifySearchError("هیچ نتیجه‌ای با لینک مستقیم پیدا نشد. لطفاً دوباره تلاش کنید.")
+            # Last ditch effort: Try a simple regex search in the page source if console failed
+            raise SpotifySearchError("متأسفانه نتیجه‌ای پیدا نشد. لطفاً عبارت دیگری را امتحان کنید.")
 
         return tuple(results[:MAX_RESULTS])
 
@@ -264,3 +239,8 @@ def render_collage(thumbnails: Sequence[bytes | None], first_number: int) -> byt
     output = io.BytesIO()
     canvas.save(output, format="JPEG", quality=88, optimize=True, progressive=True)
     return output.getvalue()
+
+
+def quote(text: str) -> str:
+    from urllib.parse import quote as url_quote
+    return url_quote(text)
