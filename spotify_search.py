@@ -7,6 +7,7 @@ import io
 import logging
 import json
 import re
+from urllib.parse import quote
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -74,7 +75,7 @@ class SpotifySearchService:
             async with httpx.AsyncClient(timeout=10.0, proxy=self.proxy_url, follow_redirects=True) as client:
                 # We use the search endpoint that returns up to 30 results
                 response = await client.get(
-                    f"https://www.chosic.com/api/tools/search?q={httpx.utils.quote(normalized)}&type=track&limit=30",
+                    f"https://www.chosic.com/api/tools/search?q={quote(normalized)}&type=track&limit=30",
                     headers=self.headers
                 )
                 if response.status_code == 200:
@@ -114,7 +115,7 @@ class SpotifySearchService:
                                     track_id=item.get("trackId", ""),
                                     title=item.get("trackName", "Unknown"),
                                     artist=item.get("artistName", "Unknown"),
-                                    url=f"https://open.spotify.com/search/{httpx.utils.quote(item.get('trackName', '') + ' ' + item.get('artistName', ''))}",
+                                    url=f"https://open.spotify.com/search/{quote(item.get('trackName', '') + ' ' + item.get('artistName', ''))}",
                                     thumbnail_url=item.get("artworkUrl100", "").replace("100x100", "600x600"),
                                 )
                             )
