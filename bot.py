@@ -2464,8 +2464,28 @@ def _is_admin(user: Any) -> bool:
     return bool(user and (user.username or "").lower() == ADMIN_USERNAME.lower())
 
 
+def _strip_broadcast_command(text: str) -> str:
+    """Remove the /broadcast (or /broadcast@botname) prefix and return the rest."""
+    if not text:
+        return ""
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        return ""
+    return parts[1].strip()
+
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message to all registered users. Admin-only."""
+    """Send a message (text / photo / video / audio / voice / document / animation / sticker)
+    to all registered users. Admin-only.
+
+    Supported forms:
+      /broadcast some text                       -> plain text message
+      photo with caption "/broadcast some text"  -> photo + caption
+      video with caption "/broadcast ..."        -> video + caption
+      animation / audio / voice / document / sticker with caption "/broadcast ..."
+      sticker (no caption) with reply /broadcast -> forwarded sticker
+      /broadcast (as a reply to any message)     -> copies that target message
+    """
     if not _is_admin(update.effective_user):
         await update.effective_message.reply_text(
             status_card("⛔ دسترسی ممنوع", "این دستور فقط برای ادمین ربات قابل استفاده است."),
@@ -2473,15 +2493,28 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    # Use the full text from the message to preserve newlines, excluding the command itself
-    raw_text = update.effective_message.text or ""
-    parts = raw_text.split(None, 1)
-    text = parts[1].strip() if len(parts) > 1 else ""
-    if not text:
-        await update.effective_message.reply_text(
+    msg = update.effective_message
+
+    # 1) Reply form: /broadcast as a reply to some other message -> copy that target
+    target_msg = msg.reply_to_message if msg.reply_to_message else msg
+
+    caption_text = _strip_broadcast_command(msg.text or msg.caption or "")
+
+    has_media = any(
+        getattr(target_msg, attr, None) is not None
+        for attr in ("photo", "video", "audio", "voice", "document", "animation", "sticker")
+    )
+
+    is_text_only = not has_media and bool(caption_text)
+
+    if not has_media and not is_text_only:
+        await msg.reply_text(
             status_card(
                 "📢 ارسال پیام همگانی",
-                "متن پیام را بعد از دستور بنویس:\n<code>/broadcast متن پیام</code>",
+                "نحوه استفاده:\n"
+                "<code>/broadcast متن پیام</code>\n"
+                "یا یک عکس/ویدیو/فایل/استیکر بفرست و کپشنش را <code>/broadcast متن</code> بگذار.\n"
+                "یا روی هر پیامی ریپلای کن و <code>/broadcast</code> بزن.",
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -2489,7 +2522,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     all_ids = users_db.all_user_ids()
     total = len(all_ids)
-    status_msg = await update.effective_message.reply_text(
+    status_msg = await msg.reply_text(
         status_card("📢 در حال ارسال…", f"تعداد گیرنده: <b>{total}</b> نفر"),
         parse_mode=ParseMode.HTML,
     )
@@ -2498,7 +2531,16 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     failed = 0
     for uid in all_ids:
         try:
-            await context.bot.send_message(chat_id=uid, text=text)
+            if is_text_only:
+                await context.bot.send_message(chat_id=uid, text=caption_text)
+            else:
+                # copy_message preserves photo/video/voice/audio/document/animation/sticker
+                # and the original caption. If admin provided custom caption text via
+                # the /broadcast command, we override the caption with it.
+                kwargs = {"chat_id": uid, "from_chat_id": target_msg.chat_id, "message_id": target_msg.message_id}
+                if caption_text:
+                    kwargs["caption"] = caption_text
+                await context.bot.copy_message(**kwargs)
             sent += 1
         except TelegramError:
             failed += 1
@@ -3242,6 +3284,14 @@ def main() -> None:
     application = builder.build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
+    # PTB's CommandHandler only matches message.text, not message.caption.
+    # Add a separate handler for caption-based /broadcast (photo/video/etc with caption).
+    application.add_handler(
+        MessageHandler(
+            filters.CAPTION & filters.Regex(r"^/broadcast(?:@\w+)?(?:\s|$)"),
+            broadcast_command,
+        )
+    )
     application.add_handler(CommandHandler("adduser", adduser_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
