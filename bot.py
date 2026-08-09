@@ -3284,11 +3284,11 @@ def main() -> None:
     application = builder.build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
-    # PTB's CommandHandler only matches message.text, not message.caption.
-    # Add a separate handler for caption-based /broadcast (photo/video/etc with caption).
+    # PTB's CommandHandler and filters.Regex only inspect message.text, NOT message.caption.
+    # For a photo/video/etc with caption "/broadcast ...", we need filters.CaptionRegex.
     application.add_handler(
         MessageHandler(
-            filters.CAPTION & filters.Regex(r"^/broadcast(?:@\w+)?(?:\s|$)"),
+            filters.CAPTION & filters.CaptionRegex(r"^/broadcast(?:@\w+)?(?:\s|$)"),
             broadcast_command,
         )
     )
