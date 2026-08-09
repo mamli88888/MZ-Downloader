@@ -78,6 +78,15 @@ from youtube_search import (
     estimate_youtube_size,
     normalize_search_query,
 )
+from mz_shazam_search import (
+    MAX_RESULTS as SHAZAM_SEARCH_MAX_RESULTS,
+    RESULTS_PER_PAGE as SHAZAM_RESULTS_PER_PAGE,
+    ShazamSearchError,
+    ShazamSearchResult,
+    ShazamSearchService,
+    normalize_song_query,
+    youtube_url_for_song,
+)
 
 
 LOG_HANDLERS: list[logging.Handler] = [logging.StreamHandler()]
@@ -121,6 +130,13 @@ YOUTUBE_SEARCH = YouTubeSearchService(
         else None
     )
 )
+SHAZAM_SEARCH = ShazamSearchService(
+    proxy_url=(
+        f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+        if SETTINGS.use_proxy
+        else None
+    )
+)
 
 URL_REGEX = re.compile(r"https?://[^\s<>\"']+|www\.[^\s<>\"']+", re.IGNORECASE)
 TRAILING_URL_PUNCTUATION = ".,!?:;،؛؟]}>\"'"
@@ -136,6 +152,10 @@ YOUTUBE_SEARCH_TTL = 10 * 60
 YOUTUBE_SEARCH_RATE_LIMIT = 5
 YOUTUBE_SEARCH_RATE_WINDOW = 60.0
 MAX_YOUTUBE_SEARCH_SESSIONS = 512
+SHAZAM_SEARCH_TTL = 10 * 60
+SHAZAM_SEARCH_RATE_LIMIT = 5
+SHAZAM_SEARCH_RATE_WINDOW = 60.0
+MAX_SHAZAM_SEARCH_SESSIONS = 512
 
 
 @dataclass
@@ -177,12 +197,29 @@ class YouTubeSearchSession:
     selected: bool = False
 
 
+@dataclass
+class ShazamSearchSession:
+    token: str
+    created_at: float
+    chat_id: int
+    user_id: int
+    reply_to: int | None
+    query: str
+    results: tuple[ShazamSearchResult, ...]
+    current_page: int = 0
+    busy: bool = False
+    selected: bool = False
+
+
 PENDING_SELECTIONS: dict[str, PendingSelection] = {}
 YOUTUBE_SEARCH_SESSIONS: dict[str, YouTubeSearchSession] = {}
+SHAZAM_SEARCH_SESSIONS: dict[str, ShazamSearchSession] = {}
 ACTIVE_REQUESTS: dict[tuple[int, int], set[asyncio.Task[Any]]] = {}
 USER_RATE_LIMITS: dict[tuple[int, int], deque[float]] = defaultdict(deque)
 YOUTUBE_SEARCH_RATE_LIMITS: dict[tuple[int, int], deque[float]] = defaultdict(deque)
+SHAZAM_SEARCH_RATE_LIMITS: dict[tuple[int, int], deque[float]] = defaultdict(deque)
 ACTIVE_YOUTUBE_SEARCHES: set[tuple[int, int]] = set()
+ACTIVE_SHAZAM_SEARCHES: set[tuple[int, int]] = set()
 MEMBERSHIP_CACHE: dict[int, float] = {}
 # token → (url, created_at, chat_id, user_id)
 REEL_MUSIC_URLS: dict[str, tuple[str, float, int, int]] = {}
@@ -566,6 +603,97 @@ def prune_youtube_search_sessions() -> None:
             history.popleft()
         if not history:
             YOUTUBE_SEARCH_RATE_LIMITS.pop(key, None)
+
+
+# --- Shazam song search helpers -----------------------------------------
+
+def allow_shazam_search(key: tuple[int, int]) -> bool:
+    now = time.monotonic()
+    history = SHAZAM_SEARCH_RATE_LIMITS[key]
+    while history and now - history[0] > SHAZAM_SEARCH_RATE_WINDOW:
+        history.popleft()
+    if len(history) >= SHAZAM_SEARCH_RATE_LIMIT:
+        return False
+    history.append(now)
+    return True
+
+
+def shazam_search_page_count(session: ShazamSearchSession) -> int:
+    return max(1, math.ceil(len(session.results) / SHAZAM_RESULTS_PER_PAGE))
+
+
+def _truncate_button_text(text: str, max_len: int = 38) -> str:
+    """Trim a song label so the inline button stays readable on mobile."""
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 1].rstrip() + "…"
+
+
+def shazam_search_keyboard(session: ShazamSearchSession, page: int) -> InlineKeyboardMarkup:
+    """Inline keyboard with one 'glass button' per song on the current page.
+
+    Telegram renders inline buttons with a translucent/frosted look by default,
+    which gives the 'دکمه شیشه‌ای' appearance the user asked for.
+    """
+    start = page * SHAZAM_RESULTS_PER_PAGE
+    stop = min(start + SHAZAM_RESULTS_PER_PAGE, len(session.results))
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for result_index in range(start, stop):
+        result = session.results[result_index]
+        label = _truncate_button_text(result.label)
+        row.append(
+            InlineKeyboardButton(
+                f"🎵 {label}",
+                callback_data=f"ss:{session.token}:{result_index}",
+            )
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton("⬅️ صفحه قبل", callback_data=f"sp:{session.token}:{page - 1}")
+        )
+    if page + 1 < shazam_search_page_count(session):
+        navigation.append(
+            InlineKeyboardButton("صفحه بعد ➡️", callback_data=f"sp:{session.token}:{page + 1}")
+        )
+    if navigation:
+        rows.append(navigation)
+    return InlineKeyboardMarkup(rows)
+
+
+def shazam_search_caption(session: ShazamSearchSession, page: int) -> str:
+    page_count = shazam_search_page_count(session)
+    return (
+        "🎵 <b>نتایج جست‌وجوی آهنگ</b>\n"
+        f"عبارت: <b>{html_escape(session.query)}</b>\n"
+        f"صفحه {persian_number(page + 1)} از {persian_number(page_count)}"
+        " • روی آهنگ موردنظر بزن تا دانلود شه."
+    )
+
+
+def prune_shazam_search_sessions() -> None:
+    now = time.monotonic()
+    for token, session in list(SHAZAM_SEARCH_SESSIONS.items()):
+        if now - session.created_at >= SHAZAM_SEARCH_TTL:
+            SHAZAM_SEARCH_SESSIONS.pop(token, None)
+    overflow = len(SHAZAM_SEARCH_SESSIONS) - MAX_SHAZAM_SEARCH_SESSIONS
+    if overflow > 0:
+        oldest = sorted(SHAZAM_SEARCH_SESSIONS.values(), key=lambda item: item.created_at)[:overflow]
+        for session in oldest:
+            SHAZAM_SEARCH_SESSIONS.pop(session.token, None)
+    for key, history in list(SHAZAM_SEARCH_RATE_LIMITS.items()):
+        while history and now - history[0] > SHAZAM_SEARCH_RATE_WINDOW:
+            history.popleft()
+        if not history:
+            SHAZAM_SEARCH_RATE_LIMITS.pop(key, None)
 
 
 async def send_long_text(
@@ -2043,11 +2171,267 @@ async def on_youtube_search_callback(update: Update, context: ContextTypes.DEFAU
         session.busy = False
 
 
+# --- Shazam song search command + callbacks -----------------------------
+
+async def run_shazam_search(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw_query: str,
+) -> None:
+    """Run a Shazam song search and send the first page (cover collage + buttons)."""
+    message = update.effective_message
+    key = request_owner_key(update)
+    try:
+        query_text = normalize_song_query(raw_query)
+    except ShazamSearchError:
+        await message.reply_text(
+            status_card(
+                "🎵 چی رو جست‌وجو کنم؟",
+                "نام خواننده یا آهنگ رو بنویس؛ مثلاً <code>/song Coldplay Yellow</code>.",
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if key in ACTIVE_SHAZAM_SEARCHES:
+        await message.reply_text(
+            status_card("⏳ جست‌وجوی قبلی هنوز ادامه دارد", "چند لحظه صبر کن تا نتیجه‌ها آماده شوند."),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not allow_shazam_search(key):
+        await message.reply_text(
+            status_card("⏱ کمی آهسته‌تر", "تا یک دقیقهٔ دیگر دوباره جست‌وجو کن."),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    prune_shazam_search_sessions()
+    MEMBERSHIP_CACHE[update.effective_user.id] = max(
+        MEMBERSHIP_CACHE.get(update.effective_user.id, 0),
+        time.monotonic() + SHAZAM_SEARCH_TTL,
+    )
+    ACTIVE_SHAZAM_SEARCHES.add(key)
+    status_message: Any | None = None
+    session: ShazamSearchSession | None = None
+    try:
+        status_message = await send_status(
+            context,
+            update.effective_chat.id,
+            status_card(
+                "🎵 دارم آهنگ‌ها رو می‌گردم…",
+                f"عبارت: <b>{html_escape(query_text)}</b>\nتا ۳۰ نتیجه رو با کاور و اسم آماده می‌کنم.",
+            ),
+            message.message_id,
+        )
+        results = await SHAZAM_SEARCH.search(query_text)
+        if not results:
+            await edit_status(
+                status_message,
+                status_card(
+                    "😕 نتیجه‌ای پیدا نشد",
+                    f"برای <b>{html_escape(query_text)}</b> آهنگی پیدا نشد.",
+                    "عبارت دیگری را امتحان کن.",
+                ),
+            )
+            return
+        token = uuid.uuid4().hex[:12]
+        session = ShazamSearchSession(
+            token=token,
+            created_at=time.monotonic(),
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id,
+            reply_to=message.message_id,
+            query=query_text,
+            results=results[:SHAZAM_SEARCH_MAX_RESULTS],
+        )
+        page_image = await SHAZAM_SEARCH.build_page_image(session.results, 0)
+        SHAZAM_SEARCH_SESSIONS[token] = session
+        prune_shazam_search_sessions()
+
+        async def send_results() -> Any:
+            return await context.bot.send_photo(
+                chat_id=session.chat_id,
+                photo=page_image,
+                filename=f"shazam-search-{token}-1.jpg",
+                caption=shazam_search_caption(session, 0),
+                parse_mode=ParseMode.HTML,
+                reply_markup=shazam_search_keyboard(session, 0),
+                reply_to_message_id=session.reply_to,
+            )
+
+        await telegram_retry(send_results)
+        with contextlib.suppress(TelegramError, AttributeError):
+            await status_message.delete()
+    except ShazamSearchError as exc:
+        logger.info("Shazam search unavailable: %s", exc)
+        if status_message is not None:
+            await edit_status(
+                status_message,
+                status_card(
+                    "😕 نتیجه‌ای آماده نشد",
+                    "جست‌وجوی آهنگ موقتاً پاسخ نداد یا نتیجه‌ای پیدا نشد.",
+                    "عبارت دیگری را امتحان کن.",
+                ),
+            )
+    except TelegramError as exc:
+        logger.warning("Shazam search result could not be sent: %s", exc)
+        if session is not None:
+            SHAZAM_SEARCH_SESSIONS.pop(session.token, None)
+        if status_message is not None:
+            await edit_status(
+                status_message,
+                status_card("😕 ارسال نتیجه‌ها ناموفق بود", "چند لحظهٔ دیگر دوباره امتحان کن."),
+            )
+    except Exception as exc:
+        logger.exception("Unexpected Shazam search failure: %s", exc)
+        if session is not None:
+            SHAZAM_SEARCH_SESSIONS.pop(session.token, None)
+        if status_message is not None:
+            await edit_status(
+                status_message,
+                status_card("😕 جست‌وجو انجام نشد", "چند لحظهٔ دیگر دوباره امتحان کن."),
+            )
+    finally:
+        ACTIVE_SHAZAM_SEARCHES.discard(key)
+
+
+@membership_required
+async def song_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /song <query> — search songs via ShazamIO (with iTunes fallback)."""
+    query_text = " ".join(context.args or ())
+    if not query_text and update.effective_message.reply_to_message is not None:
+        replied = update.effective_message.reply_to_message
+        query_text = replied.text or replied.caption or ""
+    await run_shazam_search(update, context, query_text)
+
+
+@membership_required
+async def on_shazam_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline button presses for the Shazam song search results."""
+    query = update.callback_query
+    data = query.data or ""
+    parts = data.split(":")
+    token = parts[1] if len(parts) > 1 else ""
+    prune_shazam_search_sessions()
+    session = SHAZAM_SEARCH_SESSIONS.get(token)
+    if session is None:
+        await query.answer("این جست‌وجو منقضی شده؛ دوباره /song بزن.", show_alert=True)
+        return
+    if session.chat_id != update.effective_chat.id or session.user_id != update.effective_user.id:
+        await query.answer("این نتیجه‌ها متعلق به شما نیست.", show_alert=True)
+        return
+    if session.selected:
+        await query.answer("این آهنگ قبلاً انتخاب شده است.", show_alert=True)
+        return
+    try:
+        value = int(parts[2])
+    except (IndexError, TypeError, ValueError):
+        await query.answer("دکمه معتبر نیست.", show_alert=True)
+        return
+
+    # --- Song selection (ss:) ---
+    if data.startswith("ss:"):
+        if session.busy:
+            with contextlib.suppress(TelegramError):
+                await query.answer("صبر کن صفحه کامل آماده شود.")
+            return
+        if value < 0 or value >= len(session.results):
+            await query.answer("این آهنگ در دسترس نیست.", show_alert=True)
+            return
+        session.selected = True
+        selected = session.results[value]
+        with contextlib.suppress(TelegramError):
+            await query.answer(f"🎵 {selected.label} — دارم پیدا می‌کنم…")
+        # Look up the song on YouTube so the existing download pipeline can
+        # take over (the bot already knows how to download from YouTube).
+        proxy_url = (
+            f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+            if SETTINGS.use_proxy
+            else None
+        )
+        youtube_url = await youtube_url_for_song(
+            selected.artist_name,
+            selected.track_name,
+            proxy_url=proxy_url,
+        )
+        if not youtube_url:
+            session.selected = False
+            with contextlib.suppress(TelegramError):
+                await context.bot.send_message(
+                    chat_id=session.chat_id,
+                    text=status_card(
+                        "😕 لینک دانلود پیدا نشد",
+                        f"برای <b>{html_escape(selected.label)}</b> نسخهٔ YouTube پیدا نشد.",
+                        "آهنگ دیگری را انتخاب کن.",
+                    ),
+                    reply_to_message_id=session.reply_to,
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+        try:
+            accepted = await process_urls(update, context, (youtube_url,), session.reply_to)
+        except BaseException:
+            session.selected = False
+            raise
+        if accepted:
+            SHAZAM_SEARCH_SESSIONS.pop(token, None)
+            with contextlib.suppress(TelegramError):
+                await query.edit_message_reply_markup(reply_markup=None)
+        else:
+            session.selected = False
+        return
+
+    # --- Pagination (sp:) ---
+    if not data.startswith("sp:"):
+        await query.answer()
+        return
+    page_count = shazam_search_page_count(session)
+    if value < 0 or value >= page_count:
+        await query.answer("این صفحه وجود ندارد.", show_alert=True)
+        return
+    if session.busy:
+        await query.answer("دارم صفحه را می‌سازم…")
+        return
+    if value == session.current_page:
+        await query.answer()
+        return
+
+    session.busy = True
+    try:
+        with contextlib.suppress(TelegramError):
+            await query.answer("دارم صفحه را می‌سازم…")
+        page_image = await SHAZAM_SEARCH.build_page_image(session.results, value)
+        if SHAZAM_SEARCH_SESSIONS.get(token) is not session or session.selected:
+            return
+        await query.edit_message_media(
+            media=InputMediaPhoto(
+                media=page_image,
+                filename=f"shazam-search-{token}-{value + 1}.jpg",
+                caption=shazam_search_caption(session, value),
+                parse_mode=ParseMode.HTML,
+            ),
+            reply_markup=shazam_search_keyboard(session, value),
+        )
+        session.current_page = value
+    except (ShazamSearchError, TelegramError) as exc:
+        logger.warning("Shazam search page %d failed: %s", value, exc)
+        with contextlib.suppress(TelegramError):
+            await context.bot.send_message(
+                chat_id=session.chat_id,
+                text=status_card("😕 صفحه آماده نشد", "دوباره روی دکمهٔ صفحه بزن."),
+                reply_to_message_id=session.reply_to,
+                parse_mode=ParseMode.HTML,
+            )
+    finally:
+        session.busy = False
+
+
 WELCOME_PRIVATE = status_card(
     "✨ سلام! من MZ Downloaderم",
     "لینکت رو بفرست، بقیه‌ش با من 😎\n\n"
     "🎬 ویدیو با انتخاب کیفیت\n"
     "🔎 جست‌وجوی YouTube و نمایش ۳۰ نتیجه\n"
+    "🎵 جست‌وجوی آهنگ با /song (کاور + خواننده - اسم آهنگ)\n"
     "🎧 آهنگ تکی، آلبوم و پلی‌لیست ZIP\n"
     "📸 کپشن پست‌های Instagram\n"
     "🖼 پیش‌نمایش، فقط صدا و دانلود چندتایی\n"
@@ -2200,6 +2584,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• برای افزودن بات به گروه روی پروفایل بات بزن و گزینه Add to Group or Channel رو بزن و گروه موردنظرت رو انتخاب کن؛ بعدش بات رو به‌عنوان ادمین به گروه اضافه کن.\n\n"
         "<b>فرمان‌ها</b>\n"
         "<code>/search عبارت</code> جست‌وجوی YouTube\n"
+        "<code>/song عبارت</code> جست‌وجوی آهنگ (کاور + خواننده - اسم آهنگ)\n"
         "<code>/cancel</code> توقف دانلودهای خودت\n"
         "<code>/status</code> وضعیت صف\n"
         "<code>/platforms</code> پلتفرم‌های قابل استفاده\n"
@@ -2821,6 +3206,8 @@ async def post_shutdown(application: Application) -> None:
         release_pending_selection(session)
     YOUTUBE_SEARCH_SESSIONS.clear()
     ACTIVE_YOUTUBE_SEARCHES.clear()
+    SHAZAM_SEARCH_SESSIONS.clear()
+    ACTIVE_SHAZAM_SEARCHES.clear()
     for worker in ACCOUNT_POOL.workers:
         with contextlib.suppress(Exception):
             await worker.client.disconnect()
@@ -2863,11 +3250,13 @@ def main() -> None:
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("caption", caption_command))
     application.add_handler(CommandHandler(("search", "yt"), search_command))
+    application.add_handler(CommandHandler("song", song_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("dl", dl_command))
     application.add_handler(CallbackQueryHandler(on_selection, pattern=r"^(?:sel|cancel|info|caption):"))
     application.add_handler(CallbackQueryHandler(on_reel_music_callback, pattern=r"^reel_music:"))
     application.add_handler(CallbackQueryHandler(on_youtube_search_callback, pattern=r"^(?:ys|yp):"))
+    application.add_handler(CallbackQueryHandler(on_shazam_search_callback, pattern=r"^(?:ss|sp):"))
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
