@@ -152,7 +152,7 @@ URL_REGEX = re.compile(r"https?://[^\s<>\"']+|www\.[^\s<>\"']+", re.IGNORECASE)
 TRAILING_URL_PUNCTUATION = ".,!?:;،؛؟]}>\"'"
 MAX_ACTIVE_TASKS_PER_USER = 2
 REQUIRED_CHANNELS = (
-    ("@MZDNLD_upnews", "https://t.me/MZDNLD_upnews", "MZ Downloader | News"),
+    ("@MZDNLD_upnews", "https://t.me/MZDNLD_upnews", "MZ Downloader | Updates"),
 )
 MEMBERSHIP_CACHE_TTL = 5 * 60
 FEEDBACK_STICKER_SET = "MZDownloader"
@@ -2534,6 +2534,7 @@ WELCOME_PRIVATE = status_card(
     "لینکت رو بفرست، بقیه‌ش با من 😎\n\n"
     "🎬 ویدیو با انتخاب کیفیت\n"
     "🔎 جست‌وجوی YouTube و نمایش ۳۰ نتیجه\n"
+    "📝 دانلود ساب‌تایتل فارسی و انگلیسی برای ویدیوهای یوتیوب\n"
     "🎵 جست‌وجوی آهنگ با /song (کاور + خواننده - اسم آهنگ)\n"
     "🎧 آهنگ تکی، آلبوم و پلی‌لیست ZIP\n"
     "📸 کپشن پست‌های Instagram\n"
