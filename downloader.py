@@ -293,6 +293,111 @@ def _flag_to_lang(country_code: str) -> str | None:
     return FLAG_TO_LANG.get(country_code.upper())
 
 
+# Maps lowercased human language names (in multiple scripts) to ISO 639-1 codes.
+# Used to detect text-only language buttons that don't carry a flag emoji
+# (e.g. @allsaverbot sometimes labels buttons with just "فارسی" or "English").
+LANG_NAME_TO_CODE: dict[str, str] = {
+    "persian": "fa", "farsi": "fa", "dari": "fa", "فارسی": "fa", "فارسى": "fa",
+    "english": "en", "انگلیسی": "en", "انگليسی": "en",
+    "arabic": "ar", "العربية": "ar", "عربی": "ar",
+    "spanish": "es", "español": "es", "espanol": "es", "اسپانیایی": "es",
+    "french": "fr", "français": "fr", "francais": "fr", "فرانسوی": "fr",
+    "german": "de", "deutsch": "de", "آلمانی": "de",
+    "italian": "it", "italiano": "it", "ایتالیایی": "it",
+    "portuguese": "pt", "português": "pt", "portugues": "pt", "پرتغالی": "pt",
+    "russian": "ru", "русский": "ru", "روسی": "ru",
+    "ukrainian": "uk", "українська": "uk", "اوکراینی": "uk",
+    "turkish": "tr", "türkçe": "tr", "turkce": "tr", "ترکی": "tr",
+    "hindi": "hi", "हिन्दी": "hi", "هندی": "hi",
+    "urdu": "ur", "اردو": "ur", "اردو": "ur",
+    "bengali": "bn", "বাংলা": "bn",
+    "indonesian": "id", "bahasa": "id", "اندونزیایی": "id",
+    "malay": "ms", "مالایی": "ms",
+    "chinese": "zh", "中文": "zh", "چینی": "zh",
+    "japanese": "ja", "日本語": "ja", "ژاپنی": "ja",
+    "korean": "ko", "한국어": "ko", "کره‌ای": "ko",
+    "thai": "th", "ไทย": "th",
+    "vietnamese": "vi", "tiếng việt": "vi", "tieng viet": "vi",
+    "dutch": "nl", "nederlands": "nl", "هلندی": "nl",
+    "polish": "pl", "polski": "pl", "لهستانی": "pl",
+    "czech": "cs", "čeština": "cs", "cestina": "cs",
+    "slovak": "sk",
+    "hungarian": "hu", "magyar": "hu",
+    "romanian": "ro", "română": "ro", "romana": "ro",
+    "bulgarian": "bg", "български": "bg",
+    "swedish": "sv", "svenska": "sv",
+    "norwegian": "no", "norsk": "no",
+    "finnish": "fi", "suomi": "fi",
+    "danish": "da", "dansk": "da",
+    "greek": "el", "ελληνικά": "el",
+    "hebrew": "he", "עברית": "he",
+    "kurdish": "ku", "kurdi": "ku", "کردی": "ku",
+    "pashto": "ps", "پښتو": "ps",
+    "azerbaijani": "az", "azərbaycan": "az",
+    "kazakh": "kk", "қазақ": "kk",
+    "uzbek": "uz", "oʻzbek": "uz",
+    "filipino": "fil", "tagalog": "fil",
+}
+
+
+def _detect_language_name(label: str) -> str | None:
+    """Return the ISO 639-1 code if *label* is (or starts with) a known
+    language name in any script. Returns ``None`` otherwise.
+
+    The match is case-insensitive for Latin script. For CJK and other
+    scripts, the match is exact (those scripts don't have case).
+    """
+    if not label:
+        return None
+    lowered = label.strip().lower()
+    if not lowered:
+        return None
+    # Exact match
+    if lowered in LANG_NAME_TO_CODE:
+        return LANG_NAME_TO_CODE[lowered]
+    # Original-case match (for non-Latin scripts that don't lowercase well)
+    original = label.strip()
+    if original in LANG_NAME_TO_CODE:
+        return LANG_NAME_TO_CODE[original]
+    # Starts-with match (e.g. "English (auto-generated)" → "en")
+    for key, code in LANG_NAME_TO_CODE.items():
+        if lowered.startswith(key) or original.startswith(key):
+            return code
+    return None
+
+
+# Short labels that are clearly NOT language selectors — used by the
+# heuristic fallback in :func:`extract_language_options`.
+_NON_LANGUAGE_LABEL_MARKERS = (
+    "cancel", "back", "close", "menu", "start", "stop", "retry", "retry",
+    "download", "refresh", "share", "help", "settings", "next", "prev",
+    "بازگشت", "لغو", "بستن", "منو", "شروع", "توقف", "دانلود", "بارگیری",
+    "به‌روزرسانی", "اشتراک‌گذاری", "راهنما", "تنظیمات", "بعدی", "قبلی",
+)
+
+
+def _looks_like_language_button(label: str) -> bool:
+    """Heuristic: does this short button label look like a language selector?
+
+    Returns True for short (≤24 char) labels that aren't obviously navigation
+    or action buttons. This is intentionally permissive — it's only used as a
+    fallback when the message is a photo (typical of @allsaverbot's multi-audio
+    cover) and no flag/language-name was detected.
+    """
+    if not label:
+        return False
+    stripped = label.strip()
+    if not stripped:
+        return False
+    if len(stripped) > 24:
+        return False
+    lowered = stripped.lower()
+    for marker in _NON_LANGUAGE_LABEL_MARKERS:
+        if marker in lowered:
+            return False
+    return True
+
+
 ERROR_MARKERS = (
     "invalid url",
     "unsupported",
@@ -414,20 +519,28 @@ def extract_quality_options(message: Any) -> tuple[QualityOption, ...]:
 
 
 def extract_language_options(message: Any) -> tuple[QualityOption, ...]:
-    """Find inline buttons that look like audio-language flag selectors.
+    """Find inline buttons that look like audio-language selectors.
 
-    A button qualifies when:
+    A button qualifies when ANY of the following is true:
       1. Its label contains at least one regional-indicator flag emoji
          (e.g. 🇮🇷, 🇬🇧, 🇩🇪).
-      2. It is NOT a URL button.
-      3. It does NOT match the regular quality / caption patterns (so we
-         don't accidentally swallow a quality button that happens to contain
-         a flag — e.g. "🇮🇷 1080p" would still be treated as quality).
+      2. Its label is (or starts with) a known language name in any script
+         — e.g. "فارسی", "English", "العربية", "Español", "हिन्दी".
+      3. Heuristic fallback: when the message is a photo (typical of the
+         @allsaverbot multi-audio cover) and a button doesn't match any
+         quality / caption / URL / denied pattern, treat it as a language
+         button. This catches buttons that use unexpected formats.
+
+    The button must NOT be a URL button and must NOT match the regular
+    quality / caption patterns (so we don't accidentally swallow a quality
+    button that happens to contain a flag — e.g. "🇮🇷 1080p" would still
+    be treated as quality).
 
     Returned options use ``action="language"`` so callers can distinguish
     them from regular media/caption options.
     """
     rows = getattr(message, "buttons", None) or ()
+    is_photo = message_media_kind(message) == MediaKind.PHOTO
     options: list[QualityOption] = []
     for row_index, row in enumerate(rows):
         for column_index, button in enumerate(row):
@@ -436,37 +549,66 @@ def extract_language_options(message: Any) -> tuple[QualityOption, ...]:
                 continue
             if _button_url(button):
                 continue
-            flags = _flag_emojis_in_label(label)
-            if not flags:
-                continue
             # Skip buttons that look like quality / caption selectors
             if QUALITY_PATTERN.search(label) or CAPTION_BUTTON_PATTERN.search(label):
                 continue
-            options.append(
-                QualityOption(
-                    label=label,
-                    row=row_index,
-                    column=column_index,
-                    fingerprint=button_fingerprint(button, row_index, column_index),
-                    expected_kind=None,
-                    expected_height=None,
-                    action="language",
+            flags = _flag_emojis_in_label(label)
+            lang_name = _detect_language_name(label)
+            if flags or lang_name:
+                options.append(
+                    QualityOption(
+                        label=label,
+                        row=row_index,
+                        column=column_index,
+                        fingerprint=button_fingerprint(button, row_index, column_index),
+                        expected_kind=None,
+                        expected_height=None,
+                        action="language",
+                    )
                 )
-            )
+                continue
+            # Heuristic fallback: on a photo message (typical of the
+            # @allsaverbot multi-audio cover), any small non-quality,
+            # non-URL, non-denied button is most likely a language selector.
+            # This catches buttons that use unexpected formats (e.g. just
+            # a country code, an obscure language name, or an emoji we
+            # don't recognise).
+            if is_photo and _looks_like_language_button(label):
+                options.append(
+                    QualityOption(
+                        label=label,
+                        row=row_index,
+                        column=column_index,
+                        fingerprint=button_fingerprint(button, row_index, column_index),
+                        expected_kind=None,
+                        expected_height=None,
+                        action="language",
+                    )
+                )
     return tuple(options)
 
 
 def language_option_lang_code(option: QualityOption) -> str | None:
-    """Return the ISO 639-1 language code for a language-flag QualityOption.
+    """Return the ISO 639-1 language code for a language QualityOption.
 
-    Picks the first flag emoji in the label and maps it via :data:`FLAG_TO_LANG`.
-    Returns ``None`` if the flag has no known language mapping.
+    Tries in order:
+      1. Flag emoji in the label → country code → language code
+         (e.g. 🇮🇷 → IR → fa).
+      2. Language name in the label → language code
+         (e.g. "فارسی" → fa, "English" → en).
+
+    Returns ``None`` if no mapping can be derived (e.g. the label was
+    matched only by the heuristic fallback in
+    :func:`extract_language_options`).
     """
     flags = _flag_emojis_in_label(option.label)
     for cc in flags:
         code = _flag_to_lang(cc)
         if code:
             return code
+    code = _detect_language_name(option.label)
+    if code:
+        return code
     return None
 
 
@@ -838,6 +980,14 @@ async def await_response_decision(
             if expected_option is None:
                 lang_options = extract_language_options(message)
                 if lang_options:
+                    logger.info(
+                        "Detected language menu: %d option(s) [%s] on msg %d (kind=%s, text=%r)",
+                        len(lang_options),
+                        ", ".join(opt.label for opt in lang_options),
+                        message_id,
+                        kind.name if hasattr(kind, "name") else str(kind),
+                        text[:200],
+                    )
                     previews = dict(candidates)
                     if kind == MediaKind.PHOTO:
                         previews[message_id] = message
@@ -1195,6 +1345,7 @@ class DownloaderGateway:
                 # (e.g. @allsaverbot for multi-audio YouTube videos). Up to
                 # 3 consecutive language menus are auto-handled; anything
                 # beyond that is treated as an error to avoid infinite loops.
+                lang_menu_ids: set[int] = set()
                 for _language_round in range(4):
                     decision = await await_response_decision(
                         stream,
@@ -1204,6 +1355,13 @@ class DownloaderGateway:
                         preview_grace=self.preview_grace,
                         album_window=self.album_window,
                         expected_kind=effective_kind,
+                        # Allow the bot to edit any of the language menu
+                        # messages in-place (e.g. to replace flag buttons
+                        # with quality buttons, or to show the video itself).
+                        # Without this, edits to a menu message would be
+                        # rejected by the correlation check because their
+                        # message_id is <= after_id.
+                        allowed_edit_ids=lang_menu_ids | reply_targets,
                     )
                     if decision.status != "language_menu":
                         break
@@ -1267,11 +1425,22 @@ class DownloaderGateway:
                         "Auto-clicking language button %r on @%s for %s",
                         current.label, bot_username, url,
                     )
-                    await menu.click(current.row, current.column)
-                    # Update tracking so the next await_response_decision call
-                    # picks up messages that arrive AFTER the click.
-                    after_id = await self._latest_message_id(client, bot_username)
+                    # IMPORTANT: do NOT re-fetch the latest message id after
+                    # clicking. If we did, a fast bot response that arrives
+                    # before our get_messages call returns would have its id
+                    # incorporated into after_id, and the subsequent
+                    # await_response_decision would filter it out
+                    # (message_id <= after_id). The BotEventStream's _seen
+                    # set already deduplicates already-processed messages,
+                    # so keeping after_id at its pre-click value is safe and
+                    # ensures we never miss the bot's response.
+                    lang_menu_ids.add(decision.menu_message_id)
                     reply_targets.add(decision.menu_message_id)
+                    await menu.click(current.row, current.column)
+                    logger.info(
+                        "Language button clicked on @%s, waiting for response (after_id=%d, reply_targets=%s)",
+                        bot_username, after_id, sorted(reply_targets),
+                    )
                 # After the loop, decision is non-None and is either a regular
                 # menu / media / timeout / error.
                 assert decision is not None
