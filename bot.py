@@ -3195,12 +3195,14 @@ async def post_init(application: Application) -> None:
         BotCommand("stats", "آمار این اجرا"),
         BotCommand("caption", "دریافت کپشن Instagram"),
         BotCommand("search", "جست‌وجو در YouTube"),
+        BotCommand("song", "جست‌و‌جو آهنگ"),
         BotCommand("cancel", "توقف دانلودهای من"),
         BotCommand("dl", "دانلود لینک"),
     ]
     group_commands = [
         BotCommand("dl", "دانلود لینک یا پیام ریپلای‌شده"),
         BotCommand("search", "جست‌وجو در YouTube"),
+        BotCommand("song", "جست‌و‌جو آهنگ"),
         BotCommand("cancel", "توقف دانلودهای من"),
         BotCommand("status", "وضعیت صف"),
         BotCommand("platforms", "پلتفرم‌ها"),
