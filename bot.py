@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import io
 import ipaddress
 import json
 import logging
@@ -86,6 +87,15 @@ from mz_shazam_search import (
     ShazamSearchService,
     normalize_song_query,
     youtube_url_for_song,
+)
+from youtube_subtitle import (
+    LANGUAGE_ENGLISH as SUBTITLE_LANG_EN,
+    LANGUAGE_PERSIAN as SUBTITLE_LANG_FA,
+    YouTubeSubtitleError,
+    YouTubeSubtitleNotFound,
+    extract_youtube_video_id as _extract_youtube_video_id,
+    fetch_youtube_subtitle,
+    is_youtube_shorts_url,
 )
 
 
@@ -224,6 +234,11 @@ MEMBERSHIP_CACHE: dict[int, float] = {}
 # token → (url, created_at, chat_id, user_id)
 REEL_MUSIC_URLS: dict[str, tuple[str, float, int, int]] = {}
 REEL_MUSIC_TTL = 600  # 10 minutes
+# token → (youtube_url, created_at, chat_id, user_id)
+# Used by the subtitle follow-up message so the callback handler can recover
+# the original YouTube URL when the user clicks 🇮🇷 فارسی or 🇬🇧 English.
+YOUTUBE_SUBTITLE_URLS: dict[str, tuple[str, float, int, int]] = {}
+YOUTUBE_SUBTITLE_TTL = 600  # 10 minutes
 ADMIN_USERNAME = "iR0nin"  # only this user can use /broadcast
 
 # Pixeldrain uploader
@@ -835,6 +850,35 @@ async def scrape_instagram_caption(url: str) -> str:
     except Exception as exc:
         logger.warning("Instagram caption scraper failed: %s", exc)
     return ""
+
+
+def is_youtube_long_video(url: str, result: GatewayResult) -> bool:
+    """Decide whether *url* (a YouTube URL whose download just finished) is a
+    *long* video — i.e. NOT a Short — so the subtitle follow-up should fire.
+
+    A video is considered long when:
+      1. The URL path is NOT ``/shorts/{id}``, AND
+      2. Either the downloaded media has no duration info, OR duration > 60s.
+    """
+    if is_youtube_shorts_url(url):
+        return False
+    if result.media:
+        duration = getattr(result.media[0], "duration", None)
+        if duration is not None and duration <= 60:
+            return False
+    return True
+
+
+async def fetch_subtitle_for_user(url: str, language: str) -> bytes:
+    """Wrapper around :func:`fetch_youtube_subtitle` that injects the project
+    proxy. Returns the raw SRT bytes. Raises :class:`YouTubeSubtitleError`
+    on any failure.
+    """
+    return await fetch_youtube_subtitle(
+        url,
+        language,
+        proxy_url=_caption_proxy_url(),
+    )
 
 
 def is_active_channel_member(member: Any) -> bool:
@@ -1696,6 +1740,35 @@ async def _process_url(
                             reply_to_message_id=reply_to,
                             reply_markup=InlineKeyboardMarkup([[
                                 InlineKeyboardButton("🎵 دریافت موزیک ریلز", callback_data=f"reel_music:{reel_token}")
+                            ]]),
+                        )
+                elif platform == Platform.YOUTUBE and is_youtube_long_video(url, result):
+                    # Subtitle follow-up: offer Persian & English SRT download.
+                    yt_sub_token = uuid.uuid4().hex[:12]
+                    YOUTUBE_SUBTITLE_URLS[yt_sub_token] = (
+                        url,
+                        time.monotonic(),
+                        chat_id,
+                        update.effective_user.id,
+                    )
+                    with contextlib.suppress(TelegramError):
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=status_card(
+                                "📝 زیرنویس این ویدیو رو هم می‌خوای؟",
+                                "اگه ساب‌تایتل این ویدیو رو هم می‌خوای، دکمه هر زبانی که می‌خوای بزن تا بفرستم.",
+                            ),
+                            parse_mode=ParseMode.HTML,
+                            reply_to_message_id=reply_to,
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton(
+                                    "🇮🇷 فارسی",
+                                    callback_data=f"yt_sub:{yt_sub_token}:{SUBTITLE_LANG_FA}",
+                                ),
+                                InlineKeyboardButton(
+                                    "🇬🇧 English",
+                                    callback_data=f"yt_sub:{yt_sub_token}:{SUBTITLE_LANG_EN}",
+                                ),
                             ]]),
                         )
                 return
@@ -3162,6 +3235,182 @@ def cleanup_stale_download_directories(max_age_seconds: float = 24 * 60 * 60) ->
             cleanup_request_directory(child, SETTINGS.download_root)
 
 
+# Help text shown after sending an SRT subtitle file. Exact wording per spec.
+SUBTITLE_HELP_TEXT = (
+    "📄 راهنمای استفاده از فایل زیرنویس\n"
+    "\n"
+    "فایل SRT شامل متن زیرنویس به‌همراه زمان‌بندی دقیق هر جمله است.\n"
+    "\n"
+    "🎬 برای استفاده، فایل SRT را همراه با ویدیوی خود در برنامه‌هایی مثل VLC، "
+    "MX Player، PotPlayer یا نرم‌افزارهای ادیت ویدیو مثل CapCut و Premiere وارد کنید.\n"
+    "\n"
+    "💡 اگر فقط متن زیرنویس را می‌خواهید، می‌توانید فایل SRT را با هر ویرایشگر متنی باز کنید.\n"
+    "\n"
+    "⚠️ فایل SRT به‌تنهایی ویدیو نیست؛ فقط متن و زمان‌بندی زیرنویس را شامل می‌شود."
+)
+
+
+async def on_youtube_subtitle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 🇮🇷 فارسی / 🇬🇧 English subtitle button presses.
+
+    Callback data format: ``yt_sub:{token}:{language}`` where language is "fa" or "en".
+    Recovers the YouTube URL from :data:`YOUTUBE_SUBTITLE_URLS`, fetches the SRT
+    via :mod:`youtube_subtitle`, sends it as a document, then sends the help text.
+    """
+    query = update.callback_query
+    data = query.data or ""
+    parts = data.split(":")
+    # Expected parts: ["yt_sub", token, language]
+    if len(parts) < 3:
+        await query.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+    token = parts[1]
+    language = parts[2]
+
+    if language not in (SUBTITLE_LANG_FA, SUBTITLE_LANG_EN):
+        await query.answer("زبان انتخابی پشتیبانی نمی‌شود.", show_alert=True)
+        return
+
+    entry = YOUTUBE_SUBTITLE_URLS.get(token)
+    if entry is None:
+        await query.answer("این درخواست منقضی شده است.", show_alert=True)
+        return
+
+    url, created_at, orig_chat_id, orig_user_id = entry
+    if time.monotonic() - created_at > YOUTUBE_SUBTITLE_TTL:
+        YOUTUBE_SUBTITLE_URLS.pop(token, None)
+        await query.answer("این درخواست منقضی شده است.", show_alert=True)
+        return
+    if update.effective_user.id != orig_user_id or update.effective_chat.id != orig_chat_id:
+        await query.answer("این درخواست متعلق به شما نیست.", show_alert=True)
+        return
+
+    # Don't pop the token yet — allow the user to also click the *other* language
+    # button on the same follow-up message. The token naturally expires via TTL.
+
+    chat_id = update.effective_chat.id
+    reply_to = query.message.message_id if query.message else None
+
+    lang_label = "فارسی" if language == SUBTITLE_LANG_FA else "English"
+    await query.answer(f"📝 دارم زیرنویس {lang_label} رو آماده می‌کنم…")
+
+    # Replace the keyboard with a "preparing" indicator so the user knows it's working
+    with contextlib.suppress(TelegramError):
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"⏳ در حال آماده‌سازی زیرنویس {lang_label}…",
+                    callback_data="yt_sub:noop",
+                ),
+            ]])
+        )
+
+    status_message = await send_status(
+        context,
+        chat_id,
+        status_card(
+            f"📝 در حال دانلود زیرنویس {lang_label}",
+            "از روی زیرنویس‌های YouTube استخراج می‌شه. ممکنه چند ثانیه طول بکشه.",
+        ),
+        reply_to,
+    )
+
+    try:
+        srt_bytes = await fetch_subtitle_for_user(url, language)
+    except YouTubeSubtitleNotFound:
+        await edit_status(
+            status_message,
+            status_card(
+                "⚠️ زیرنویس پیدا نشد",
+                f"برای این ویدیو زیرنویس {lang_label} در دسترس نیست.\n"
+                "ممکنه ویدیو زیرنویس نداشته باشه یا YouTube در حال حاضر اجازه نده.",
+            ),
+        )
+        # Restore the original language buttons so the user can try the other language
+        with contextlib.suppress(TelegramError):
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "🇮🇷 فارسی",
+                        callback_data=f"yt_sub:{token}:{SUBTITLE_LANG_FA}",
+                    ),
+                    InlineKeyboardButton(
+                        "🇬🇧 English",
+                        callback_data=f"yt_sub:{token}:{SUBTITLE_LANG_EN}",
+                    ),
+                ]])
+            )
+        return
+    except YouTubeSubtitleError as exc:
+        logger.warning("YouTube subtitle fetch failed for %s: %s", url, exc)
+        await edit_status(
+            status_message,
+            status_card(
+                "⚠️ دریافت زیرنویس ناموفق بود",
+                f"یه مشکلی پیش اومد. دوباره تلاش کن.\n"
+                f"جزئیات: {html.escape(str(exc))}",
+            ),
+        )
+        # Restore the original language buttons
+        with contextlib.suppress(TelegramError):
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "🇮🇷 فارسی",
+                        callback_data=f"yt_sub:{token}:{SUBTITLE_LANG_FA}",
+                    ),
+                    InlineKeyboardButton(
+                        "🇬🇧 English",
+                        callback_data=f"yt_sub:{token}:{SUBTITLE_LANG_EN}",
+                    ),
+                ]])
+            )
+        return
+
+    # Send the SRT file as a document
+    video_id_for_name = _extract_youtube_video_id(url) or ""
+    filename = f"subtitle_{video_id_for_name or 'video'}_{language}.srt"
+    document = io.BytesIO(srt_bytes)
+    document.name = filename
+
+    try:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=document,
+            filename=filename,
+            caption=f"📝 زیرنویس {lang_label} • <code>{html.escape(video_id_for_name or url)}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=reply_to,
+        )
+    except TelegramError as exc:
+        logger.warning("Failed to send SRT document: %s", exc)
+        await edit_status(
+            status_message,
+            status_card(
+                "⚠️ ارسال فایل زیرنویس ناموفق بود",
+                f"یه مشکلی توی ارسال فایل پیش اومد. دوباره تلاش کن.\nجزئیات: {html.escape(str(exc))}",
+            ),
+        )
+        return
+
+    # Edit status message to "done"
+    await edit_status(
+        status_message,
+        status_card(
+            f"✅ زیرنویس {lang_label} ارسال شد",
+            "فایل زیرنویس رو بالا می‌بینی. راهنمای استفاده‌اش رو هم بعدش فرستادم.",
+        ),
+    )
+
+    # Send the help text — exact wording per spec
+    with contextlib.suppress(TelegramError):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=SUBTITLE_HELP_TEXT,
+            reply_to_message_id=reply_to,
+        )
+
+
 async def post_init(application: Application) -> None:
     global SELECTION_REAPER_TASK, HEALTH_SERVER
     cleanup_stale_download_directories()
@@ -3309,6 +3558,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(on_reel_music_callback, pattern=r"^reel_music:"))
     application.add_handler(CallbackQueryHandler(on_youtube_search_callback, pattern=r"^(?:ys|yp):"))
     application.add_handler(CallbackQueryHandler(on_shazam_search_callback, pattern=r"^(?:ss|sp):"))
+    application.add_handler(CallbackQueryHandler(on_youtube_subtitle_callback, pattern=r"^yt_sub:"))
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
