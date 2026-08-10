@@ -881,6 +881,56 @@ async def fetch_subtitle_for_user(url: str, language: str) -> bytes:
     )
 
 
+async def send_subtitle_followup(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    reply_to: int | None,
+    youtube_url: str,
+    result: GatewayResult,
+) -> None:
+    """Send the 🇮🇷 فارسی / 🇬🇧 English subtitle follow-up message after a
+    long YouTube video has been successfully delivered to the user.
+
+    Shared between :func:`_process_url` (direct-download path) and
+    :func:`on_selection` (quality-selection path) so both code paths trigger
+    the same follow-up.
+
+    Ownership model: we store ``user_id = -1`` so the callback handler skips
+    the per-user check (chat_id match is enough because only the original
+    chat can see the inline button).
+    """
+    if not is_youtube_long_video(youtube_url, result):
+        return
+    yt_sub_token = uuid.uuid4().hex[:12]
+    YOUTUBE_SUBTITLE_URLS[yt_sub_token] = (
+        youtube_url,
+        time.monotonic(),
+        chat_id,
+        -1,  # skip per-user check; chat_id match is sufficient
+    )
+    with contextlib.suppress(TelegramError):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=status_card(
+                "📝 زیرنویس این ویدیو رو هم می‌خوای؟",
+                "اگه ساب‌تایتل این ویدیو رو هم می‌خوای، دکمه هر زبانی که می‌خوای بزن تا بفرستم.",
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=reply_to,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🇮🇷 فارسی",
+                    callback_data=f"yt_sub:{yt_sub_token}:{SUBTITLE_LANG_FA}",
+                ),
+                InlineKeyboardButton(
+                    "🇬🇧 English",
+                    callback_data=f"yt_sub:{yt_sub_token}:{SUBTITLE_LANG_EN}",
+                ),
+            ]]),
+        )
+
+
 def is_active_channel_member(member: Any) -> bool:
     status = getattr(member, "status", "")
     if status in {ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER}:
@@ -1742,35 +1792,15 @@ async def _process_url(
                                 InlineKeyboardButton("🎵 دریافت موزیک ریلز", callback_data=f"reel_music:{reel_token}")
                             ]]),
                         )
-                elif platform == Platform.YOUTUBE and is_youtube_long_video(url, result):
+                elif platform == Platform.YOUTUBE:
                     # Subtitle follow-up: offer Persian & English SRT download.
-                    yt_sub_token = uuid.uuid4().hex[:12]
-                    YOUTUBE_SUBTITLE_URLS[yt_sub_token] = (
-                        url,
-                        time.monotonic(),
-                        chat_id,
-                        update.effective_user.id,
+                    await send_subtitle_followup(
+                        context,
+                        chat_id=chat_id,
+                        reply_to=reply_to,
+                        youtube_url=url,
+                        result=result,
                     )
-                    with contextlib.suppress(TelegramError):
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=status_card(
-                                "📝 زیرنویس این ویدیو رو هم می‌خوای؟",
-                                "اگه ساب‌تایتل این ویدیو رو هم می‌خوای، دکمه هر زبانی که می‌خوای بزن تا بفرستم.",
-                            ),
-                            parse_mode=ParseMode.HTML,
-                            reply_to_message_id=reply_to,
-                            reply_markup=InlineKeyboardMarkup([[
-                                InlineKeyboardButton(
-                                    "🇮🇷 فارسی",
-                                    callback_data=f"yt_sub:{yt_sub_token}:{SUBTITLE_LANG_FA}",
-                                ),
-                                InlineKeyboardButton(
-                                    "🇬🇧 English",
-                                    callback_data=f"yt_sub:{yt_sub_token}:{SUBTITLE_LANG_EN}",
-                                ),
-                            ]]),
-                        )
                 return
             if result.status == "needs_selection":
                 displayed_options = tuple(
@@ -3072,6 +3102,16 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             ),
             progress=selection_progress,
         )
+        # Subtitle follow-up for long YouTube videos (selected-quality path).
+        # This mirrors the direct-download path in _process_url.
+        if session.platform == Platform.YOUTUBE and option.action == "media":
+            await send_subtitle_followup(
+                context,
+                chat_id=session.chat_id,
+                reply_to=session.reply_to,
+                youtube_url=session.source_url,
+                result=result,
+            )
     except asyncio.CancelledError:
         with contextlib.suppress(TelegramError):
             await query.edit_message_text(
@@ -3281,8 +3321,13 @@ async def on_youtube_subtitle_callback(update: Update, context: ContextTypes.DEF
         YOUTUBE_SUBTITLE_URLS.pop(token, None)
         await query.answer("این درخواست منقضی شده است.", show_alert=True)
         return
-    if update.effective_user.id != orig_user_id or update.effective_chat.id != orig_chat_id:
+    # When orig_user_id == -1 we only enforce chat_id match (used by the
+    # quality-selection path where the original user_id is not stored).
+    if orig_user_id != -1 and update.effective_user.id != orig_user_id:
         await query.answer("این درخواست متعلق به شما نیست.", show_alert=True)
+        return
+    if update.effective_chat.id != orig_chat_id:
+        await query.answer("این درخواست متعلق به این چت نیست.", show_alert=True)
         return
 
     # Don't pop the token yet — allow the user to also click the *other* language
