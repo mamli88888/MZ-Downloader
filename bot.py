@@ -142,7 +142,7 @@ URL_REGEX = re.compile(r"https?://[^\s<>\"']+|www\.[^\s<>\"']+", re.IGNORECASE)
 TRAILING_URL_PUNCTUATION = ".,!?:;،؛؟]}>\"'"
 MAX_ACTIVE_TASKS_PER_USER = 2
 REQUIRED_CHANNELS = (
-    ("@MZBOTS_Monitor", "https://t.me/MZBOTS_Monitor", "MZ Bots Monitoring"),
+    ("@MZDNLD_upnews", "https://t.me/MZDNLD_upnews", "MZ Downloader | News"),
 )
 MEMBERSHIP_CACHE_TTL = 5 * 60
 FEEDBACK_STICKER_SET = "MZDownloader"
@@ -884,7 +884,7 @@ async def ensure_required_membership(update: Update, context: ContextTypes.DEFAU
     await message.reply_text(
         status_card(
             "اول یه عضویت کوچولو 😊",
-            "برای اینکه بتونی از همه‌ی امکانات استفاده کنی، توی هر دو کانال زیر عضو شو.",
+            "برای اینکه بتونی از همه‌ی امکانات استفاده کنی، توی کانال زیر عضو شو.",
             "عضو که شدی، دوباره /start رو بزن تا بریم سراغ دانلود!",
         ),
         parse_mode=ParseMode.HTML,
