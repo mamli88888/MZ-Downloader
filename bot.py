@@ -93,6 +93,7 @@ from youtube_subtitle import (
     LANGUAGE_PERSIAN as SUBTITLE_LANG_FA,
     YouTubeSubtitleError,
     YouTubeSubtitleNotFound,
+    detect_original_language as _detect_youtube_original_language,
     extract_youtube_video_id as _extract_youtube_video_id,
     fetch_youtube_subtitle,
     is_youtube_shorts_url,
@@ -878,6 +879,23 @@ async def fetch_subtitle_for_user(url: str, language: str) -> bytes:
         url,
         language,
         proxy_url=_caption_proxy_url(),
+    )
+
+
+async def resolve_youtube_original_language(url: str) -> str | None:
+    """Detect the original language of a YouTube video (ISO 639-1 code).
+
+    Used as the ``language_resolver`` callback for :meth:`DownloaderGateway.request`
+    so that, when @allsaverbot replies to a multi-audio YouTube URL with a row
+    of flag-emoji buttons, we automatically click the flag matching the
+    video's original language instead of bothering the user.
+
+    Best-effort: returns ``None`` on any failure, in which case the gateway
+    falls back to clicking the first flag button (which is usually the
+    original language on YouTube multi-audio tracks anyway).
+    """
+    return await _detect_youtube_original_language(
+        url, proxy_url=_caption_proxy_url()
     )
 
 
@@ -1762,6 +1780,11 @@ async def _process_url(
                 url=url,
                 attempt_directory=attempt_directory,
                 progress_callback=progress.download,
+                language_resolver=(
+                    resolve_youtube_original_language
+                    if platform == Platform.YOUTUBE
+                    else None
+                ),
             )
             if result.status == "ready":
                 instagram_caption = await caption_task if caption_task is not None else ""
@@ -1806,7 +1829,8 @@ async def _process_url(
                 displayed_options = tuple(
                     option
                     for option in result.options
-                    if not (platform == Platform.INSTAGRAM and option.action == "caption")
+                    if option.action != "language"
+                    and not (platform == Platform.INSTAGRAM and option.action == "caption")
                 )[:24]
                 youtube_formats: tuple[YouTubeFormatSize, ...] = ()
                 if platform == Platform.YOUTUBE:

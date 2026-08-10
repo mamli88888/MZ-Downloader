@@ -212,6 +212,87 @@ DENIED_BUTTON_MARKERS = (
     "refresh metadata",
 )
 CAPTION_BUTTON_PATTERN = re.compile(r"\b(?:download\s+)?caption\b", re.IGNORECASE)
+
+# ---- language-flag emoji detection ----
+# @allsaverbot (and similar multi-audio downloaders) show a thumbnail + a row
+# of flag-emoji buttons (one per audio language) for YouTube videos that have
+# multiple audio tracks. We auto-detect this "language menu" and click through
+# it so the user only ever sees the regular quality menu.
+#
+# Each flag emoji is two regional indicator chars (U+1F1E6 .. U+1F1FF), each
+# corresponding to a letter A..Z. The pair gives an ISO 3166-1 alpha-2 country
+# code (e.g. "IR" -> 🇮🇷, "GB" -> 🇬🇧, "DE" -> 🇩🇪).
+REGIONAL_INDICATOR_A = 0x1F1E6
+REGIONAL_INDICATOR_Z = 0x1F1FF
+
+# Map ISO 3166-1 alpha-2 country codes -> ISO 639-1 language codes.
+# This is necessarily heuristic — many countries have multiple official
+# languages. We pick the most common language for each flag, especially
+# as it relates to YouTube multi-audio tracks.
+FLAG_TO_LANG: dict[str, str] = {
+    "IR": "fa", "AF": "fa", "TJ": "fa",
+    "US": "en", "GB": "en", "CA": "en", "AU": "en", "NZ": "en", "IE": "en",
+    "DE": "de", "AT": "de", "CH": "de",
+    "FR": "fr", "BE": "fr", "MC": "fr",
+    "ES": "es", "MX": "es", "AR": "es", "CO": "es", "CL": "es", "PE": "es",
+    "VE": "es", "EC": "es", "UY": "es", "PY": "es", "BO": "es", "CR": "es",
+    "CU": "es", "DO": "es", "GT": "es", "HN": "es", "NI": "es", "PA": "es",
+    "PR": "es", "SV": "es",
+    "IT": "it", "PT": "pt", "BR": "pt",
+    "RU": "ru", "BY": "ru", "KZ": "ru",
+    "UA": "uk",
+    "TR": "tr", "AZ": "az", "UZ": "uz", "KZ": "kk", "KG": "ky", "TM": "tk",
+    "SA": "ar", "AE": "ar", "EG": "ar", "IQ": "ar", "SY": "ar", "JO": "ar",
+    "LB": "ar", "PS": "ar", "YE": "ar", "OM": "ar", "KW": "ar", "QA": "ar",
+    "BH": "ar", "LY": "ar", "TN": "ar", "DZ": "ar", "MA": "ar", "SD": "ar",
+    "MR": "ar", "DJ": "ar", "KM": "ar",
+    "CN": "zh", "HK": "zh", "TW": "zh", "SG": "zh",
+    "JP": "ja", "KR": "ko", "KP": "ko",
+    "IN": "hi", "PK": "ur", "BD": "bn", "LK": "si", "NP": "ne",
+    "TH": "th", "VN": "vi", "ID": "id", "MY": "ms", "PH": "fil",
+    "NL": "nl", "BE": "nl",
+    "PL": "pl", "CZ": "cs", "SK": "sk", "HU": "hu", "RO": "ro", "BG": "bg",
+    "SE": "sv", "NO": "no", "FI": "fi", "DK": "da", "IS": "is",
+    "GR": "el", "IL": "he",
+    "ET": "am", "ER": "ti",
+    "GE": "ka", "AM": "hy",
+    "PS2": "ps",  # placeholder; actual Pashto would need a country — not used
+}
+# Persian is also spoken in Bahrain alongside Arabic — but the flag 🇧🇭 more
+# commonly maps to Arabic in YouTube multi-audio contexts, so we keep "ar".
+
+
+def _flag_emojis_in_label(label: str) -> list[str]:
+    """Return the list of ISO 3166-1 alpha-2 country codes for flag emojis in *label*.
+
+    Each flag emoji is exactly two regional indicator chars. We scan the label
+    char-by-char and collect every such pair. Non-flag emoji and bare regional
+    indicators (single char with no pair) are ignored.
+    """
+    flags: list[str] = []
+    chars = list(label)
+    i = 0
+    while i + 1 < len(chars):
+        c1 = ord(chars[i])
+        c2 = ord(chars[i + 1])
+        if (REGIONAL_INDICATOR_A <= c1 <= REGIONAL_INDICATOR_Z
+                and REGIONAL_INDICATOR_A <= c2 <= REGIONAL_INDICATOR_Z):
+            cc1 = chr(c1 - REGIONAL_INDICATOR_A + ord("A"))
+            cc2 = chr(c2 - REGIONAL_INDICATOR_A + ord("A"))
+            flags.append(cc1 + cc2)
+            i += 2
+            continue
+        i += 1
+    return flags
+
+
+def _flag_to_lang(country_code: str) -> str | None:
+    """Map an ISO 3166-1 alpha-2 country code (e.g. "IR", "GB") to an ISO 639-1
+    language code (e.g. "fa", "en"). Returns ``None`` if no mapping exists.
+    """
+    return FLAG_TO_LANG.get(country_code.upper())
+
+
 ERROR_MARKERS = (
     "invalid url",
     "unsupported",
@@ -330,6 +411,64 @@ def extract_quality_options(message: Any) -> tuple[QualityOption, ...]:
                 )
             )
     return tuple(options)
+
+
+def extract_language_options(message: Any) -> tuple[QualityOption, ...]:
+    """Find inline buttons that look like audio-language flag selectors.
+
+    A button qualifies when:
+      1. Its label contains at least one regional-indicator flag emoji
+         (e.g. 🇮🇷, 🇬🇧, 🇩🇪).
+      2. It is NOT a URL button.
+      3. It does NOT match the regular quality / caption patterns (so we
+         don't accidentally swallow a quality button that happens to contain
+         a flag — e.g. "🇮🇷 1080p" would still be treated as quality).
+
+    Returned options use ``action="language"`` so callers can distinguish
+    them from regular media/caption options.
+    """
+    rows = getattr(message, "buttons", None) or ()
+    options: list[QualityOption] = []
+    for row_index, row in enumerate(rows):
+        for column_index, button in enumerate(row):
+            label = str(getattr(button, "text", "") or "").strip()
+            if not label:
+                continue
+            if _button_url(button):
+                continue
+            flags = _flag_emojis_in_label(label)
+            if not flags:
+                continue
+            # Skip buttons that look like quality / caption selectors
+            if QUALITY_PATTERN.search(label) or CAPTION_BUTTON_PATTERN.search(label):
+                continue
+            options.append(
+                QualityOption(
+                    label=label,
+                    row=row_index,
+                    column=column_index,
+                    fingerprint=button_fingerprint(button, row_index, column_index),
+                    expected_kind=None,
+                    expected_height=None,
+                    action="language",
+                )
+            )
+    return tuple(options)
+
+
+def language_option_lang_code(option: QualityOption) -> str | None:
+    """Return the ISO 639-1 language code for a language-flag QualityOption.
+
+    Picks the first flag emoji in the label and maps it via :data:`FLAG_TO_LANG`.
+    Returns ``None`` if the flag has no known language mapping.
+    """
+    flags = _flag_emojis_in_label(option.label)
+    for cc in flags:
+        code = _flag_to_lang(cc)
+        if code:
+            return code
+    return None
+
 
 
 def message_text(message: Any) -> str:
@@ -689,6 +828,27 @@ async def await_response_decision(
                     preview_messages=tuple(previews[key] for key in sorted(previews)),
                     text=text.strip(),
                 )
+
+            # Language-flag menu (e.g. @allsaverbot for multi-audio YouTube videos):
+            # the bot sends a thumbnail photo + a row of flag-emoji buttons, one
+            # per audio language. We auto-detect this so :meth:`DownloaderGateway.request`
+            # can transparently click through it without bothering the user.
+            # Only detected on the initial request (expected_option is None) and
+            # only when no regular quality/caption options are present.
+            if expected_option is None:
+                lang_options = extract_language_options(message)
+                if lang_options:
+                    previews = dict(candidates)
+                    if kind == MediaKind.PHOTO:
+                        previews[message_id] = message
+                    return ResponseDecision(
+                        status="language_menu",
+                        options=lang_options,
+                        menu_message_id=message_id,
+                        correlation=correlation,
+                        preview_messages=tuple(previews[key] for key in sorted(previews)),
+                        text=text.strip(),
+                    )
             
             if expected_option is not None and expected_option.action == "caption" and text.strip():
                 return ResponseDecision(
@@ -1014,6 +1174,7 @@ class DownloaderGateway:
         attempt_directory: Path,
         progress_callback: ProgressCallback | None = None,
         expected_kind_override: MediaKind | None = None,
+        language_resolver: Callable[[str], Awaitable[str | None]] | None = None,
     ) -> GatewayResult:
         if self.cooldowns.remaining(worker_name, bot_username) > 0:
             return GatewayResult(status="error", bot_username=bot_username, reason="cooldown")
@@ -1027,15 +1188,93 @@ class DownloaderGateway:
                     if expected_kind_override is not None
                     else expected_kind_for_url(url)
                 )
-                decision = await await_response_decision(
-                    stream,
-                    after_id=max(baseline, sent_id),
-                    reply_targets={sent_id},
-                    timeout=self.wait_timeout,
-                    preview_grace=self.preview_grace,
-                    album_window=self.album_window,
-                    expected_kind=effective_kind,
-                )
+                after_id = max(baseline, sent_id)
+                reply_targets = {sent_id}
+                decision: ResponseDecision | None = None
+                # Loop to transparently click through language-flag menus
+                # (e.g. @allsaverbot for multi-audio YouTube videos). Up to
+                # 3 consecutive language menus are auto-handled; anything
+                # beyond that is treated as an error to avoid infinite loops.
+                for _language_round in range(4):
+                    decision = await await_response_decision(
+                        stream,
+                        after_id=after_id,
+                        reply_targets=reply_targets,
+                        timeout=self.wait_timeout,
+                        preview_grace=self.preview_grace,
+                        album_window=self.album_window,
+                        expected_kind=effective_kind,
+                    )
+                    if decision.status != "language_menu":
+                        break
+                    # Pick the flag option matching the video's original language
+                    chosen = await self._pick_language_option(
+                        decision.options, url, language_resolver
+                    )
+                    if chosen is None:
+                        # No flag options or no language mapping at all — give up
+                        # gracefully with an unsupported_buttons error so the
+                        # caller can fall back to another provider.
+                        self.cooldowns.mark_timeout(worker_name, bot_username)
+                        return GatewayResult(
+                            status="error",
+                            bot_username=bot_username,
+                            reason="unsupported_buttons",
+                            request_message_id=sent_id,
+                        )
+                    # Re-fetch the menu message (it may have been edited in the
+                    # meantime) and click the chosen language button.
+                    menu = await client.get_messages(
+                        bot_username, ids=decision.menu_message_id
+                    )
+                    if not menu or not getattr(menu, "buttons", None):
+                        self.cooldowns.mark_timeout(worker_name, bot_username)
+                        return GatewayResult(
+                            status="error",
+                            bot_username=bot_username,
+                            reason="menu_missing",
+                            request_message_id=sent_id,
+                        )
+                    # Re-find the option on the (possibly edited) menu so we
+                    # click the right row/column.
+                    current_lang_options = extract_language_options(menu)
+                    current = next(
+                        (
+                            item for item in current_lang_options
+                            if item.row == chosen.row
+                            and item.column == chosen.column
+                            and item.fingerprint == chosen.fingerprint
+                        ),
+                        None,
+                    )
+                    if current is None:
+                        # Fallback: pick by language code on the current menu
+                        preferred = await self._resolve_preferred_language(
+                            url, language_resolver
+                        )
+                        current = self._match_option_by_lang(
+                            current_lang_options, preferred
+                        ) or (current_lang_options[0] if current_lang_options else None)
+                    if current is None:
+                        self.cooldowns.mark_timeout(worker_name, bot_username)
+                        return GatewayResult(
+                            status="error",
+                            bot_username=bot_username,
+                            reason="menu_changed",
+                            request_message_id=sent_id,
+                        )
+                    logger.info(
+                        "Auto-clicking language button %r on @%s for %s",
+                        current.label, bot_username, url,
+                    )
+                    await menu.click(current.row, current.column)
+                    # Update tracking so the next await_response_decision call
+                    # picks up messages that arrive AFTER the click.
+                    after_id = await self._latest_message_id(client, bot_username)
+                    reply_targets.add(decision.menu_message_id)
+                # After the loop, decision is non-None and is either a regular
+                # menu / media / timeout / error.
+                assert decision is not None
             if decision.status == "timeout":
                 self.cooldowns.mark_timeout(worker_name, bot_username)
                 return GatewayResult(
@@ -1104,6 +1343,58 @@ class DownloaderGateway:
             self.cooldowns.mark_timeout(worker_name, bot_username)
             logger.exception("Downloader request failed for @%s: %s", bot_username, exc)
             return GatewayResult(status="error", bot_username=bot_username, reason="service_error")
+
+    @staticmethod
+    async def _resolve_preferred_language(
+        url: str,
+        language_resolver: Callable[[str], Awaitable[str | None]] | None,
+    ) -> str | None:
+        if language_resolver is None:
+            return None
+        try:
+            return await language_resolver(url)
+        except Exception as exc:
+            logger.info("language_resolver failed for %s: %s", url, exc)
+            return None
+
+    @staticmethod
+    def _match_option_by_lang(
+        options: tuple[QualityOption, ...],
+        preferred_lang: str | None,
+    ) -> QualityOption | None:
+        if not preferred_lang or not options:
+            return None
+        for option in options:
+            option_lang = language_option_lang_code(option)
+            if option_lang == preferred_lang:
+                return option
+        return None
+
+    async def _pick_language_option(
+        self,
+        options: tuple[QualityOption, ...],
+        url: str,
+        language_resolver: Callable[[str], Awaitable[str | None]] | None,
+    ) -> QualityOption | None:
+        """Pick the flag option matching the video's original language.
+
+        Strategy (in order):
+          1. Ask ``language_resolver(url)`` for the preferred ISO 639-1 code
+             (e.g. "fa", "en", "ar"). If it returns a code, find the flag
+             button whose flag maps to that code.
+          2. Fallback: return the first flag option. On YouTube multi-audio,
+             the original language is typically listed first by @allsaverbot.
+
+        Returns ``None`` only when *options* is empty.
+        """
+        if not options:
+            return None
+        preferred = await self._resolve_preferred_language(url, language_resolver)
+        match = self._match_option_by_lang(options, preferred)
+        if match is not None:
+            return match
+        return options[0]
+
 
     async def select(
         self,

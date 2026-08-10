@@ -475,3 +475,132 @@ def _downsub_resolve_entry(
     body = _downsub_fetch_subtitle_list(youtube_url, proxy_url=proxy_url)
     entry = _select_subtitle_entry(body, language)
     return body, entry
+
+
+# ---------------------------------------------------------------------------
+# Original-language detection (for multi-audio YouTube videos)
+# ---------------------------------------------------------------------------
+# When @allsaverbot (or similar multi-audio downloaders) receives a YouTube
+# URL whose video has multiple audio tracks, it replies with a thumbnail +
+# a row of flag-emoji buttons (one per audio language). We auto-click the
+# flag matching the video's *original* language. The functions below infer
+# that language from the downsub.com subtitle list (the first manual
+# subtitle is usually the original language).
+
+# Language-name (lowercased) → ISO 639-1 code, for downsub.com subtitle names.
+LANG_NAME_TO_CODE: dict[str, str] = {
+    "persian": "fa", "farsi": "fa", "dari": "fa",
+    "english": "en",
+    "arabic": "ar",
+    "spanish": "es", "español": "es", "espanol": "es",
+    "french": "fr", "français": "fr", "francais": "fr",
+    "german": "de", "deutsch": "de",
+    "italian": "it", "italiano": "it",
+    "portuguese": "pt", "português": "pt", "portugues": "pt",
+    "russian": "ru", "русский": "ru",
+    "ukrainian": "uk", "українська": "uk",
+    "turkish": "tr", "türkçe": "tr", "turkce": "tr",
+    "hindi": "hi", "हिन्दी": "hi",
+    "urdu": "ur", "اردو": "ur",
+    "bengali": "bn", "বাংলা": "bn",
+    "indonesian": "id", "bahasa": "id",
+    "malay": "ms",
+    "chinese": "zh", "simplified": "zh", "traditional": "zh", "中文": "zh",
+    "japanese": "ja", "日本語": "ja",
+    "korean": "ko", "한국어": "ko",
+    "thai": "th", "ไทย": "th",
+    "vietnamese": "vi", "tiếng việt": "vi", "tieng viet": "vi",
+    "dutch": "nl", "nederlands": "nl",
+    "polish": "pl", "polski": "pl",
+    "czech": "cs", "čeština": "cs", "cestina": "cs",
+    "slovak": "sk",
+    "hungarian": "hu", "magyar": "hu",
+    "romanian": "ro", "română": "ro", "romana": "ro",
+    "bulgarian": "bg", "български": "bg",
+    "swedish": "sv", "svenska": "sv",
+    "norwegian": "no", "norsk": "no",
+    "finnish": "fi", "suomi": "fi",
+    "danish": "da", "dansk": "da",
+    "greek": "el", "ελληνικά": "el",
+    "hebrew": "he", "עברית": "he",
+    "kurdish": "ku", "kurdi": "ku",
+    "pashto": "ps", "پښتو": "ps",
+    "azerbaijani": "az", "azərbaycan": "az", "azerbaycan": "az",
+    "kazakh": "kk", "қазақ": "kk",
+    "uzbek": "uz", "oʻzbek": "uz",
+    "filipino": "fil", "tagalog": "fil",
+}
+
+
+def lang_name_to_code(name: str) -> str | None:
+    """Map a human-readable language name (e.g. "Persian", "English (auto-generated)")
+    to an ISO 639-1 code. Returns ``None`` if no mapping exists.
+    """
+    if not name:
+        return None
+    lowered = name.strip().lower()
+    if not lowered:
+        return None
+    if lowered in LANG_NAME_TO_CODE:
+        return LANG_NAME_TO_CODE[lowered]
+    for key, code in LANG_NAME_TO_CODE.items():
+        if lowered.startswith(key):
+            return code
+    return None
+
+
+def _detect_original_language_via_downsub(
+    youtube_url: str, *, proxy_url: str | None
+) -> str | None:
+    """Synchronous helper: ask downsub.com for the subtitle list and return
+    the ISO 639-1 code of the first *manual* subtitle (usually the original
+    language). Returns ``None`` on any failure or if no manual subtitle exists.
+    """
+    try:
+        body = _downsub_fetch_subtitle_list(youtube_url, proxy_url=proxy_url)
+    except Exception as exc:
+        logger.info("downsub language detection failed for %s: %s", youtube_url, exc)
+        return None
+    manual = body.get("subtitles") or []
+    for entry in manual:
+        name = (entry.get("name") or "").strip()
+        # Skip auto-generated entries — we want the first *manual* subtitle,
+        # which is the original language on YouTube.
+        if "auto" in name.lower():
+            continue
+        code = lang_name_to_code(name)
+        if code:
+            return code
+    return None
+
+
+async def detect_original_language(
+    youtube_url: str, *, proxy_url: str | None = None, timeout: float = 12.0
+) -> str | None:
+    """Best-effort detection of a YouTube video's original language.
+
+    Returns an ISO 639-1 code (e.g. ``"fa"``, ``"en"``, ``"ar"``) or ``None``.
+
+    Strategy:
+      1. Ask downsub.com for the subtitle list. The first *manual* subtitle
+         is typically the video's original language. This works from cloud
+         IPs because downsub.com's backend does the YouTube fetch on its
+         own network position.
+
+    This is best-effort: on any failure or timeout we return ``None`` and
+    let the caller fall back to the first flag button (which is usually
+    the original language on YouTube multi-audio tracks anyway).
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _detect_original_language_via_downsub, youtube_url, proxy_url=proxy_url
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.info("downsub language detection timed out for %s", youtube_url)
+        return None
+    except Exception as exc:
+        logger.info("downsub language detection failed for %s: %s", youtube_url, exc)
+        return None
