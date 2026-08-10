@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
 import io
+import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -13,6 +17,8 @@ from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 import httpx
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -30,6 +36,106 @@ MAX_CONCURRENT_SEARCHES = 2
 MAX_CONCURRENT_PAGE_BUILDS = 3
 MAX_CONCURRENT_FORMAT_LOOKUPS = 2
 FORMAT_LOOKUP_TIMEOUT_SECONDS = 15.0
+
+# ---- downsub.com integration (used as a fallback for format-size lookup) ----
+# When yt-dlp is blocked by YouTube's bot detection, we ask downsub.com for the
+# video duration and estimate per-quality file sizes using YouTube's typical
+# per-resolution bitrates.
+_DOWNSUB_KEY = b"zthxw34cdp6wfyxmpad38v52t3hsz6c5"
+_DOWNSUB_API = "https://get.downsub.com/"
+_DOWNSUB_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# Approximate bitrates (bits/sec) YouTube uses for each resolution. Source:
+# YouTube's adaptive streaming manifests; these are conservative midpoints.
+_QUALITY_BITRATES_BPS: dict[int, int] = {
+    144: 100_000,
+    240: 300_000,
+    360: 800_000,
+    480: 1_500_000,
+    720: 2_500_000,
+    1080: 4_500_000,
+    1440: 9_000_000,
+    2160: 20_000_000,
+}
+
+
+def _evp_bytes_to_key(
+    password: bytes, salt: bytes, key_len: int = 32, iv_len: int = 16
+) -> tuple[bytes, bytes]:
+    d = b""
+    prev = b""
+    while len(d) < key_len + iv_len:
+        prev = hashlib.md5(prev + password + salt).digest()
+        d += prev
+    return d[:key_len], d[key_len : key_len + iv_len]
+
+
+def _crypto_js_encrypt(plaintext: str, key: bytes) -> str:
+    salt = os.urandom(8)
+    dk, iv = _evp_bytes_to_key(key, salt)
+    ct = AES.new(dk, AES.MODE_CBC, iv).encrypt(pad(plaintext.encode("utf-8"), 16))
+    return json.dumps(
+        {"ct": base64.b64encode(ct).decode(), "iv": iv.hex(), "s": salt.hex()},
+        separators=(",", ":"),
+    )
+
+
+def _b64url(s: str) -> str:
+    return base64.b64encode(s.encode("utf-8")).decode().replace("+", "-").replace("/", "_").rstrip("=")
+
+
+def _downsub_encode(data: str, key: bytes | None = None) -> str:
+    if key is None:
+        key = _DOWNSUB_KEY
+    return _b64url(_crypto_js_encrypt(json.dumps(data, separators=(",", ":")), key))
+
+
+def _parse_duration_to_seconds(text: str) -> int:
+    """Parse ``"HH:MM:SS"`` or ``"MM:SS"`` into total seconds."""
+    if not text:
+        return 0
+    parts = text.strip().split(":")
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return 0
+    if len(nums) == 3:
+        return nums[0] * 3600 + nums[1] * 60 + nums[2]
+    if len(nums) == 2:
+        return nums[0] * 60 + nums[1]
+    if len(nums) == 1:
+        return nums[0]
+    return 0
+
+
+def _downsub_fetch_duration(url: str, *, proxy_url: str | None) -> int:
+    """Ask downsub.com for the duration of *url* in seconds (0 on failure)."""
+    payload = {
+        "url": url,
+        "data": _downsub_encode(_downsub_encode(url), url.encode("utf-8")),
+    }
+    headers = {
+        "User-Agent": _DOWNSUB_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "Origin": "https://downsub.com",
+        "Referer": "https://downsub.com/",
+    }
+    with httpx.Client(
+        http2=True, timeout=15.0, headers=headers, proxy=proxy_url
+    ) as client:
+        r = client.post(_DOWNSUB_API, json=payload)
+        if r.status_code != 200:
+            return 0
+        try:
+            body = r.json()
+        except Exception:
+            return 0
+    return _parse_duration_to_seconds(body.get("duration", "") if isinstance(body, dict) else "")
 
 CANVAS_WIDTH = 1280
 CANVAS_PADDING = 24
@@ -332,6 +438,15 @@ class YouTubeSearchService:
         self._search_slots.release()
 
     def _format_sizes_sync(self, url: str) -> tuple[YouTubeFormatSize, ...]:
+        # Try yt-dlp first (works on networks where YouTube's bot detection
+        # isn't triggered). On failure, fall back to a duration-based estimate
+        # derived from the downsub.com API.
+        yt_dlp_results = self._format_sizes_via_yt_dlp(url)
+        if yt_dlp_results:
+            return yt_dlp_results
+        return self._format_sizes_via_downsub(url)
+
+    def _format_sizes_via_yt_dlp(self, url: str) -> tuple[YouTubeFormatSize, ...]:
         options: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
@@ -345,13 +460,33 @@ class YouTubeSearchService:
         }
         if self.proxy_url:
             options["proxy"] = self.proxy_url
+        # Suppress yt-dlp's noisy stderr output (it prints "Sign in to
+        # confirm you're not a bot" even with quiet=True). We redirect
+        # stderr to /dev/null during the call; on any failure we silently
+        # fall back to the downsub.com duration-based estimate.
+        import os as _os
+        import sys as _sys
+        try:
+            devnull_fd = _os.open(_os.devnull, _os.O_WRONLY)
+            saved_stderr_fd = _os.dup(_sys.stderr.fileno())
+            _os.dup2(devnull_fd, _sys.stderr.fileno())
+            _os.close(devnull_fd)
+        except Exception:
+            saved_stderr_fd = None
         try:
             with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=False)
-        except DownloadError as exc:
-            raise YouTubeSearchError("YouTube format lookup failed") from exc
-        except Exception as exc:
-            raise YouTubeSearchError("Unexpected YouTube format lookup failure") from exc
+        except Exception:
+            # Any failure (including YouTube's "Sign in to confirm you're not
+            # a bot" challenge) means we should silently fall back.
+            return ()
+        finally:
+            if saved_stderr_fd is not None:
+                try:
+                    _os.dup2(saved_stderr_fd, _sys.stderr.fileno())
+                    _os.close(saved_stderr_fd)
+                except Exception:
+                    pass
         formats = info.get("formats") if isinstance(info, dict) else None
         results: list[YouTubeFormatSize] = []
         for entry in formats or ():
@@ -381,6 +516,49 @@ class YouTubeSearchService:
                     size=size_int,
                 )
             )
+        return tuple(results)
+
+    def _format_sizes_via_downsub(self, url: str) -> tuple[YouTubeFormatSize, ...]:
+        """Fallback: derive format sizes from the video duration via downsub.com.
+
+        When yt-dlp is blocked by YouTube's bot detection, we ask downsub.com
+        for the video duration (its backend can fetch metadata that we can't)
+        and then estimate per-quality file sizes using YouTube's typical
+        per-resolution bitrates.
+        """
+        try:
+            duration_seconds = _downsub_fetch_duration(url, proxy_url=self.proxy_url)
+        except Exception as exc:
+            logger.info("downsub duration lookup failed for %s: %s", url, exc)
+            return ()
+        if not duration_seconds or duration_seconds < 1:
+            return ()
+        results: list[YouTubeFormatSize] = []
+        # Per-quality typical bitrates (bits per second). These are the
+        # average values YouTube uses for adaptive streaming; actual sizes
+        # may vary ±30% depending on content complexity.
+        for height, bitrate_bps in _QUALITY_BITRATES_BPS.items():
+            estimated_size = int(duration_seconds * bitrate_bps / 8)
+            results.append(
+                YouTubeFormatSize(
+                    height=height,
+                    abr_kbps=None,
+                    is_audio_only=False,
+                    is_muxed=False,
+                    size=estimated_size,
+                )
+            )
+        # Audio-only estimate (128 kbps AAC)
+        audio_size = int(duration_seconds * 128_000 / 8)
+        results.append(
+            YouTubeFormatSize(
+                height=None,
+                abr_kbps=128,
+                is_audio_only=True,
+                is_muxed=False,
+                size=audio_size,
+            )
+        )
         return tuple(results)
 
     async def format_sizes(self, url: str) -> tuple[YouTubeFormatSize, ...]:
