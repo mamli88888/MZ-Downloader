@@ -61,7 +61,7 @@ PRIMARY_DOWNLOADER_BOT=download_it_bot
 SECONDARY_DOWNLOADER_BOT=AllSavesBot
 SPOTIFY_DOWNLOADER_BOT=spotifysavesbot
 SOUNDCLOUD_DOWNLOADER_BOT=scload_bot
-INSTAGRAM_YOUTUBE_BOTS=allsaverbot,instadowbot,download_it_bot,AllSavesBot
+INSTAGRAM_YOUTUBE_BOTS=ziyotech_instagram_downloaderbot,allsaverbot,instadowbot,download_it_bot,AllSavesBot
 TIKTOK_DOWNLOADER_BOTS=download_it_bot,AllSavesBot
 ```
 

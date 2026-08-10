@@ -158,7 +158,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     soundcloud_bot = bot_name("SOUNDCLOUD_DOWNLOADER_BOT", "scload_bot")
     instagram_youtube_bots = bot_list(
         "INSTAGRAM_YOUTUBE_BOTS",
-        "allsaverbot,instadowbot,download_it_bot,AllSavesBot",
+        "ziyotech_instagram_downloaderbot,allsaverbot,instadowbot,download_it_bot,AllSavesBot",
     )
     tiktok_bots = bot_list("TIKTOK_DOWNLOADER_BOTS", "download_it_bot,AllSavesBot")
     twitter_bots = bot_list("TWITTER_BOTS", "AllSavesBot,download_it_bot")
