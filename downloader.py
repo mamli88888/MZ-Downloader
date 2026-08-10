@@ -734,7 +734,16 @@ async def await_response_decision(
         if kind == MediaKind.REJECTED or _contains_marker(text, PROMOTION_MARKERS):
             continue
         if expected_option is not None:
-            if not _quality_matches(message, expected_option):
+            # After a quality button click, the user has explicitly chosen a
+            # quality. Trust the support bot's response — accept any media of
+            # the expected kind. The strict _quality_matches filter is too
+            # aggressive here: many bots send videos without proper
+            # DocumentAttributeVideo (so dimensions are missing), or return
+            # slightly different resolutions than the button label, or use a
+            # generic filename like "video.mp4" that doesn't contain "360p".
+            # All of those would cause _quality_matches to return False and
+            # the video would be silently dropped, leading to a timeout.
+            if not _kind_matches(message, kind, expected_option.expected_kind):
                 continue
         elif not _kind_matches(message, kind, expected_kind):
             continue
