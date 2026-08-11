@@ -33,6 +33,26 @@ class AccountConfig:
 
 
 @dataclass(frozen=True)
+class IGBridgeConfig:
+    """Configuration for the Instagram DM bridge (optional feature).
+
+    When enabled, the bot logs into an Instagram account and listens for DMs.
+    Telegram users pair their account via /ig, then any Instagram URL they
+    DM to the page is downloaded and sent back to them in Telegram.
+    """
+    enabled: bool
+    username: str
+    password: str
+    session_file: str
+    proxy: str
+
+    @property
+    def session_path(self) -> Path:
+        path = Path(self.session_file)
+        return path if path.is_absolute() else PROJECT_DIR / path
+
+
+@dataclass(frozen=True)
 class Settings:
     bot_token: str
     accounts: tuple[AccountConfig, ...]
@@ -68,6 +88,7 @@ class Settings:
     proxy_port: int
     pixeldrain_delete_delay: float
     pixeldrain_api_key: str | None
+    ig_bridge: IGBridgeConfig
 
 
 def _as_bool(value: str | None, default: bool) -> bool:
@@ -229,6 +250,13 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         proxy_type=proxy_type,
         proxy_host=env.get("PROXY_HOST", "127.0.0.1").strip(),
         proxy_port=_as_int(env, "PROXY_PORT", 10808),
+        ig_bridge=IGBridgeConfig(
+            enabled=_as_bool(env.get("IG_BRIDGE_ENABLED"), False),
+            username=env.get("IG_BRIDGE_USERNAME", "").strip(),
+            password=env.get("IG_BRIDGE_PASSWORD", "").strip(),
+            session_file=env.get("IG_BRIDGE_SESSION_FILE", "ig_session.json").strip() or "ig_session.json",
+            proxy=env.get("IG_BRIDGE_PROXY", "").strip(),
+        ),
     )
 
 

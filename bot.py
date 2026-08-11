@@ -98,6 +98,10 @@ from youtube_subtitle import (
     is_youtube_shorts_url,
 )
 
+# Instagram DM bridge (optional feature; degrades gracefully if disabled)
+import ig_pairings
+from ig_bridge import IGBridgeConfig, InstagramBridge
+
 
 LOG_HANDLERS: list[logging.Handler] = [logging.StreamHandler()]
 if not os.getenv("RAILWAY_ENVIRONMENT"):
@@ -255,6 +259,7 @@ PIXELDRAIN_UPLOADER = PixeldrainUploader(
 FEEDBACK_STICKER_IDS: tuple[str, ...] = ()
 SELECTION_REAPER_TASK: asyncio.Task[Any] | None = None
 HEALTH_SERVER: asyncio.AbstractServer | None = None
+IG_BRIDGE: InstagramBridge | None = None
 STARTED_AT = time.monotonic()
 
 
@@ -2743,6 +2748,171 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+# ─── Instagram DM bridge ────────────────────────────────────────────────────
+
+async def ig_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the user their Instagram-bridge pairing code.
+
+    The user sends this code to the configured Instagram page's DM to link
+    their Telegram account with their Instagram account.
+    """
+    if not SETTINGS.ig_bridge.enabled:
+        await update.effective_message.reply_text(
+            status_card(
+                "قابلیت پل اینستاگرام غیرفعاله",
+                "این قابلیت فعلاً توسط ادمین فعال نشده. بعداً دوباره امتحان کن.",
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    user = update.effective_user
+    if user is None:
+        return
+    tg_user_id = user.id
+    code = ig_pairings.generate_code(tg_user_id)
+    ig_username = SETTINGS.ig_bridge.username
+    ig_handle = f"@{ig_username}" if ig_username and not ig_username.startswith("@") else ig_username
+    already_paired_ig = ig_pairings.get_ig_user_id(tg_user_id)
+    header_line = (
+        f"🔗 پیج اینستاگرام: <b>{html.escape(ig_handle)}</b>\n"
+        if ig_handle else ""
+    )
+    if already_paired_ig:
+        body = (
+            f"{header_line}"
+            f"حساب اینستاگرام شما قبلاً به این ربات وصل شده. می‌تونی هر رییلز، پست یا "
+            f"لینک اینستاگرام رو به دایرکت {html.escape(ig_handle or 'همون پیج')} بفرستی "
+            f"تا اینجا برات دانلودش کنم.\n\n"
+            f"اگه می‌خوای حساب جدیدی وصل کنی، اول با /igunlink ارتباط قبلی رو پاک کن."
+        )
+    else:
+        body = (
+            f"{header_line}"
+            f"کد اختصاصی تو:\n"
+            f"<code>{code}</code>\n\n"
+            f"این کد رو به دایرکت {html.escape(ig_handle or 'همون پیج')} بفرست تا حسابت وصل بشه.\n"
+            f"بعد از وصل شدن، هر رییلز، پست یا لینک اینستاگرام که براش دایرکت بفرستی، "
+            f"اینجا دانلود و برات ارسال می‌شه.\n\n"
+            f"⏱ این کد تا ۲۴ ساعت معتبره."
+        )
+    await update.effective_message.reply_text(
+        status_card("📸 پل اینستاگرام", body),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def igunlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unlink the user's Instagram account from this Telegram bot."""
+    user = update.effective_user
+    if user is None:
+        return
+    removed = ig_pairings.unpair_by_tg(user.id)
+    if removed:
+        await update.effective_message.reply_text(
+            status_card("✅ ارتباط قطع شد", "حساب اینستاگرامت دیگه به این ربات وصله نیست."),
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.effective_message.reply_text(
+            status_card("هیچ ارتباطی نیست", "حساب اینستاگرامت از قبل به این ربات وصل نبود."),
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def _handle_ig_pairing_success(
+    tg_user_id: int, ig_user_id: int, ig_username: str,
+) -> None:
+    """Called by the IG bridge when a user successfully pairs their IG account."""
+    if not APPLICATION:
+        return
+    handle = f"@{ig_username}" if ig_username else f"({ig_user_id})"
+    try:
+        await APPLICATION.bot.send_message(
+            chat_id=tg_user_id,
+            text=status_card(
+                "✅ اینستاگرام وصل شد",
+                f"حساب اینستاگرام <b>{html.escape(handle)}</b> به ربات وصل شد.\n"
+                f"از این به بعد هر رییلز، پست یا لینک اینستاگرام که براش دایرکت بفرستی، "
+                f"اینجا دانلود می‌شه.",
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as exc:
+        logger.warning("Failed to notify TG user %s of IG pairing: %s", tg_user_id, exc)
+
+
+async def _handle_ig_url(tg_user_id: int, url: str, extra_info: dict) -> None:
+    """Called by the IG bridge when a paired IG user sends a URL.
+
+    Triggers the normal download flow as if the user had sent the URL directly
+    in Telegram.
+    """
+    if not APPLICATION:
+        logger.error("IG bridge URL callback invoked but APPLICATION is None")
+        return
+
+    # Build a synthetic Update-like context so we can reuse _process_url.
+    # _process_url reads update.effective_chat.id and update.effective_user.id
+    # and update.effective_message. We construct a minimal stand-in.
+    ig_username = extra_info.get("ig_username", "")
+
+    # Send a "received your URL" message first so the user has a reply target.
+    intro_text = status_card(
+        "📥 از دایرکت اینستاگرام",
+        f"<b>{html.escape(f'@{ig_username}') if ig_username else 'اینستاگرام'}</b> → "
+        f"<code>{html.escape(url)}</code>",
+    )
+    try:
+        intro_msg = await APPLICATION.bot.send_message(
+            chat_id=tg_user_id,
+            text=intro_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except TelegramError as exc:
+        logger.warning("Failed to send IG-bridge intro to TG user %s: %s", tg_user_id, exc)
+        return
+
+    # Construct a fake Update so _process_url can read chat_id, user_id, etc.
+    # python-telegram-bot's Update is a TypedDict-like dataclass; we can build
+    # one from a dict via Update.de_json.
+    fake_update_data = {
+        "update_id": 0,
+        "message": {
+            "message_id": intro_msg.message_id,
+            "date": int(time.time()),
+            "chat": {"id": tg_user_id, "type": "private"},
+            "from": {"id": tg_user_id, "is_bot": False},
+            "text": url,
+        },
+    }
+    fake_update = Update.de_json(fake_update_data, APPLICATION.bot)
+
+    # Acquire a ContextTypes.DEFAULT_TYPE-style object.
+    context = ContextTypes.DEFAULT_TYPE(application=APPLICATION)
+
+    try:
+        await _process_url(fake_update, context, url, intro_msg.message_id)
+    except Exception as exc:
+        logger.exception("IG-bridge _process_url failed for url=%s: %s", url, exc)
+        try:
+            await APPLICATION.bot.send_message(
+                chat_id=tg_user_id,
+                text=status_card(
+                    "❌ دانلود ناموفق بود",
+                    f"نتونستم این لینک رو پردازش کنم.\n<code>{html.escape(str(exc))[:300]}</code>",
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=intro_msg.message_id,
+            )
+        except TelegramError:
+            pass
+
+
+# Application reference set in main() so the IG-bridge callbacks can use it
+APPLICATION: Application | None = None
+
+
 @membership_required
 async def caption_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -3493,6 +3663,8 @@ async def post_init(application: Application) -> None:
         BotCommand("song", "جست‌و‌جو آهنگ"),
         BotCommand("cancel", "توقف دانلودهای من"),
         BotCommand("dl", "دانلود لینک"),
+        BotCommand("ig", "اتصال به اینستاگرام"),
+        BotCommand("igunlink", "قطع اتصال اینستاگرام"),
     ]
     group_commands = [
         BotCommand("dl", "دانلود لینک یا پیام ریپلای‌شده"),
@@ -3521,9 +3693,41 @@ async def post_init(application: Application) -> None:
     SELECTION_REAPER_TASK = asyncio.create_task(selection_reaper(application), name="selection-reaper")
     logger.info("Bot initialized with %d downloader account(s)", ACCOUNT_POOL.total)
 
+    # Start the Instagram DM bridge (if enabled)
+    global IG_BRIDGE
+    if SETTINGS.ig_bridge.enabled:
+        ig_config = IGBridgeConfig(
+            enabled=SETTINGS.ig_bridge.enabled,
+            username=SETTINGS.ig_bridge.username,
+            password=SETTINGS.ig_bridge.password,
+            session_file=SETTINGS.ig_bridge.session_file,
+            proxy=SETTINGS.ig_bridge.proxy,
+        )
+        IG_BRIDGE = InstagramBridge(
+            config=ig_config,
+            on_url=_handle_ig_url,
+            on_pairing_success=_handle_ig_pairing_success,
+        )
+        try:
+            ig_started = await IG_BRIDGE.start()
+            if ig_started:
+                logger.info("IG bridge started for @%s", SETTINGS.ig_bridge.username)
+            else:
+                logger.warning("IG bridge failed to start (see earlier logs).")
+                IG_BRIDGE = None
+        except Exception as exc:
+            logger.error("IG bridge start error: %s", exc, exc_info=True)
+            IG_BRIDGE = None
+    else:
+        logger.info("IG bridge disabled (IG_BRIDGE_ENABLED=false).")
+
 
 async def post_shutdown(application: Application) -> None:
-    global SELECTION_REAPER_TASK, HEALTH_SERVER
+    global SELECTION_REAPER_TASK, HEALTH_SERVER, IG_BRIDGE
+    if IG_BRIDGE is not None:
+        with contextlib.suppress(Exception):
+            await IG_BRIDGE.stop()
+        IG_BRIDGE = None
     if SELECTION_REAPER_TASK:
         SELECTION_REAPER_TASK.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -3600,6 +3804,8 @@ def main() -> None:
     application.add_handler(CommandHandler("song", song_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("dl", dl_command))
+    application.add_handler(CommandHandler("ig", ig_command))
+    application.add_handler(CommandHandler("igunlink", igunlink_command))
     application.add_handler(CallbackQueryHandler(on_selection, pattern=r"^(?:sel|cancel|info|caption):"))
     application.add_handler(CallbackQueryHandler(on_reel_music_callback, pattern=r"^reel_music:"))
     application.add_handler(CallbackQueryHandler(on_youtube_search_callback, pattern=r"^(?:ys|yp):"))
@@ -3619,6 +3825,11 @@ def main() -> None:
     )
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_chat_members))
     application.add_error_handler(error_handler)
+
+    # Make the application instance available to IG-bridge callbacks
+    global APPLICATION
+    APPLICATION = application
+
     logger.info("MZ Downloader is starting")
     application.run_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
 
