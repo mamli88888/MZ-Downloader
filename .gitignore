@@ -12,3 +12,5 @@ downloads/
 live-test-results/
 bot.log*
 .railway-variables.env
+ig_session.json
+ig_pairings.json
