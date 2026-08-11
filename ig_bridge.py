@@ -157,6 +157,15 @@ class InstagramBridge:
             cl = ig_session.build_client(proxy=self.config.proxy or None)
 
             session_path = self.config.session_path
+            logger.info(
+                "IG bridge: looking for session file at %s (exists=%s), "
+                "username=@%s, proxy=%s",
+                session_path,
+                session_path.exists(),
+                self.config.username,
+                self.config.proxy or "(none)",
+            )
+
             if session_path.exists():
                 try:
                     cl.load_settings(str(session_path))
@@ -164,7 +173,10 @@ class InstagramBridge:
                     me = cl.user_info_by_username(self.config.username)
                     if me is None:
                         raise RuntimeError("user_info_by_username returned None")
-                    logger.info("IG session loaded from %s", session_path)
+                    logger.info(
+                        "IG session loaded from %s (verified, user_id=%s).",
+                        session_path, cl.user_id,
+                    )
                     self.client = cl
                     self._my_user_id = cl.user_id
                     return True
@@ -174,19 +186,54 @@ class InstagramBridge:
                     )
                     ig_session.print_troubleshooting_hint(e)
                     cl = ig_session.build_client(proxy=self.config.proxy or None)
+            else:
+                logger.error(
+                    "IG session file NOT FOUND at %s. "
+                    "You must run ig_login.py on your LOCAL machine (with a proxy "
+                    "if in Iran) to generate ig_session.json, then copy that file "
+                    "to the server. Fresh login from a data-center IP will be "
+                    "rejected by Instagram (HTTP 400).",
+                    session_path,
+                )
 
-            # Fresh login
+            # Fresh login (will almost certainly fail on a server IP — Instagram
+            # rejects logins from data-center IPs as suspicious)
             if not self.config.password:
                 logger.error(
                     "No usable IG session at %s and no IG_BRIDGE_PASSWORD set. "
-                    "Run ig_login.py first to create a session file.",
+                    "Run ig_login.py locally first to create a session file.",
                     session_path,
                 )
                 return False
+            logger.warning(
+                "Attempting fresh Instagram login from this server's IP. "
+                "This will likely fail with HTTP 400 if this is a data-center IP "
+                "(Railway, Heroku, AWS, etc). The correct approach is: run "
+                "ig_login.py locally, then copy ig_session.json to the server."
+            )
             try:
                 cl.login(self.config.username, self.config.password)
             except Exception as exc:
-                ig_session.print_troubleshooting_hint(exc)
+                # HTTP 400 from accounts/login/ = Instagram rejected the login.
+                # Common causes: data-center IP, missing 2FA, wrong password,
+                # account temporarily locked, or rate-limited.
+                msg = str(exc).lower()
+                if "400" in msg or "bad request" in msg:
+                    logger.error(
+                        "Instagram returned HTTP 400 on login. This typically means:\n"
+                        "  1) You are running on a data-center IP (Railway/AWS/etc) — "
+                        "Instagram rejects fresh logins from such IPs.\n"
+                        "  2) Two-factor authentication is enabled on the account "
+                        "(fresh login via the bridge does not handle 2FA).\n"
+                        "  3) The password is wrong, OR the account is temporarily "
+                        "locked due to suspicious activity.\n\n"
+                        "FIX: Run ig_login.py on your LOCAL machine (it handles 2FA "
+                        "and challenges interactively), then copy the generated "
+                        "ig_session.json to the server. Do NOT attempt fresh login "
+                        "on the server."
+                    )
+                else:
+                    ig_session.print_troubleshooting_hint(exc)
                 raise
             cl.dump_settings(str(session_path))
             logger.info("IG fresh login OK; session saved to %s", session_path)

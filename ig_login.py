@@ -59,10 +59,10 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    username = os.environ.get("IG_BRIDGE_USERNAME", "MZ_Downloader").strip()
-    password = os.environ.get("IG_BRIDGE_PASSWORD", "zaker1388").strip()
+    username = os.environ.get("IG_BRIDGE_USERNAME", "").strip()
+    password = os.environ.get("IG_BRIDGE_PASSWORD", "").strip()
     session_file = os.environ.get("IG_BRIDGE_SESSION_FILE", "ig_session.json")
-    proxy = os.environ.get("IG_BRIDGE_PROXY", "socks5://127.0.0.1:10808").strip()
+    proxy = os.environ.get("IG_BRIDGE_PROXY", "").strip()
     impersonate = os.environ.get("IG_BRIDGE_IMPERSONATE", "chrome120").strip() or None
 
     if not username:
