@@ -63,6 +63,7 @@ class IGBridgeConfig:
     username: str = ""
     password: str = ""
     session_file: str = "ig_session.json"
+    session_json: str = ""  # raw JSON string (overrides session_file if set)
     proxy: str = ""  # e.g. "http://user:pass@host:port" or "socks5://host:port"
 
     @property
@@ -150,6 +151,7 @@ class InstagramBridge:
     async def _login(self) -> bool:
         """Log in to Instagram (load session or fresh login). Runs in executor."""
         import ig_session
+        import json as _json
 
         loop = asyncio.get_event_loop()
 
@@ -157,15 +159,39 @@ class InstagramBridge:
             cl = ig_session.build_client(proxy=self.config.proxy or None)
 
             session_path = self.config.session_path
+            session_json_str = self.config.session_json.strip()
             logger.info(
-                "IG bridge: looking for session file at %s (exists=%s), "
-                "username=@%s, proxy=%s",
-                session_path,
-                session_path.exists(),
+                "IG bridge: session source = %s, username=@%s, proxy=%s",
+                "IG_BRIDGE_SESSION_JSON env var" if session_json_str
+                else f"file {session_path} (exists={session_path.exists()})",
                 self.config.username,
                 self.config.proxy or "(none)",
             )
 
+            # Priority 1: IG_BRIDGE_SESSION_JSON env var (raw JSON string)
+            if session_json_str:
+                try:
+                    settings = _json.loads(session_json_str)
+                    cl.set_settings(settings)
+                    me = cl.user_info_by_username(self.config.username)
+                    if me is None:
+                        raise RuntimeError("user_info_by_username returned None")
+                    logger.info(
+                        "IG session loaded from IG_BRIDGE_SESSION_JSON env var "
+                        "(verified, user_id=%s).", cl.user_id,
+                    )
+                    self.client = cl
+                    self._my_user_id = cl.user_id
+                    return True
+                except Exception as e:
+                    logger.warning(
+                        "IG session load from IG_BRIDGE_SESSION_JSON failed (%s); "
+                        "falling back to file.", e,
+                    )
+                    ig_session.print_troubleshooting_hint(e)
+                    cl = ig_session.build_client(proxy=self.config.proxy or None)
+
+            # Priority 2: session file
             if session_path.exists():
                 try:
                     cl.load_settings(str(session_path))
@@ -186,13 +212,16 @@ class InstagramBridge:
                     )
                     ig_session.print_troubleshooting_hint(e)
                     cl = ig_session.build_client(proxy=self.config.proxy or None)
-            else:
+            elif not session_json_str:
                 logger.error(
-                    "IG session file NOT FOUND at %s. "
-                    "You must run ig_login.py on your LOCAL machine (with a proxy "
-                    "if in Iran) to generate ig_session.json, then copy that file "
-                    "to the server. Fresh login from a data-center IP will be "
-                    "rejected by Instagram (HTTP 400).",
+                    "IG session file NOT FOUND at %s and IG_BRIDGE_SESSION_JSON env "
+                    "var is not set. You must either:\n"
+                    "  (a) Run ig_login.py on your LOCAL machine (with a proxy if in "
+                    "Iran) to generate ig_session.json, then either copy that file "
+                    "to the server OR set IG_BRIDGE_SESSION_JSON to the file's "
+                    "content.\n"
+                    "  (b) Set IG_BRIDGE_SESSION_JSON to the JSON content directly "
+                    "(recommended for Railway — paste the JSON as the env var value).",
                     session_path,
                 )
 

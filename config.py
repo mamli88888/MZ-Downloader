@@ -45,6 +45,7 @@ class IGBridgeConfig:
     password: str
     session_file: str
     proxy: str
+    session_json: str = ""
 
     @property
     def session_path(self) -> Path:
@@ -255,6 +256,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             username=env.get("IG_BRIDGE_USERNAME", "").strip(),
             password=env.get("IG_BRIDGE_PASSWORD", "").strip(),
             session_file=env.get("IG_BRIDGE_SESSION_FILE", "ig_session.json").strip() or "ig_session.json",
+            session_json=env.get("IG_BRIDGE_SESSION_JSON", "").strip(),
             proxy=env.get("IG_BRIDGE_PROXY", "").strip(),
         ),
     )
