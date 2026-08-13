@@ -1,0 +1,45 @@
+# docker-compose.yml — MZ-Downloader + Cobalt in a single container.
+#
+# The Dockerfile clones cobalt from GitHub at build time, so you don't need
+# to keep the cobalt source tree around. Just clone this repo and run:
+#
+#   git clone https://github.com/mamli88888/MZ-Downloader.git
+#   cd MZ-Downloader
+#   cp .env.example .env  # then edit .env to set BOT_TOKEN etc.
+#   docker compose up -d --build
+#
+# To update cobalt to the latest version, rebuild the image:
+#   docker compose build --no-cache
+#   docker compose up -d
+
+services:
+  mz-downloader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Pin a specific cobalt branch/tag/commit. Default: main
+        - COBALT_REF=main
+    container_name: mz-downloader
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override the inter-process cobalt URL — inside the container, cobalt
+      # listens on 127.0.0.1:9000 (set by start.sh). The bot uses this URL.
+      COBALT_API_URL: http://127.0.0.1:9000/
+      FFMPEG_PATH: /usr/bin/ffmpeg
+    volumes:
+      # Persist downloaded files across restarts (optional).
+      - mz-downloads:/app/downloads
+      # Optional: mount a cookies.json for cobalt to access age-restricted or
+      # member-only YouTube/Instagram content. See cobalt docs for the format.
+      # - ./cookies.json:/cookies.json:ro
+    # Cobalt's API port is only exposed if you want to use it from outside
+    # the container (e.g. for debugging). Don't expose it publicly without
+    # setting up COBALT_API_KEY or TURNSTILE protection first.
+    ports:
+      - "127.0.0.1:9000:9000"  # cobalt API (localhost-only)
+
+volumes:
+  mz-downloads:

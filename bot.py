@@ -67,7 +67,9 @@ from downloader import (
     request_dr_downloader_album,
 )
 from instagram_caption import InstagramCaptionError, fetch_instagram_caption
-from routing import Platform, all_providers, detect_platform, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
+from cobalt_client import CobaltClient, CobaltError
+from cobalt_gateway import COBALT_PROVIDER, CobaltGateway
+from routing import Platform, all_providers, detect_platform, is_cobalt_provider, is_instagram_reel, ordered_providers, platform_info, providers_for_platform, spotify_resource_type
 from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
 from youtube_search import (
     MAX_RESULTS as YOUTUBE_SEARCH_MAX_RESULTS,
@@ -133,6 +135,31 @@ GATEWAY = DownloaderGateway(
         else None
     ),
 )
+
+# Cobalt self-hosted API gateway. Only initialized when COBALT_API_URL is set.
+# When configured, YouTube and Instagram downloads go to cobalt first; the
+# Telegram backup bots are still tried as a fallback if cobalt fails.
+COBALT_GATEWAY: CobaltGateway | None = None
+if SETTINGS.cobalt_api_url:
+    _cobalt_client = CobaltClient(
+        api_url=SETTINGS.cobalt_api_url,
+        api_key=SETTINGS.cobalt_api_key,
+        proxy_url=(
+            f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+            if SETTINGS.use_proxy
+            else None
+        ),
+    )
+    COBALT_GATEWAY = CobaltGateway(
+        client=_cobalt_client,
+        max_download_size=SETTINGS.max_download_size,
+        ffmpeg_path=os.environ.get("FFMPEG_PATH", "ffmpeg"),
+    )
+    logger.info(
+        "Cobalt gateway enabled (API_URL=%s, priority=%s)",
+        SETTINGS.cobalt_api_url,
+        SETTINGS.cobalt_priority,
+    )
 YOUTUBE_SEARCH = YouTubeSearchService(
     proxy_url=(
         f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
@@ -184,13 +211,16 @@ class PendingSelection:
     request_message_id: int
     menu_message_id: int
     options: tuple[QualityOption, ...]
-    lease: WorkerLease
+    lease: WorkerLease | None
     attempt_directory: Path
     fallback_text: str = ""
     instagram_caption: str = ""
     caption_task: asyncio.Task[str] | None = None
     processing: bool = False
     processing_task: asyncio.Task[Any] | None = None
+    # "telegram" (backup downloader bots) or "cobalt" (self-hosted cobalt API).
+    # When "cobalt", `lease`, `request_message_id`, `menu_message_id` are unused.
+    provider_kind: str = "telegram"
 
 
 @dataclass
@@ -1465,8 +1495,32 @@ def failure_text(reasons: list[str], request_id: str) -> str:
         body = "مسیر دانلود موقتاً شلوغه؛ چند دقیقه دیگه دوباره امتحانش کن."
     elif "timeout" in reasons:
         body = "آماده‌کردن این لینک بیشتر از حد معمول طول کشید؛ یک بار دیگه بفرستش."
-    elif "service_rejected" in reasons:
+    elif "service_rejected" in reasons or "content_private" in reasons or "content_unavailable" in reasons:
         body = "احتمالاً لینک خصوصی، حذف‌شده یا محدود شده و نمی‌تونم به محتواش برسم."
+    elif "content_age" in reasons:
+        body = "این محتوا محدودیت سنی داره و از مسیر فعلی قابل دریافت نیست."
+    elif "content_too_long" in reasons:
+        body = "این ویدیو خیلی طولانیه و فعلاً قابل پردازش نیست."
+    elif "content_live" in reasons:
+        body = "این یک پخش زنده‌ست و قابل دانلود نیست."
+    elif "rate_limited" in reasons:
+        body = "به سرویس دانلود خیلی درخواست فرستادیم؛ کمی بعد دوباره امتحان کن."
+    elif "unsupported_link" in reasons:
+        body = "این فرمت لینک پشتیبانی نمی‌شه."
+    elif "drm_protected" in reasons:
+        body = "این محتوا DRM-protected است و قابل دانلود نیست."
+    elif "auth_required" in reasons:
+        body = "برای این محتوا باید وارد حساب کاربری بشی — فعلاً قابل دریافت نیست."
+    elif "cobalt_error" in reasons:
+        body = "از مسیر دانلود اصلی مشکلی پیش اومد؛ مسیرهای جایگزین هم نتیجه نداد."
+    elif "cobalt_disabled" in reasons:
+        body = "مسیر اصلی دانلود غیرفعاله و مسیرهای جایگزین هم جواب ندادند."
+    elif "ffmpeg_failed" in reasons:
+        body = "پردازش ویدیو ناموفق بود (ffmpeg خطا داد)."
+    elif "no_telegram_accounts" in reasons:
+        body = "هیچ اکانت تلگرامی برای مسیرهای جایگزین وصل نیست."
+    elif "pool_unavailable" in reasons or "telegram_queue_full" in reasons:
+        body = "صف مسیرهای جایگزین پر شده؛ کمی بعد دوباره امتحان کن."
     else:
         body = "نتونستم از این لینک فایل سالمی بگیرم؛ لینک رو چک کن و دوباره بفرست."
     return status_card(
@@ -1490,7 +1544,9 @@ def release_pending_selection(session: PendingSelection) -> None:
         PENDING_SELECTIONS.pop(session.token, None)
     if session.caption_task is not None and not session.caption_task.done():
         session.caption_task.cancel()
-    ACCOUNT_POOL.release(session.lease)
+    # Cobalt sessions don't hold a Telethon lease — only release telegram ones.
+    if session.provider_kind == "telegram" and session.lease is not None:
+        ACCOUNT_POOL.release(session.lease)
     cleanup_request_directory(session.attempt_directory, SETTINGS.download_root)
 
 
@@ -1562,22 +1618,22 @@ async def _process_url(
         return
     spotify_collection_type = spotify_resource_type(url)
     is_spotify_collection = platform == Platform.SPOTIFY and spotify_collection_type in {"album", "playlist"}
-    normal_providers = () if is_spotify_collection else providers_for_platform(platform, SETTINGS)
-    providers = tuple(dict.fromkeys((*normal_providers, *all_providers(SETTINGS))))
+    if is_spotify_collection:
+        providers = ()
+    else:
+        providers = ordered_providers(platform, SETTINGS)
     if not providers:
         STATS.failed += 1
         return
     info = platform_info(platform)
-    if not is_spotify_collection and ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
-        STATS.failed += 1
-        await send_status(
-            context,
-            chat_id,
-            status_card("⏳ یکم شلوغه", "صف فعلاً پر شده؛ چند لحظه دیگه دوباره امتحان کن."),
-            reply_to,
-        )
-        return
-    if not is_spotify_collection and ACCOUNT_POOL.total == 0:
+    # Cobalt doesn't need a Telethon account; only telegram fallbacks do.
+    telegram_providers = tuple(p for p in providers if not is_cobalt_provider(p))
+    has_cobalt_provider = any(is_cobalt_provider(p) for p in providers)
+    needs_telegram_pool = bool(telegram_providers) and not is_spotify_collection
+    # If cobalt is first and the only pool entry is empty, we still let the
+    # request through — cobalt may succeed without needing a Telegram account.
+    # We only bail out upfront if cobalt is NOT in the picture at all.
+    if needs_telegram_pool and not has_cobalt_provider and ACCOUNT_POOL.total == 0:
         STATS.failed += 1
         await send_status(
             context,
@@ -1589,8 +1645,19 @@ async def _process_url(
             reply_to,
         )
         return
+    if needs_telegram_pool and not has_cobalt_provider and ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
+        STATS.failed += 1
+        await send_status(
+            context,
+            chat_id,
+            status_card("⏳ یکم شلوغه", "صف فعلاً پر شده؛ چند لحظه دیگه دوباره امتحان کن."),
+            reply_to,
+        )
+        return
 
-    queued = ACCOUNT_POOL.total > 0 and ACCOUNT_POOL.busy_count >= ACCOUNT_POOL.total
+    pool_total = ACCOUNT_POOL.total
+    pool_busy = ACCOUNT_POOL.busy_count
+    queued = pool_total > 0 and pool_busy >= pool_total
     initial = status_card(
         "⏳ لینک رفت توی صف" if queued else "🔎 بذار لینکت رو بررسی کنم…",
         (
@@ -1734,16 +1801,16 @@ async def _process_url(
                 cleanup_request_directory(attempt_directory, SETTINGS.download_root)
                 attempt_directory = None
 
-        if ACCOUNT_POOL.total == 0:
-            raise PoolUnavailable("No Telegram fallback account is connected")
-        if ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
-            raise PoolUnavailable("Fallback queue is full")
-        lease = await asyncio.wait_for(
-            ACCOUNT_POOL.acquire(),
-            timeout=SETTINGS.worker_acquire_timeout,
-        )
+        # Lease is acquired lazily — only when we hit the first telegram provider.
+        # Cobalt requests don't need a Telethon account at all, so we don't
+        # pre-check the pool here. If cobalt succeeds we never touch the pool;
+        # if cobalt fails AND the pool is empty/unavailable, we just record
+        # the reason and exit the loop with an error result.
+        lease: WorkerLease | None = None
+        provider_kind = "telegram"
         for index, bot_username in enumerate(providers, start=1):
-            phase = "مسیر اصلی" if index <= len(normal_providers) else "مسیر جایگزین"
+            is_cobalt = is_cobalt_provider(bot_username)
+            phase = "مسیر اصلی" if index <= max(1, len(providers) - len(telegram_providers)) else "مسیر جایگزین"
             await progress.update(
                 10,
                 "🔄 دارم محتوا رو آماده می‌کنم…",
@@ -1755,14 +1822,53 @@ async def _process_url(
                 request_id,
                 f"{index}-{bot_username}",
             )
-            result = await GATEWAY.request(
-                client=lease.worker.client,
-                worker_name=lease.worker.name,
-                bot_username=bot_username,
-                url=url,
-                attempt_directory=attempt_directory,
-                progress_callback=progress.download,
-            )
+            if is_cobalt:
+                if COBALT_GATEWAY is None:
+                    reasons.append("cobalt_disabled")
+                    cleanup_request_directory(attempt_directory, SETTINGS.download_root)
+                    attempt_directory = None
+                    continue
+                provider_kind = "cobalt"
+                result = await COBALT_GATEWAY.request(
+                    url=url,
+                    platform=platform,
+                    attempt_directory=attempt_directory,
+                    progress_callback=progress.download,
+                )
+            else:
+                # Telegram provider — we need a Telethon lease. If the pool is
+                # empty (no accounts configured) we skip with a reason rather
+                # than crashing. This lets cobalt-only deployments work.
+                if ACCOUNT_POOL.total == 0:
+                    reasons.append("no_telegram_accounts")
+                    cleanup_request_directory(attempt_directory, SETTINGS.download_root)
+                    attempt_directory = None
+                    continue
+                if ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
+                    reasons.append("telegram_queue_full")
+                    cleanup_request_directory(attempt_directory, SETTINGS.download_root)
+                    attempt_directory = None
+                    continue
+                if lease is None:
+                    try:
+                        lease = await asyncio.wait_for(
+                            ACCOUNT_POOL.acquire(),
+                            timeout=SETTINGS.worker_acquire_timeout,
+                        )
+                    except (asyncio.TimeoutError, PoolUnavailable) as exc:
+                        reasons.append("pool_unavailable")
+                        cleanup_request_directory(attempt_directory, SETTINGS.download_root)
+                        attempt_directory = None
+                        continue
+                provider_kind = "telegram"
+                result = await GATEWAY.request(
+                    client=lease.worker.client,
+                    worker_name=lease.worker.name,
+                    bot_username=bot_username,
+                    url=url,
+                    attempt_directory=attempt_directory,
+                    progress_callback=progress.download,
+                )
             if result.status == "ready":
                 instagram_caption = await caption_task if caption_task is not None else ""
                 caption_task = None
@@ -1948,6 +2054,7 @@ async def _process_url(
                     attempt_directory=attempt_directory,
                     fallback_text=result.text if platform != Platform.INSTAGRAM else "",
                     caption_task=caption_task,
+                    provider_kind=provider_kind,
                 )
                 caption_task = None
                 PENDING_SELECTIONS[token] = session
@@ -3050,20 +3157,33 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     try:
-        if session.lease.worker.lease_id != session.lease.lease_id:
-            raise RuntimeError("Selection lease is no longer active")
         selection_progress = ProgressReporter(query.message, session.request_id)
         await selection_progress.update(10, selection_title, selection_label, force=True)
-        result = await GATEWAY.select(
-            client=session.lease.worker.client,
-            worker_name=session.lease.worker.name,
-            bot_username=session.bot_username,
-            request_message_id=session.request_message_id,
-            menu_message_id=session.menu_message_id,
-            option=option,
-            attempt_directory=session.attempt_directory,
-            progress_callback=selection_progress.download,
-        )
+        if session.provider_kind == "cobalt":
+            if COBALT_GATEWAY is None:
+                raise RuntimeError("Cobalt gateway is not available")
+            result = await COBALT_GATEWAY.select(
+                url=session.source_url,
+                platform=session.platform,
+                option=option,
+                attempt_directory=session.attempt_directory,
+                progress_callback=selection_progress.download,
+            )
+        else:
+            if session.lease is None:
+                raise RuntimeError("Selection lease is missing for telegram provider")
+            if session.lease.worker.lease_id != session.lease.lease_id:
+                raise RuntimeError("Selection lease is no longer active")
+            result = await GATEWAY.select(
+                client=session.lease.worker.client,
+                worker_name=session.lease.worker.name,
+                bot_username=session.bot_username,
+                request_message_id=session.request_message_id,
+                menu_message_id=session.menu_message_id,
+                option=option,
+                attempt_directory=session.attempt_directory,
+                progress_callback=selection_progress.download,
+            )
         if result.status == "text":
             chunks = [result.text[index:index + 3500] for index in range(0, len(result.text), 3500)] or [""]
             for index, chunk in enumerate(chunks):

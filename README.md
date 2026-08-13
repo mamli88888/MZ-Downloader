@@ -4,9 +4,68 @@
 
 راهنمای کامل انتشار: [RAILWAY_DEPLOY_FA.md](RAILWAY_DEPLOY_FA.md)
 
+## Cobalt — موتور دانلود خودمیزبان
+
+این پروژه به‌صورت پیش‌فرض از [cobalt](https://github.com/imputnet/cobalt) به‌عنوان موتور اصلی دانلود برای **یوتیوب** و **اینستاگرام** استفاده می‌کند. cobalt یک سرویس Node.js است که در همان کانتینر ربات اجرا می‌شود (به‌صورت یک فرمان پس‌زمینه) و یک API ساده‌ی HTTP روی `127.0.0.1:9000` ارائه می‌دهد.
+
+### نحوه‌ی کار
+
+- برای **یوتیوب**: ربات ابتدا منوی کیفیت را نمایش می‌دهد (360p تا 4K، به‌علاوه‌ی MP3 در بیت‌ریت‌های ۱۲۸/۲۵۶/۳۲۰). با انتخاب هر گزینه، درخواست به cobalt ارسال می‌شود و فایل نهایی (ویدیوی muxed یا فایل صوتی) دریافت می‌شود.
+- برای **اینستاگرام**: cobalt به‌صورت خودکار نوع محتوا را تشخیص می‌دهد — Reel یا ویدیوی تکی مستقیماً دانلود می‌شود، پست‌های carousel (چندعکسی/چندویدیویی) به‌صورت یک منوی انتخاب نمایش داده می‌شوند، و عکس‌های تکی مستقیماً ارسال می‌شوند.
+- اگر cobalt به هر دلیلی شکست بخورد (مثلاً محتوای خصوصی یا خطای سرویس)، ربات به‌صورت خودکار به بات‌های پشتیبان تلگرام (`INSTAGRAM_YOUTUBE_BOTS`) برمی‌گردد.
+
+### پیکربندی
+
+| متغیر | پیش‌فرض | توضیح |
+|------|---------|-------|
+| `COBALT_API_URL` | (خالی) | آدرس API cobalt. خالی = غیرفعال. در Docker: `http://127.0.0.1:9000/` |
+| `COBALT_API_KEY` | (خالی) | کلید اختیاری اگر نمونه‌ی cobalt شما محافظت شده باشد |
+| `COBALT_PRIORITY` | `true` | `true` = cobalt اول؛ `false` = بات‌های تلگرام اول |
+| `FFMPEG_PATH` | `ffmpeg` | مسیر ffmpeg برای ترکیب ویدیو/صدا (محتوای vp9/av1 یوتیوب) |
+
+### اجرای محلی (بدون Docker)
+
+```bash
+# 1. کلون cobalt و نصب وابستگی‌ها
+git clone https://github.com/imputnet/cobalt.git /path/to/cobalt
+cd /path/to/cobalt/api && pnpm install
+
+# 2. ساخت فایل .env برای cobalt
+cat > .env <<EOF
+API_URL=http://127.0.0.1:9000/
+API_PORT=9000
+API_LISTEN_ADDRESS=127.0.0.1
+EOF
+
+# 3. اجرای cobalt در پس‌زمینه
+node src/cobalt.js &
+
+# 4. اجرای ربات با COBALT_API_URL تنظیم‌شده
+cd /path/to/MZ-Downloader
+echo "COBALT_API_URL=http://127.0.0.1:9000/" >> .env
+python bot.py
+```
+
+### اجرا با Docker
+
+```bash
+git clone https://github.com/mamli88888/MZ-Downloader.git
+cd MZ-Downloader
+cp .env.example .env  # BOT_TOKEN و TELEGRAM_ACCOUNTS را ویرایش کنید
+docker compose up -d --build
+docker compose logs -f
+```
+
+Dockerfile به‌صورت خودکار cobalt را از GitHub کلون می‌کند و در همان کانتینر نصب می‌کند. `start.sh` هم cobalt و هم ربات را همزمان اجرا می‌کند و در صورت خروج هرکدام، کانتینر ری‌استارت می‌شود.
+
+### محدودیت‌های شناخته‌شده
+
+- cobalt بدون `YOUTUBE_SESSION_SERVER` فقط ویدیوهای h264 یوتیوب را تا 1080p می‌تواند به‌صورت server-side muxed ارائه دهد. برای کیفیت بالاتر (4K) یا کدک‌های vp9/av1 باید [yt-session-generator](https://github.com/imputnet/yt-session-generator) را راه‌اندازی کنید.
+- استوری اینستاگرام نیاز به کوکی Instagram دارد (cobalt از `cookies.json` استفاده می‌کند). بدون کوکی فقط پست‌ها، Reelها و carouselها کار می‌کنند.
+
 ## مسیریابی
 
-- Instagram / YouTube: به‌ترتیب `allsaverbot`، `instadowbot`، `download_it_bot` و `AllSavesBot`
+- Instagram / YouTube: **ابتدا cobalt**، سپس `ziyotech_instagram_downloaderbot`، `allsaverbot`، `instadowbot`، `download_it_bot` و `AllSavesBot`
 - TikTok: `download_it_bot` و سپس `AllSavesBot`
 - Twitter/X / Facebook / VK: فقط `download_it_bot`
 - Spotify track: فقط `spotifysavesbot`

@@ -68,6 +68,9 @@ class Settings:
     proxy_port: int
     pixeldrain_delete_delay: float
     pixeldrain_api_key: str | None
+    cobalt_api_url: str
+    cobalt_api_key: str | None
+    cobalt_priority: bool
 
 
 def _as_bool(value: str | None, default: bool) -> bool:
@@ -209,6 +212,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         music_finder_bots=music_finder_bots,
         pixeldrain_delete_delay=_as_float(env, "PIXELDRAIN_DELETE_DELAY_SECONDS", 1800.0),
         pixeldrain_api_key=env.get("PIXELDRAIN_API_KEY", "").strip() or None,
+        cobalt_api_url=env.get("COBALT_API_URL", "").strip(),
+        cobalt_api_key=env.get("COBALT_API_KEY", "").strip() or None,
+        cobalt_priority=_as_bool(env.get("COBALT_PRIORITY"), True),
         download_root=download_root,
         max_file_size=_as_int(env, "MAX_FILE_SIZE_MB", 30) * 1024 * 1024,
         # Zero disables the application-level source-size cap. Telegram upload

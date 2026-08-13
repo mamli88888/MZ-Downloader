@@ -87,6 +87,41 @@ def all_providers(settings) -> tuple[str, ...]:
     return settings.fallback_bots
 
 
+def ordered_providers(
+    platform: Platform,
+    settings,
+) -> tuple[str, ...]:
+    """Build the ordered list of providers to try for a given platform.
+
+    Cobalt (the COBALT_PROVIDER sentinel from cobalt_gateway) is prepended for
+    YouTube and Instagram when COBALT_API_URL is configured and COBALT_PRIORITY
+    is enabled. The backup Telegram bots are always appended afterwards so the
+    bot still works if cobalt is down or returns an error.
+
+    For non-YouTube/Instagram platforms, cobalt is never inserted.
+    """
+    from cobalt_gateway import COBALT_PROVIDER
+
+    normal = providers_for_platform(platform, settings)
+    fallback = all_providers(settings)
+
+    cobalt_first = (
+        settings.cobalt_api_url
+        and settings.cobalt_priority
+        and platform in {Platform.YOUTUBE, Platform.INSTAGRAM}
+    )
+    if cobalt_first:
+        return tuple(dict.fromkeys((COBALT_PROVIDER, *normal, *fallback)))
+    return tuple(dict.fromkeys((*normal, *fallback)))
+
+
+def is_cobalt_provider(bot_username: str) -> bool:
+    """True if the given provider name is the cobalt sentinel."""
+    from cobalt_gateway import COBALT_PROVIDER
+
+    return bot_username == COBALT_PROVIDER
+
+
 def spotify_resource_type(url: str) -> str | None:
     try:
         parsed = urlsplit(url)
