@@ -19,6 +19,30 @@ WORKDIR /build/cobalt/api
 RUN pnpm install --frozen-lockfile=false
 
 
+# --------------------------------------------------------------------------- #
+# bgutil PO Token server builder stage.
+# --------------------------------------------------------------------------- #
+# We build the bgutil-ytdlp-pot-provider server (TypeScript → JS) so it can
+# run inside the same container as cobalt + the bot. This eliminates the need
+# for a separate Docker service for bgutil — critical for Railway, which runs
+# a single container per service.
+FROM node:22-slim AS bgutil-builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG BGUTIL_REF=main
+RUN git clone --depth=1 --branch="${BGUTIL_REF}" https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /build/bgutil
+
+WORKDIR /build/bgutil/server
+# Install ALL deps (including devDeps for tsc), compile TS, then prune devDeps.
+RUN npm ci --no-audit --no-fund \
+    && npx tsc \
+    && npm prune --omit=dev
+
+
 FROM node:22-slim AS runtime
 
 # Install Python + ffmpeg + system deps in a single layer.
@@ -56,18 +80,26 @@ COPY --chown=appuser:appuser . /app/
 # Copy the pre-built cobalt API from the builder stage.
 COPY --from=cobalt-builder --chown=appuser:appuser /build/cobalt/ /opt/cobalt/
 
+# Copy the pre-built bgutil PO Token server from its builder stage.
+# /build/bgutil/server/build/ contains the compiled JS (main.js etc.).
+COPY --from=bgutil-builder --chown=appuser:appuser /build/bgutil/server/ /opt/bgutil/
+
 # Make the start script executable.
 RUN chmod +x /app/start.sh
 
-# Default cobalt env (can be overridden at runtime via -e flags).
+# Default cobalt + bgutil env (can be overridden at runtime via -e flags).
 ENV COBALT_API_URL=http://127.0.0.1:9000/ \
     API_URL=http://127.0.0.1:9000/ \
     API_PORT=9000 \
     API_LISTEN_ADDRESS=127.0.0.1 \
-    FFMPEG_PATH=/usr/bin/ffmpeg
+    FFMPEG_PATH=/usr/bin/ffmpeg \
+    YTDLP_ENABLED=true \
+    YTDLP_BGUTIL_BASE_URL=http://127.0.0.1:4416 \
+    BGUTIL_PORT=4416 \
+    BGUTIL_TOKEN_TTL=6
 
 USER appuser
 
-# Use tini as PID 1 so SIGTERM propagates correctly to both child processes.
+# Use tini as PID 1 so SIGTERM propagates correctly to all child processes.
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/app/start.sh"]
