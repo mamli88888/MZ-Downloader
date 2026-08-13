@@ -6,7 +6,6 @@
   },
   "deploy": {
     "runtime": "V2",
-    "startCommand": "/app/start.sh",
     "numReplicas": 1,
     "sleepApplication": false,
     "restartPolicyType": "ON_FAILURE",

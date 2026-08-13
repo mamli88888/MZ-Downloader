@@ -1,46 +1,18 @@
-# Python cache + virtualenvs
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+.env
+.env.*
+!.env.example
+*.session
+*.session-*
 .venv/
 venv/
-env/
-.env
-
-# Local downloads / runtime artefacts
 downloads/
-*.log
-*.session
-*.session-journal
-*.db
-*.sqlite
-*.sqlite3
-
-# Git
+live-test-results/
+tests/
+__pycache__/
+*.py[cod]
+*.log*
+inspect_recent.py
+live_contract_test.py
+export_sessions.py
 .git/
 .gitignore
-.gitattributes
-
-# Documentation that doesn't need to ship in the image
-*.md
-!README.md
-
-# Tests
-tests/
-live_contract_test.py
-inspect_recent.py
-
-# Cobalt source (we clone it in the Dockerfile, so don't COPY it)
-cobalt/
-
-# Docker
-Dockerfile
-docker-compose.yml
-.dockerignore
-
-# Editor / OS
-.DS_Store
-.vscode/
-.idea/
-*.swp

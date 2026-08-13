@@ -68,14 +68,6 @@ class Settings:
     proxy_port: int
     pixeldrain_delete_delay: float
     pixeldrain_api_key: str | None
-    cobalt_api_url: str
-    cobalt_api_key: str | None
-    cobalt_priority: bool
-    # yt-dlp + bgutil PO Token gateway (YouTube only)
-    ytdlp_enabled: bool
-    ytdlp_bgutil_base_url: str
-    ytdlp_cookies_file: Path
-    ytdlp_player_clients: tuple[str, ...]
 
 
 def _as_bool(value: str | None, default: bool) -> bool:
@@ -200,21 +192,6 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     download_dir = Path(env.get("DOWNLOAD_DIR", "downloads"))
     download_root = download_dir if download_dir.is_absolute() else PROJECT_DIR / download_dir
 
-    # yt-dlp + bgutil PO Token gateway config (YouTube only).
-    # When YTDLP_ENABLED=true, YouTube downloads go to yt-dlp + bgutil first;
-    # Cobalt (if still configured) becomes a fallback.
-    ytdlp_enabled = _as_bool(env.get("YTDLP_ENABLED"), False)
-    ytdlp_bgutil_base_url = env.get("YTDLP_BGUTIL_BASE_URL", "http://127.0.0.1:4416").strip()
-    ytdlp_cookies_env = env.get("YTDLP_COOKIES_FILE", "cookies.txt").strip()
-    ytdlp_cookies_path = Path(ytdlp_cookies_env)
-    if not ytdlp_cookies_path.is_absolute():
-        ytdlp_cookies_path = PROJECT_DIR / ytdlp_cookies_path
-    ytdlp_player_clients = tuple(
-        client.strip()
-        for client in env.get("YTDLP_PLAYER_CLIENTS", "mweb,web").split(",")
-        if client.strip()
-    ) or ("mweb", "web")
-
     return Settings(
         bot_token=env.get("BOT_TOKEN", "").strip(),
         accounts=_load_accounts(env),
@@ -232,13 +209,6 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         music_finder_bots=music_finder_bots,
         pixeldrain_delete_delay=_as_float(env, "PIXELDRAIN_DELETE_DELAY_SECONDS", 1800.0),
         pixeldrain_api_key=env.get("PIXELDRAIN_API_KEY", "").strip() or None,
-        cobalt_api_url=env.get("COBALT_API_URL", "").strip(),
-        cobalt_api_key=env.get("COBALT_API_KEY", "").strip() or None,
-        cobalt_priority=_as_bool(env.get("COBALT_PRIORITY"), True),
-        ytdlp_enabled=ytdlp_enabled,
-        ytdlp_bgutil_base_url=ytdlp_bgutil_base_url,
-        ytdlp_cookies_file=ytdlp_cookies_path,
-        ytdlp_player_clients=ytdlp_player_clients,
         download_root=download_root,
         max_file_size=_as_int(env, "MAX_FILE_SIZE_MB", 30) * 1024 * 1024,
         # Zero disables the application-level source-size cap. Telegram upload

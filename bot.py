@@ -67,10 +67,7 @@ from downloader import (
     request_dr_downloader_album,
 )
 from instagram_caption import InstagramCaptionError, fetch_instagram_caption
-from cobalt_client import CobaltClient, CobaltError
-from cobalt_gateway import COBALT_PROVIDER, CobaltGateway
-from ytdlp_gateway import YTDLP_PROVIDER, YtDlpGateway, bgutil_health_check
-from routing import Platform, all_providers, detect_platform, is_cobalt_provider, is_instagram_reel, is_ytdlp_provider, is_api_provider, ordered_providers, platform_info, providers_for_platform, spotify_resource_type
+from routing import Platform, all_providers, detect_platform, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
 from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
 from youtube_search import (
     MAX_RESULTS as YOUTUBE_SEARCH_MAX_RESULTS,
@@ -136,55 +133,6 @@ GATEWAY = DownloaderGateway(
         else None
     ),
 )
-
-# Cobalt self-hosted API gateway. Only initialized when COBALT_API_URL is set.
-# When configured, YouTube and Instagram downloads go to cobalt first; the
-# Telegram backup bots are still tried as a fallback if cobalt fails.
-COBALT_GATEWAY: CobaltGateway | None = None
-if SETTINGS.cobalt_api_url:
-    _cobalt_client = CobaltClient(
-        api_url=SETTINGS.cobalt_api_url,
-        api_key=SETTINGS.cobalt_api_key,
-        proxy_url=(
-            f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
-            if SETTINGS.use_proxy
-            else None
-        ),
-    )
-    COBALT_GATEWAY = CobaltGateway(
-        client=_cobalt_client,
-        max_download_size=SETTINGS.max_download_size,
-        ffmpeg_path=os.environ.get("FFMPEG_PATH", "ffmpeg"),
-    )
-    logger.info(
-        "Cobalt gateway enabled (API_URL=%s, priority=%s)",
-        SETTINGS.cobalt_api_url,
-        SETTINGS.cobalt_priority,
-    )
-
-# yt-dlp + bgutil PO Token gateway (YouTube only). Only initialized when
-# YTDLP_ENABLED=true. When configured, YouTube downloads go to yt-dlp first;
-# Cobalt (if still configured) and Telegram bots are tried as fallbacks.
-YTDLP_GATEWAY: YtDlpGateway | None = None
-if SETTINGS.ytdlp_enabled:
-    YTDLP_GATEWAY = YtDlpGateway(
-        bgutil_base_url=SETTINGS.ytdlp_bgutil_base_url,
-        cookies_file=SETTINGS.ytdlp_cookies_file,
-        proxy_url=(
-            f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
-            if SETTINGS.use_proxy
-            else None
-        ),
-        max_download_size=SETTINGS.max_download_size,
-        ffmpeg_path=os.environ.get("FFMPEG_PATH", "ffmpeg"),
-        player_clients=SETTINGS.ytdlp_player_clients,
-    )
-    logger.info(
-        "yt-dlp gateway enabled (bgutil=%s, cookies=%s, clients=%s)",
-        SETTINGS.ytdlp_bgutil_base_url,
-        SETTINGS.ytdlp_cookies_file.name if SETTINGS.ytdlp_cookies_file else None,
-        ",".join(SETTINGS.ytdlp_player_clients),
-    )
 YOUTUBE_SEARCH = YouTubeSearchService(
     proxy_url=(
         f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
@@ -236,20 +184,13 @@ class PendingSelection:
     request_message_id: int
     menu_message_id: int
     options: tuple[QualityOption, ...]
-    lease: WorkerLease | None
+    lease: WorkerLease
     attempt_directory: Path
     fallback_text: str = ""
     instagram_caption: str = ""
     caption_task: asyncio.Task[str] | None = None
     processing: bool = False
     processing_task: asyncio.Task[Any] | None = None
-    # "telegram" (backup downloader bots) or "cobalt" (self-hosted cobalt API).
-    # When "cobalt", `lease`, `request_message_id`, `menu_message_id` are unused.
-    provider_kind: str = "telegram"
-    # True when the menu/status message is a Telegram photo message (with
-    # caption + inline keyboard). Callback handlers must use edit_message_caption
-    # instead of edit_message_text for these messages.
-    is_photo: bool = False
 
 
 @dataclass
@@ -474,7 +415,7 @@ class ProgressReporter:
         if not force and now - self.last_edit < 1.0 and value < 100:
             return
         async with self.lock:
-            await edit_status_photo_aware(
+            await edit_status(
                 self.message,
                 status_card(title, f"{progress_bar(value)}\n{html_escape(detail)}"
             ))
@@ -853,89 +794,6 @@ async def send_status(
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-
-
-async def _cobalt_client_probe(api_url: str) -> bool:
-    """Quick connectivity probe for the cobalt API. Returns True if cobalt
-    responds with HTTP 200 on its `/` endpoint. Used by `post_init` to decide
-    whether to keep the cobalt gateway enabled at startup.
-    """
-    import httpx as _httpx
-
-    async with _httpx.AsyncClient(timeout=3.0, follow_redirects=True) as client:
-        response = await client.get(api_url)
-        return response.status_code == 200
-
-
-def _message_is_photo(message: Any) -> bool:
-    """True if `message` is a Telegram photo message (has PhotoSize list)."""
-    return bool(getattr(message, "photo", None))
-
-
-async def edit_status_photo_aware(
-    message: Any,
-    text: str,
-    reply_markup: Any = None,
-    *,
-    is_photo: bool = False,
-) -> None:
-    """Photo-aware version of `edit_status`. When `is_photo` is True (or auto-
-    detected via `message.photo`), edits the message caption instead of the
-    message text — because Telegram forbids changing a photo message's text
-    via `edit_message_text`.
-    """
-    if not is_photo:
-        is_photo = _message_is_photo(message)
-    if is_photo:
-        try:
-            await message.edit_caption(
-                caption=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
-            )
-        except TelegramError as exc:
-            if "message is not modified" not in str(exc).lower():
-                logger.debug("Status caption edit failed: %s", exc)
-    else:
-        await edit_status(message, text, reply_markup)
-
-
-async def edit_menu_via_query(
-    query: Any,
-    text: str,
-    reply_markup: Any = None,
-    *,
-    is_photo: bool = False,
-) -> None:
-    """Photo-aware version of `query.edit_message_text`. When `is_photo` is
-    True, edits the menu message's caption (for photo menus); otherwise edits
-    the text. Used by callback handlers so they work for both the legacy text
-    menu and the new YouTube thumbnail+caption menu.
-    """
-    if not is_photo:
-        is_photo = _message_is_photo(query.message)
-    if is_photo:
-        try:
-            await query.edit_message_caption(
-                caption=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
-            )
-        except TelegramError as exc:
-            if "message is not modified" not in str(exc).lower():
-                logger.debug("Menu caption edit failed: %s", exc)
-    else:
-        try:
-            await query.edit_message_text(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
-        except TelegramError as exc:
-            if "message is not modified" not in str(exc).lower():
-                logger.debug("Menu text edit failed: %s", exc)
-
 
 
 async def send_link_feedback(
@@ -1425,7 +1283,7 @@ async def send_result_to_user(
     if progress is not None:
         await progress.begin_upload(total_size)
     else:
-        await edit_status_photo_aware(
+        await edit_status(
             status_message,
             status_card(
                 "📤 آماده شد؛ دارم برات می‌فرستم…",
@@ -1589,7 +1447,7 @@ async def send_result_to_user(
         )
     else:
         quality_line = f"\nکیفیت: <b>{html_escape(quality)}</b>" if quality else ""
-        await edit_status_photo_aware(
+        await edit_status(
             status_message,
             status_card(
                 "✅ تموم شد؛ نوش جونت!",
@@ -1607,36 +1465,8 @@ def failure_text(reasons: list[str], request_id: str) -> str:
         body = "مسیر دانلود موقتاً شلوغه؛ چند دقیقه دیگه دوباره امتحانش کن."
     elif "timeout" in reasons:
         body = "آماده‌کردن این لینک بیشتر از حد معمول طول کشید؛ یک بار دیگه بفرستش."
-    elif "service_rejected" in reasons or "content_private" in reasons or "content_unavailable" in reasons:
+    elif "service_rejected" in reasons:
         body = "احتمالاً لینک خصوصی، حذف‌شده یا محدود شده و نمی‌تونم به محتواش برسم."
-    elif "content_age" in reasons:
-        body = "این محتوا محدودیت سنی داره و از مسیر فعلی قابل دریافت نیست."
-    elif "content_too_long" in reasons:
-        body = "این ویدیو خیلی طولانیه و فعلاً قابل پردازش نیست."
-    elif "content_live" in reasons:
-        body = "این یک پخش زنده‌ست و قابل دانلود نیست."
-    elif "rate_limited" in reasons:
-        body = "به سرویس دانلود خیلی درخواست فرستادیم؛ کمی بعد دوباره امتحان کن."
-    elif "unsupported_link" in reasons:
-        body = "این فرمت لینک پشتیبانی نمی‌شه."
-    elif "drm_protected" in reasons:
-        body = "این محتوا DRM-protected است و قابل دانلود نیست."
-    elif "auth_required" in reasons:
-        body = "برای این محتوا باید وارد حساب کاربری بشی — فعلاً قابل دریافت نیست."
-    elif "cobalt_error" in reasons:
-        body = "از مسیر دانلود اصلی مشکلی پیش اومد؛ مسیرهای جایگزین هم نتیجه نداد."
-    elif "cobalt_disabled" in reasons:
-        body = "مسیر اصلی دانلود غیرفعاله و مسیرهای جایگزین هم جواب ندادند."
-    elif "ytdlp_error" in reasons:
-        body = "دانلود از یوتیوب ناموفق بود؛ مسیرهای جایگزین هم جواب ندادند."
-    elif "ytdlp_disabled" in reasons:
-        body = "مسیر yt-dlp غیرفعاله و مسیرهای جایگزین هم جواب ندادند."
-    elif "ffmpeg_failed" in reasons:
-        body = "پردازش ویدیو ناموفق بود (ffmpeg خطا داد)."
-    elif "no_telegram_accounts" in reasons:
-        body = "هیچ اکانت تلگرامی برای مسیرهای جایگزین وصل نیست."
-    elif "pool_unavailable" in reasons or "telegram_queue_full" in reasons:
-        body = "صف مسیرهای جایگزین پر شده؛ کمی بعد دوباره امتحان کن."
     else:
         body = "نتونستم از این لینک فایل سالمی بگیرم؛ لینک رو چک کن و دوباره بفرست."
     return status_card(
@@ -1660,9 +1490,7 @@ def release_pending_selection(session: PendingSelection) -> None:
         PENDING_SELECTIONS.pop(session.token, None)
     if session.caption_task is not None and not session.caption_task.done():
         session.caption_task.cancel()
-    # Cobalt and yt-dlp sessions don't hold a Telethon lease — only release telegram ones.
-    if session.provider_kind == "telegram" and session.lease is not None:
-        ACCOUNT_POOL.release(session.lease)
+    ACCOUNT_POOL.release(session.lease)
     cleanup_request_directory(session.attempt_directory, SETTINGS.download_root)
 
 
@@ -1690,22 +1518,13 @@ async def expire_stale_selections(application: Application) -> None:
     ]
     for session in stale:
         release_pending_selection(session)
-        expired_text = status_card("⌛ زمان انتخاب تمام شد", "لینک را دوباره بفرست تا گزینه‌های تازه دریافت شوند.")
         with contextlib.suppress(TelegramError):
-            if session.is_photo:
-                await application.bot.edit_message_caption(
-                    chat_id=session.chat_id,
-                    message_id=session.status_message_id,
-                    caption=expired_text,
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                await application.bot.edit_message_text(
-                    chat_id=session.chat_id,
-                    message_id=session.status_message_id,
-                    text=expired_text,
-                    parse_mode=ParseMode.HTML,
-                )
+            await application.bot.edit_message_text(
+                chat_id=session.chat_id,
+                message_id=session.status_message_id,
+                text=status_card("⌛ زمان انتخاب تمام شد", "لینک را دوباره بفرست تا گزینه‌های تازه دریافت شوند."),
+                parse_mode=ParseMode.HTML,
+            )
 
 
 async def selection_reaper(application: Application) -> None:
@@ -1743,22 +1562,22 @@ async def _process_url(
         return
     spotify_collection_type = spotify_resource_type(url)
     is_spotify_collection = platform == Platform.SPOTIFY and spotify_collection_type in {"album", "playlist"}
-    if is_spotify_collection:
-        providers = ()
-    else:
-        providers = ordered_providers(platform, SETTINGS)
+    normal_providers = () if is_spotify_collection else providers_for_platform(platform, SETTINGS)
+    providers = tuple(dict.fromkeys((*normal_providers, *all_providers(SETTINGS))))
     if not providers:
         STATS.failed += 1
         return
     info = platform_info(platform)
-    # Cobalt and yt-dlp don't need a Telethon account; only telegram fallbacks do.
-    telegram_providers = tuple(p for p in providers if not is_api_provider(p))
-    has_api_provider = any(is_api_provider(p) for p in providers)
-    needs_telegram_pool = bool(telegram_providers) and not is_spotify_collection
-    # If an API gateway is first and the only pool entry is empty, we still let the
-    # request through — the gateway may succeed without needing a Telegram account.
-    # We only bail out upfront if no API provider is in the picture at all.
-    if needs_telegram_pool and not has_api_provider and ACCOUNT_POOL.total == 0:
+    if not is_spotify_collection and ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
+        STATS.failed += 1
+        await send_status(
+            context,
+            chat_id,
+            status_card("⏳ یکم شلوغه", "صف فعلاً پر شده؛ چند لحظه دیگه دوباره امتحان کن."),
+            reply_to,
+        )
+        return
+    if not is_spotify_collection and ACCOUNT_POOL.total == 0:
         STATS.failed += 1
         await send_status(
             context,
@@ -1770,19 +1589,8 @@ async def _process_url(
             reply_to,
         )
         return
-    if needs_telegram_pool and not has_api_provider and ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
-        STATS.failed += 1
-        await send_status(
-            context,
-            chat_id,
-            status_card("⏳ یکم شلوغه", "صف فعلاً پر شده؛ چند لحظه دیگه دوباره امتحان کن."),
-            reply_to,
-        )
-        return
 
-    pool_total = ACCOUNT_POOL.total
-    pool_busy = ACCOUNT_POOL.busy_count
-    queued = pool_total > 0 and pool_busy >= pool_total
+    queued = ACCOUNT_POOL.total > 0 and ACCOUNT_POOL.busy_count >= ACCOUNT_POOL.total
     initial = status_card(
         "⏳ لینک رفت توی صف" if queued else "🔎 بذار لینکت رو بررسی کنم…",
         (
@@ -1926,18 +1734,16 @@ async def _process_url(
                 cleanup_request_directory(attempt_directory, SETTINGS.download_root)
                 attempt_directory = None
 
-        # Lease is acquired lazily — only when we hit the first telegram provider.
-        # Cobalt and yt-dlp requests don't need a Telethon account at all, so we
-        # don't pre-check the pool here. If an API gateway succeeds we never
-        # touch the pool; if it fails AND the pool is empty/unavailable, we just
-        # record the reason and exit the loop with an error result.
-        lease: WorkerLease | None = None
-        provider_kind = "telegram"
+        if ACCOUNT_POOL.total == 0:
+            raise PoolUnavailable("No Telegram fallback account is connected")
+        if ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
+            raise PoolUnavailable("Fallback queue is full")
+        lease = await asyncio.wait_for(
+            ACCOUNT_POOL.acquire(),
+            timeout=SETTINGS.worker_acquire_timeout,
+        )
         for index, bot_username in enumerate(providers, start=1):
-            is_cobalt = is_cobalt_provider(bot_username)
-            is_ytdlp = is_ytdlp_provider(bot_username)
-            is_api = is_cobalt or is_ytdlp
-            phase = "مسیر اصلی" if index <= max(1, len(providers) - len(telegram_providers)) else "مسیر جایگزین"
+            phase = "مسیر اصلی" if index <= len(normal_providers) else "مسیر جایگزین"
             await progress.update(
                 10,
                 "🔄 دارم محتوا رو آماده می‌کنم…",
@@ -1949,66 +1755,14 @@ async def _process_url(
                 request_id,
                 f"{index}-{bot_username}",
             )
-            if is_ytdlp:
-                if YTDLP_GATEWAY is None:
-                    reasons.append("ytdlp_disabled")
-                    cleanup_request_directory(attempt_directory, SETTINGS.download_root)
-                    attempt_directory = None
-                    continue
-                provider_kind = "ytdlp"
-                result = await YTDLP_GATEWAY.request(
-                    url=url,
-                    platform=platform,
-                    attempt_directory=attempt_directory,
-                    progress_callback=progress.download,
-                )
-            elif is_cobalt:
-                if COBALT_GATEWAY is None:
-                    reasons.append("cobalt_disabled")
-                    cleanup_request_directory(attempt_directory, SETTINGS.download_root)
-                    attempt_directory = None
-                    continue
-                provider_kind = "cobalt"
-                result = await COBALT_GATEWAY.request(
-                    url=url,
-                    platform=platform,
-                    attempt_directory=attempt_directory,
-                    progress_callback=progress.download,
-                )
-            else:
-                # Telegram provider — we need a Telethon lease. If the pool is
-                # empty (no accounts configured) we skip with a reason rather
-                # than crashing. This lets cobalt-only deployments work.
-                if ACCOUNT_POOL.total == 0:
-                    reasons.append("no_telegram_accounts")
-                    cleanup_request_directory(attempt_directory, SETTINGS.download_root)
-                    attempt_directory = None
-                    continue
-                if ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
-                    reasons.append("telegram_queue_full")
-                    cleanup_request_directory(attempt_directory, SETTINGS.download_root)
-                    attempt_directory = None
-                    continue
-                if lease is None:
-                    try:
-                        lease = await asyncio.wait_for(
-                            ACCOUNT_POOL.acquire(),
-                            timeout=SETTINGS.worker_acquire_timeout,
-                        )
-                    except (asyncio.TimeoutError, PoolUnavailable) as exc:
-                        reasons.append("pool_unavailable")
-                        cleanup_request_directory(attempt_directory, SETTINGS.download_root)
-                        attempt_directory = None
-                        continue
-                provider_kind = "telegram"
-                result = await GATEWAY.request(
-                    client=lease.worker.client,
-                    worker_name=lease.worker.name,
-                    bot_username=bot_username,
-                    url=url,
-                    attempt_directory=attempt_directory,
-                    progress_callback=progress.download,
-                )
+            result = await GATEWAY.request(
+                client=lease.worker.client,
+                worker_name=lease.worker.name,
+                bot_username=bot_username,
+                url=url,
+                attempt_directory=attempt_directory,
+                progress_callback=progress.download,
+            )
             if result.status == "ready":
                 instagram_caption = await caption_task if caption_task is not None else ""
                 caption_task = None
@@ -2151,7 +1905,7 @@ async def _process_url(
                                 )
                             ]
                         )
-                elif not any(option.action == "caption" for option in displayed_options) and result.text and result.preview is None:
+                elif not any(option.action == "caption" for option in displayed_options) and result.text:
                     rows.append(
                         [InlineKeyboardButton("📝 متن/اطلاعات پست", callback_data=f"info:{token}")]
                     )
@@ -2161,35 +1915,18 @@ async def _process_url(
                     f"منبع: <code>{html_escape(host)}</code>\nکیفیت، صدا یا کپشن رو انتخاب کن.",
                     f"تا {int(SETTINGS.selection_ttl // 60)} دقیقه وقت داری"
                 )
-                # When cobalt provided a YouTube thumbnail + caption (video
-                # title / channel / duration), send ONE photo message with the
-                # caption (menu header + video info) + inline keyboard. This
-                # replaces the legacy flow of "send photo, delete status,
-                # send new text status, edit it with buttons" — everything is
-                # now a single Telegram photo message with caption + buttons.
-                menu_is_photo = False
                 if result.preview is not None:
                     try:
-                        # Build combined caption: menu header on top, video
-                        # info below. The bot's status_card helper produces a
-                        # neat boxed header; the cobalt gateway's text field
-                        # holds the per-video detail block.
-                        photo_caption = menu_text
-                        if result.text:
-                            photo_caption = photo_caption + "\n" + result.text
                         with result.preview.path.open("rb") as preview_handle:
-                            new_photo_message = await context.bot.send_photo(
+                            await context.bot.send_photo(
                                 chat_id=chat_id,
                                 photo=preview_handle,
-                                caption=photo_caption,
-                                parse_mode=ParseMode.HTML,
-                                reply_markup=InlineKeyboardMarkup(rows),
+                                caption=f"🖼 پیش‌نمایش ویدیو • {host}",
                                 reply_to_message_id=reply_to,
                             )
                         with contextlib.suppress(TelegramError):
                             await status_message.delete()
-                        status_message = new_photo_message
-                        menu_is_photo = True
+                        status_message = await send_status(context, chat_id, menu_text, None)
                     except TelegramError as exc:
                         logger.warning("Thumbnail send failed for %s: %s", request_id, exc)
                 session = PendingSelection(
@@ -2211,13 +1948,10 @@ async def _process_url(
                     attempt_directory=attempt_directory,
                     fallback_text=result.text if platform != Platform.INSTAGRAM else "",
                     caption_task=caption_task,
-                    provider_kind=provider_kind,
-                    is_photo=menu_is_photo,
                 )
                 caption_task = None
                 PENDING_SELECTIONS[token] = session
-                if not menu_is_photo:
-                    await edit_status(status_message, menu_text, InlineKeyboardMarkup(rows))
+                await edit_status(status_message, menu_text, InlineKeyboardMarkup(rows))
                 if appended_size_note:
                     with contextlib.suppress(TelegramError):
                         await context.bot.send_message(
@@ -3107,22 +2841,13 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session.processing_task.cancel()
         else:
             release_pending_selection(session)
-            cancel_text = status_card("⏹ درخواست متوقف شد", "انتخاب کیفیت لغو شد.")
             with contextlib.suppress(TelegramError):
-                if session.is_photo:
-                    await context.bot.edit_message_caption(
-                        chat_id=session.chat_id,
-                        message_id=session.status_message_id,
-                        caption=cancel_text,
-                        parse_mode=ParseMode.HTML,
-                    )
-                else:
-                    await context.bot.edit_message_text(
-                        chat_id=session.chat_id,
-                        message_id=session.status_message_id,
-                        text=cancel_text,
-                        parse_mode=ParseMode.HTML,
-                    )
+                await context.bot.edit_message_text(
+                    chat_id=session.chat_id,
+                    message_id=session.status_message_id,
+                    text=status_card("⏹ درخواست متوقف شد", "انتخاب کیفیت لغو شد."),
+                    parse_mode=ParseMode.HTML,
+                )
     for task in tasks:
         task.cancel()
     await asyncio.sleep(0)
@@ -3247,7 +2972,7 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             if not session.options:
                 release_pending_selection(session)
-                await edit_menu_via_query(query, unavailable, is_photo=session.is_photo)
+                await query.edit_message_text(unavailable, parse_mode=ParseMode.HTML)
             else:
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
@@ -3265,10 +2990,9 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         if not session.options:
             release_pending_selection(session)
-            await edit_menu_via_query(
-                query,
+            await query.edit_message_text(
                 status_card("✅ کپشن رو فرستادم", "همون متن اصلی پست آماده‌ست."),
-                is_photo=session.is_photo,
+                parse_mode=ParseMode.HTML,
             )
         return
 
@@ -3295,10 +3019,9 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         await query.answer("درخواست لغو شد")
         release_pending_selection(session)
-        await edit_menu_via_query(
-            query,
+        await query.edit_message_text(
             status_card("⏹ درخواست متوقف شد", "انتخاب کیفیت لغو شد."),
-            is_photo=session.is_photo,
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -3317,54 +3040,30 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await query.answer("باشه، شروع کردم 🚀")
     selection_title = "📝 دارم کپشن رو می‌گیرم…" if option.action == "caption" else "⬇️ دارم خروجی رو آماده می‌کنم…"
     selection_label = "کپشن پست" if option.action == "caption" else option.label
-    await edit_menu_via_query(
-        query,
+    await query.edit_message_text(
         status_card(
             selection_title,
             f"انتخابت: <b>{html_escape(selection_label)}</b>\nمنبع: <code>{html_escape(session.source_host)}</code>",
             "برای توقف: /cancel"
         ),
-        is_photo=session.is_photo,
+        parse_mode=ParseMode.HTML,
     )
 
     try:
+        if session.lease.worker.lease_id != session.lease.lease_id:
+            raise RuntimeError("Selection lease is no longer active")
         selection_progress = ProgressReporter(query.message, session.request_id)
         await selection_progress.update(10, selection_title, selection_label, force=True)
-        if session.provider_kind == "ytdlp":
-            if YTDLP_GATEWAY is None:
-                raise RuntimeError("yt-dlp gateway is not available")
-            result = await YTDLP_GATEWAY.select(
-                url=session.source_url,
-                platform=session.platform,
-                option=option,
-                attempt_directory=session.attempt_directory,
-                progress_callback=selection_progress.download,
-            )
-        elif session.provider_kind == "cobalt":
-            if COBALT_GATEWAY is None:
-                raise RuntimeError("Cobalt gateway is not available")
-            result = await COBALT_GATEWAY.select(
-                url=session.source_url,
-                platform=session.platform,
-                option=option,
-                attempt_directory=session.attempt_directory,
-                progress_callback=selection_progress.download,
-            )
-        else:
-            if session.lease is None:
-                raise RuntimeError("Selection lease is missing for telegram provider")
-            if session.lease.worker.lease_id != session.lease.lease_id:
-                raise RuntimeError("Selection lease is no longer active")
-            result = await GATEWAY.select(
-                client=session.lease.worker.client,
-                worker_name=session.lease.worker.name,
-                bot_username=session.bot_username,
-                request_message_id=session.request_message_id,
-                menu_message_id=session.menu_message_id,
-                option=option,
-                attempt_directory=session.attempt_directory,
-                progress_callback=selection_progress.download,
-            )
+        result = await GATEWAY.select(
+            client=session.lease.worker.client,
+            worker_name=session.lease.worker.name,
+            bot_username=session.bot_username,
+            request_message_id=session.request_message_id,
+            menu_message_id=session.menu_message_id,
+            option=option,
+            attempt_directory=session.attempt_directory,
+            progress_callback=selection_progress.download,
+        )
         if result.status == "text":
             chunks = [result.text[index:index + 3500] for index in range(0, len(result.text), 3500)] or [""]
             for index, chunk in enumerate(chunks):
@@ -3375,20 +3074,18 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     reply_to_message_id=session.reply_to,
                     disable_web_page_preview=True,
                 )
-            await edit_menu_via_query(
-                query,
+            await query.edit_message_text(
                 status_card(
                     "✅ کپشن ارسال شد",
                     f"تعداد بخش: <b>{len(chunks)}</b>",
                 ),
-                is_photo=session.is_photo,
+                parse_mode=ParseMode.HTML,
             )
             return
         if result.status != "ready":
-            await edit_menu_via_query(
-                query,
+            await query.edit_message_text(
                 failure_text([result.reason or "service_error"], session.request_id),
-                is_photo=session.is_photo,
+                parse_mode=ParseMode.HTML,
             )
             return
         await send_result_to_user(
@@ -3418,21 +3115,19 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
     except asyncio.CancelledError:
         with contextlib.suppress(TelegramError):
-            await edit_menu_via_query(
-                query,
-                status_card("⏹ درخواست متوقف شد", "دانلود کیفیت انتخابی لغو شد."),
-                is_photo=session.is_photo,
-            )
+            await query.edit_message_text(
+                status_card("⏹ درخواست متوقف شد", "دانلود کیفیت انتخابی لغو شد.",
+                parse_mode=ParseMode.HTML,
+            ))
     except Exception as exc:
         logger.exception("Selection %s failed: %s", session.request_id, exc)
         with contextlib.suppress(TelegramError):
-            await edit_menu_via_query(
-                query,
+            await query.edit_message_text(
                 status_card(
                     "❌ خطا در دانلود",
                     "هیچ فایل ناقصی ارسال نشد. لینک را دوباره امتحان کن.",
                 ),
-                is_photo=session.is_photo,
+                parse_mode=ParseMode.HTML,
             )
     finally:
         release_pending_selection(session)
@@ -3799,65 +3494,6 @@ async def post_init(application: Application) -> None:
         BotCommand("cancel", "توقف دانلودهای من"),
         BotCommand("dl", "دانلود لینک"),
     ]
-
-    # Cobalt startup probe: ping the cobalt API a few times. If it doesn't
-    # come up, disable the cobalt gateway so the routing layer falls back to
-    # the Telegram backup bots automatically. This makes the bot resilient to
-    # "All connection attempts failed" errors when cobalt isn't ready yet.
-    global COBALT_GATEWAY
-    if COBALT_GATEWAY is not None and SETTINGS.cobalt_api_url:
-        cobalt_ready = False
-        for attempt in range(1, 13):  # 12 attempts × 5s = 60s total
-            try:
-                probe = await asyncio.wait_for(
-                    _cobalt_client_probe(SETTINGS.cobalt_api_url),
-                    timeout=4.0,
-                )
-                if probe:
-                    cobalt_ready = True
-                    logger.info("Cobalt API ready (probe attempt %d)", attempt)
-                    break
-            except Exception as exc:
-                logger.debug("Cobalt probe attempt %d failed: %s", attempt, exc)
-            await asyncio.sleep(5.0)
-        if not cobalt_ready:
-            logger.error(
-                "Cobalt API at %s unreachable after 60s; disabling cobalt gateway. "
-                "YouTube/Instagram downloads will fall back to Telegram bots.",
-                SETTINGS.cobalt_api_url,
-            )
-            COBALT_GATEWAY = None
-
-    # yt-dlp / bgutil startup probe: ping the bgutil HTTP server. If it doesn't
-    # respond, we DON'T disable the yt-dlp gateway — yt-dlp can still work
-    # without PO tokens for some videos (and with cookies if provided). We just
-    # log a warning so the operator knows the PO Token path is degraded.
-    global YTDLP_GATEWAY
-    if YTDLP_GATEWAY is not None and SETTINGS.ytdlp_enabled:
-        try:
-            bgutil_ok = await asyncio.wait_for(
-                bgutil_health_check(SETTINGS.ytdlp_bgutil_base_url),
-                timeout=4.0,
-            )
-            if bgutil_ok:
-                logger.info(
-                    "bgutil PO Token server ready at %s",
-                    SETTINGS.ytdlp_bgutil_base_url,
-                )
-            else:
-                logger.warning(
-                    "bgutil PO Token server at %s did not respond. "
-                    "yt-dlp will work but YouTube bot-detection bypass is degraded. "
-                    "Start the server with: docker compose -f docker-compose.bgutil.yml up -d",
-                    SETTINGS.ytdlp_bgutil_base_url,
-                )
-        except Exception as exc:
-            logger.warning(
-                "bgutil PO Token server probe failed: %s. "
-                "yt-dlp will work but YouTube bot-detection bypass is degraded.",
-                exc,
-            )
-
     group_commands = [
         BotCommand("dl", "دانلود لینک یا پیام ریپلای‌شده"),
         BotCommand("search", "جست‌وجو در YouTube"),
