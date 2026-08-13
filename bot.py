@@ -69,7 +69,8 @@ from downloader import (
 from instagram_caption import InstagramCaptionError, fetch_instagram_caption
 from cobalt_client import CobaltClient, CobaltError
 from cobalt_gateway import COBALT_PROVIDER, CobaltGateway
-from routing import Platform, all_providers, detect_platform, is_cobalt_provider, is_instagram_reel, ordered_providers, platform_info, providers_for_platform, spotify_resource_type
+from ytdlp_gateway import YTDLP_PROVIDER, YtDlpGateway, bgutil_health_check
+from routing import Platform, all_providers, detect_platform, is_cobalt_provider, is_instagram_reel, is_ytdlp_provider, is_api_provider, ordered_providers, platform_info, providers_for_platform, spotify_resource_type
 from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
 from youtube_search import (
     MAX_RESULTS as YOUTUBE_SEARCH_MAX_RESULTS,
@@ -159,6 +160,30 @@ if SETTINGS.cobalt_api_url:
         "Cobalt gateway enabled (API_URL=%s, priority=%s)",
         SETTINGS.cobalt_api_url,
         SETTINGS.cobalt_priority,
+    )
+
+# yt-dlp + bgutil PO Token gateway (YouTube only). Only initialized when
+# YTDLP_ENABLED=true. When configured, YouTube downloads go to yt-dlp first;
+# Cobalt (if still configured) and Telegram bots are tried as fallbacks.
+YTDLP_GATEWAY: YtDlpGateway | None = None
+if SETTINGS.ytdlp_enabled:
+    YTDLP_GATEWAY = YtDlpGateway(
+        bgutil_base_url=SETTINGS.ytdlp_bgutil_base_url,
+        cookies_file=SETTINGS.ytdlp_cookies_file,
+        proxy_url=(
+            f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+            if SETTINGS.use_proxy
+            else None
+        ),
+        max_download_size=SETTINGS.max_download_size,
+        ffmpeg_path=os.environ.get("FFMPEG_PATH", "ffmpeg"),
+        player_clients=SETTINGS.ytdlp_player_clients,
+    )
+    logger.info(
+        "yt-dlp gateway enabled (bgutil=%s, cookies=%s, clients=%s)",
+        SETTINGS.ytdlp_bgutil_base_url,
+        SETTINGS.ytdlp_cookies_file.name if SETTINGS.ytdlp_cookies_file else None,
+        ",".join(SETTINGS.ytdlp_player_clients),
     )
 YOUTUBE_SEARCH = YouTubeSearchService(
     proxy_url=(
@@ -1602,6 +1627,10 @@ def failure_text(reasons: list[str], request_id: str) -> str:
         body = "از مسیر دانلود اصلی مشکلی پیش اومد؛ مسیرهای جایگزین هم نتیجه نداد."
     elif "cobalt_disabled" in reasons:
         body = "مسیر اصلی دانلود غیرفعاله و مسیرهای جایگزین هم جواب ندادند."
+    elif "ytdlp_error" in reasons:
+        body = "دانلود از یوتیوب ناموفق بود؛ مسیرهای جایگزین هم جواب ندادند."
+    elif "ytdlp_disabled" in reasons:
+        body = "مسیر yt-dlp غیرفعاله و مسیرهای جایگزین هم جواب ندادند."
     elif "ffmpeg_failed" in reasons:
         body = "پردازش ویدیو ناموفق بود (ffmpeg خطا داد)."
     elif "no_telegram_accounts" in reasons:
@@ -1631,7 +1660,7 @@ def release_pending_selection(session: PendingSelection) -> None:
         PENDING_SELECTIONS.pop(session.token, None)
     if session.caption_task is not None and not session.caption_task.done():
         session.caption_task.cancel()
-    # Cobalt sessions don't hold a Telethon lease — only release telegram ones.
+    # Cobalt and yt-dlp sessions don't hold a Telethon lease — only release telegram ones.
     if session.provider_kind == "telegram" and session.lease is not None:
         ACCOUNT_POOL.release(session.lease)
     cleanup_request_directory(session.attempt_directory, SETTINGS.download_root)
@@ -1722,14 +1751,14 @@ async def _process_url(
         STATS.failed += 1
         return
     info = platform_info(platform)
-    # Cobalt doesn't need a Telethon account; only telegram fallbacks do.
-    telegram_providers = tuple(p for p in providers if not is_cobalt_provider(p))
-    has_cobalt_provider = any(is_cobalt_provider(p) for p in providers)
+    # Cobalt and yt-dlp don't need a Telethon account; only telegram fallbacks do.
+    telegram_providers = tuple(p for p in providers if not is_api_provider(p))
+    has_api_provider = any(is_api_provider(p) for p in providers)
     needs_telegram_pool = bool(telegram_providers) and not is_spotify_collection
-    # If cobalt is first and the only pool entry is empty, we still let the
-    # request through — cobalt may succeed without needing a Telegram account.
-    # We only bail out upfront if cobalt is NOT in the picture at all.
-    if needs_telegram_pool and not has_cobalt_provider and ACCOUNT_POOL.total == 0:
+    # If an API gateway is first and the only pool entry is empty, we still let the
+    # request through — the gateway may succeed without needing a Telegram account.
+    # We only bail out upfront if no API provider is in the picture at all.
+    if needs_telegram_pool and not has_api_provider and ACCOUNT_POOL.total == 0:
         STATS.failed += 1
         await send_status(
             context,
@@ -1741,7 +1770,7 @@ async def _process_url(
             reply_to,
         )
         return
-    if needs_telegram_pool and not has_cobalt_provider and ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
+    if needs_telegram_pool and not has_api_provider and ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
         STATS.failed += 1
         await send_status(
             context,
@@ -1898,14 +1927,16 @@ async def _process_url(
                 attempt_directory = None
 
         # Lease is acquired lazily — only when we hit the first telegram provider.
-        # Cobalt requests don't need a Telethon account at all, so we don't
-        # pre-check the pool here. If cobalt succeeds we never touch the pool;
-        # if cobalt fails AND the pool is empty/unavailable, we just record
-        # the reason and exit the loop with an error result.
+        # Cobalt and yt-dlp requests don't need a Telethon account at all, so we
+        # don't pre-check the pool here. If an API gateway succeeds we never
+        # touch the pool; if it fails AND the pool is empty/unavailable, we just
+        # record the reason and exit the loop with an error result.
         lease: WorkerLease | None = None
         provider_kind = "telegram"
         for index, bot_username in enumerate(providers, start=1):
             is_cobalt = is_cobalt_provider(bot_username)
+            is_ytdlp = is_ytdlp_provider(bot_username)
+            is_api = is_cobalt or is_ytdlp
             phase = "مسیر اصلی" if index <= max(1, len(providers) - len(telegram_providers)) else "مسیر جایگزین"
             await progress.update(
                 10,
@@ -1918,7 +1949,20 @@ async def _process_url(
                 request_id,
                 f"{index}-{bot_username}",
             )
-            if is_cobalt:
+            if is_ytdlp:
+                if YTDLP_GATEWAY is None:
+                    reasons.append("ytdlp_disabled")
+                    cleanup_request_directory(attempt_directory, SETTINGS.download_root)
+                    attempt_directory = None
+                    continue
+                provider_kind = "ytdlp"
+                result = await YTDLP_GATEWAY.request(
+                    url=url,
+                    platform=platform,
+                    attempt_directory=attempt_directory,
+                    progress_callback=progress.download,
+                )
+            elif is_cobalt:
                 if COBALT_GATEWAY is None:
                     reasons.append("cobalt_disabled")
                     cleanup_request_directory(attempt_directory, SETTINGS.download_root)
@@ -3286,7 +3330,17 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         selection_progress = ProgressReporter(query.message, session.request_id)
         await selection_progress.update(10, selection_title, selection_label, force=True)
-        if session.provider_kind == "cobalt":
+        if session.provider_kind == "ytdlp":
+            if YTDLP_GATEWAY is None:
+                raise RuntimeError("yt-dlp gateway is not available")
+            result = await YTDLP_GATEWAY.select(
+                url=session.source_url,
+                platform=session.platform,
+                option=option,
+                attempt_directory=session.attempt_directory,
+                progress_callback=selection_progress.download,
+            )
+        elif session.provider_kind == "cobalt":
             if COBALT_GATEWAY is None:
                 raise RuntimeError("Cobalt gateway is not available")
             result = await COBALT_GATEWAY.select(
@@ -3773,6 +3827,36 @@ async def post_init(application: Application) -> None:
                 SETTINGS.cobalt_api_url,
             )
             COBALT_GATEWAY = None
+
+    # yt-dlp / bgutil startup probe: ping the bgutil HTTP server. If it doesn't
+    # respond, we DON'T disable the yt-dlp gateway — yt-dlp can still work
+    # without PO tokens for some videos (and with cookies if provided). We just
+    # log a warning so the operator knows the PO Token path is degraded.
+    global YTDLP_GATEWAY
+    if YTDLP_GATEWAY is not None and SETTINGS.ytdlp_enabled:
+        try:
+            bgutil_ok = await asyncio.wait_for(
+                bgutil_health_check(SETTINGS.ytdlp_bgutil_base_url),
+                timeout=4.0,
+            )
+            if bgutil_ok:
+                logger.info(
+                    "bgutil PO Token server ready at %s",
+                    SETTINGS.ytdlp_bgutil_base_url,
+                )
+            else:
+                logger.warning(
+                    "bgutil PO Token server at %s did not respond. "
+                    "yt-dlp will work but YouTube bot-detection bypass is degraded. "
+                    "Start the server with: docker compose -f docker-compose.bgutil.yml up -d",
+                    SETTINGS.ytdlp_bgutil_base_url,
+                )
+        except Exception as exc:
+            logger.warning(
+                "bgutil PO Token server probe failed: %s. "
+                "yt-dlp will work but YouTube bot-detection bypass is degraded.",
+                exc,
+            )
 
     group_commands = [
         BotCommand("dl", "دانلود لینک یا پیام ریپلای‌شده"),

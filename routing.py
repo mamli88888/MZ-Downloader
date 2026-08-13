@@ -93,26 +93,37 @@ def ordered_providers(
 ) -> tuple[str, ...]:
     """Build the ordered list of providers to try for a given platform.
 
-    Cobalt (the COBALT_PROVIDER sentinel from cobalt_gateway) is prepended for
-    YouTube and Instagram when COBALT_API_URL is configured and COBALT_PRIORITY
-    is enabled. The backup Telegram bots are always appended afterwards so the
-    bot still works if cobalt is down or returns an error.
+    Provider priority for YouTube:
+        1. YTDLP_PROVIDER (yt-dlp + bgutil PO Token) — always first when
+           YTDLP_ENABLED is true. This is the bot-detection-proof path.
+        2. COBALT_PROVIDER (self-hosted cobalt) — when COBALT_API_URL is set
+           and COBALT_PRIORITY is true (kept as a fallback / for Instagram).
+        3. Telegram backup bots (always appended last).
 
-    For non-YouTube/Instagram platforms, cobalt is never inserted.
+    For Instagram: only Cobalt + Telegram bots (yt-dlp path is YouTube-only).
+
+    For non-YouTube/Instagram platforms, neither yt-dlp nor cobalt is inserted.
     """
     from cobalt_gateway import COBALT_PROVIDER
+    from ytdlp_gateway import YTDLP_PROVIDER
 
     normal = providers_for_platform(platform, settings)
     fallback = all_providers(settings)
 
+    head: list[str] = []
+    # yt-dlp goes first for YouTube when enabled
+    if platform == Platform.YOUTUBE and getattr(settings, "ytdlp_enabled", False):
+        head.append(YTDLP_PROVIDER)
+    # Cobalt still goes next (for YouTube as a fallback, primary for Instagram)
     cobalt_first = (
         settings.cobalt_api_url
         and settings.cobalt_priority
         and platform in {Platform.YOUTUBE, Platform.INSTAGRAM}
     )
     if cobalt_first:
-        return tuple(dict.fromkeys((COBALT_PROVIDER, *normal, *fallback)))
-    return tuple(dict.fromkeys((*normal, *fallback)))
+        head.append(COBALT_PROVIDER)
+
+    return tuple(dict.fromkeys((*head, *normal, *fallback)))
 
 
 def is_cobalt_provider(bot_username: str) -> bool:
@@ -120,6 +131,20 @@ def is_cobalt_provider(bot_username: str) -> bool:
     from cobalt_gateway import COBALT_PROVIDER
 
     return bot_username == COBALT_PROVIDER
+
+
+def is_ytdlp_provider(bot_username: str) -> bool:
+    """True if the given provider name is the yt-dlp sentinel."""
+    from ytdlp_gateway import YTDLP_PROVIDER
+
+    return bot_username == YTDLP_PROVIDER
+
+
+def is_api_provider(bot_username: str) -> bool:
+    """True if the given provider is an API gateway (cobalt or yt-dlp),
+    i.e. not a Telegram bot — so it doesn't need a Telethon lease.
+    """
+    return is_cobalt_provider(bot_username) or is_ytdlp_provider(bot_username)
 
 
 def spotify_resource_type(url: str) -> str | None:

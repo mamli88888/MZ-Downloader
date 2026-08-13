@@ -1,4 +1,4 @@
-# docker-compose.yml — MZ-Downloader + Cobalt in a single container.
+# docker-compose.yml — MZ-Downloader + Cobalt + bgutil PO Token server.
 #
 # The Dockerfile clones cobalt from GitHub at build time, so you don't need
 # to keep the cobalt source tree around. Just clone this repo and run:
@@ -11,6 +11,10 @@
 # To update cobalt to the latest version, rebuild the image:
 #   docker compose build --no-cache
 #   docker compose up -d
+#
+# To update bgutil PO Token server (recommended weekly):
+#   docker compose pull bgutil-pot-provider
+#   docker compose up -d bgutil-pot-provider
 
 services:
   mz-downloader:
@@ -28,6 +32,8 @@ services:
       # Override the inter-process cobalt URL — inside the container, cobalt
       # listens on 127.0.0.1:9000 (set by start.sh). The bot uses this URL.
       COBALT_API_URL: http://127.0.0.1:9000/
+      # yt-dlp talks to the bgutil container over the docker network.
+      YTDLP_BGUTIL_BASE_URL: http://bgutil-pot-provider:4416
       FFMPEG_PATH: /usr/bin/ffmpeg
     volumes:
       # Persist downloaded files across restarts (optional).
@@ -35,11 +41,50 @@ services:
       # Optional: mount a cookies.json for cobalt to access age-restricted or
       # member-only YouTube/Instagram content. See cobalt docs for the format.
       # - ./cookies.json:/cookies.json:ro
+      # Mount cookies.txt for yt-dlp (age-restricted videos + extra bot
+      # detection bypass). Place a cookies.txt next to docker-compose.yml.
+      - ./cookies.txt:/app/cookies.txt:ro
     # Cobalt's API port is only exposed if you want to use it from outside
     # the container (e.g. for debugging). Don't expose it publicly without
     # setting up COBALT_API_KEY or TURNSTILE protection first.
     ports:
       - "127.0.0.1:9000:9000"  # cobalt API (localhost-only)
+    depends_on:
+      bgutil-pot-provider:
+        condition: service_healthy
+
+  # bgutil PO Token server — generates Proof-of-Origin tokens so yt-dlp can
+  # download YouTube videos without the "Sign in to confirm you are not a bot"
+  # challenge. Auto-updated daily by the watchtower sidecar.
+  bgutil-pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: mz-bgutil-pot-provider
+    init: true
+    restart: unless-stopped
+    environment:
+      TOKEN_TTL: "6"
+      # If the bot is running inside Iran (or any restricted network),
+      # uncomment to make bgutil reach YouTube through a foreign proxy.
+      # HTTP_PROXY: "http://user:pass@your-foreign-proxy:3128"
+      # HTTPS_PROXY: "http://user:pass@your-foreign-proxy:3128"
+    labels:
+      - com.centurylinklabs.watchtower.scope=bgutil
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:4416/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # Watchtower auto-pulls a new bgutil image once per day and restarts the
+  # container. Disable by removing this service if you'd rather update manually.
+  watchtower:
+    image: ghcr.io/containrrr/watchtower
+    container_name: mz-watchtower
+    restart: unless-stopped
+    command: --cleanup --scope bgutil --interval 86400 --include-restarting
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   mz-downloads:
