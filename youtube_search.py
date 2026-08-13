@@ -731,3 +731,114 @@ def render_collage(thumbnails: Sequence[bytes | None], first_number: int) -> byt
     output = io.BytesIO()
     canvas.save(output, format="JPEG", quality=88, optimize=True, progressive=True)
     return output.getvalue()
+
+
+# ----------------------------------------------------------------------
+# Single-video metadata + thumbnail helpers (used by the cobalt YouTube
+# menu to show the video thumbnail as the message image, with title /
+# channel / duration as the caption below it).
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class YouTubeVideoInfo:
+    """Lightweight metadata about a single YouTube video.
+
+    All fields are best-effort: yt-dlp may fail (YouTube bot detection,
+    private video, network issue). When that happens `fetch_video_info`
+    returns None and the caller falls back to the text-only menu.
+    """
+
+    title: str
+    channel: str
+    duration: int  # seconds; 0 if unknown
+    thumbnail_url: str
+
+
+def fetch_video_info(url: str, *, timeout: float = 15.0) -> YouTubeVideoInfo | None:
+    """Fetch video metadata via yt-dlp (no download).
+
+    Synchronous because yt-dlp is sync. Call via `asyncio.to_thread`.
+    Best-effort: returns None on any failure (yt-dlp DownloadError,
+    network timeout, missing fields).
+    """
+    try:
+        opts = {
+            "quiet": True,
+            "skip_download": True,
+            "no_warnings": True,
+            "socket_timeout": int(timeout),
+            "extract_flat": False,
+            "nocheckcertificate": True,
+        }
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not isinstance(info, dict):
+            return None
+        title = str(info.get("title") or "").strip()
+        channel = str(
+            info.get("uploader") or info.get("channel") or info.get("channel_id") or ""
+        ).strip()
+        try:
+            duration = int(info.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0
+        thumb_url = ""
+        best_area = -1
+        for t in info.get("thumbnails") or []:
+            w = int(t.get("width") or 0)
+            h = int(t.get("height") or 0)
+            area = w * h
+            if area > best_area and t.get("url"):
+                best_area = area
+                thumb_url = str(t["url"])
+        if not thumb_url:
+            thumb_url = str(info.get("thumbnail") or "")
+        if not title and not thumb_url:
+            return None
+        return YouTubeVideoInfo(
+            title=title,
+            channel=channel,
+            duration=duration,
+            thumbnail_url=thumb_url,
+        )
+    except DownloadError:
+        return None
+    except Exception:
+        logger.exception("fetch_video_info crashed for %s", url)
+        return None
+
+
+async def download_thumbnail_bytes(thumbnail_url: str, *, timeout: float = 10.0) -> bytes | None:
+    """Download thumbnail bytes via httpx. Best-effort, never raises."""
+    if not thumbnail_url:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(
+                thumbnail_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            response.raise_for_status()
+            data = response.content
+            if not data or len(data) > MAX_THUMBNAIL_BYTES:
+                return None
+            return data
+    except Exception:
+        logger.debug("download_thumbnail_bytes failed for %s", thumbnail_url, exc_info=True)
+        return None
+
+
+def format_duration(seconds: int) -> str:
+    """Format seconds as `M:SS` or `H:MM:SS`. Handles 0 and negative inputs."""
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        seconds = 0
+    if seconds < 0:
+        seconds = 0
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"

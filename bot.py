@@ -221,6 +221,10 @@ class PendingSelection:
     # "telegram" (backup downloader bots) or "cobalt" (self-hosted cobalt API).
     # When "cobalt", `lease`, `request_message_id`, `menu_message_id` are unused.
     provider_kind: str = "telegram"
+    # True when the menu/status message is a Telegram photo message (with
+    # caption + inline keyboard). Callback handlers must use edit_message_caption
+    # instead of edit_message_text for these messages.
+    is_photo: bool = False
 
 
 @dataclass
@@ -445,7 +449,7 @@ class ProgressReporter:
         if not force and now - self.last_edit < 1.0 and value < 100:
             return
         async with self.lock:
-            await edit_status(
+            await edit_status_photo_aware(
                 self.message,
                 status_card(title, f"{progress_bar(value)}\n{html_escape(detail)}"
             ))
@@ -824,6 +828,89 @@ async def send_status(
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+
+
+async def _cobalt_client_probe(api_url: str) -> bool:
+    """Quick connectivity probe for the cobalt API. Returns True if cobalt
+    responds with HTTP 200 on its `/` endpoint. Used by `post_init` to decide
+    whether to keep the cobalt gateway enabled at startup.
+    """
+    import httpx as _httpx
+
+    async with _httpx.AsyncClient(timeout=3.0, follow_redirects=True) as client:
+        response = await client.get(api_url)
+        return response.status_code == 200
+
+
+def _message_is_photo(message: Any) -> bool:
+    """True if `message` is a Telegram photo message (has PhotoSize list)."""
+    return bool(getattr(message, "photo", None))
+
+
+async def edit_status_photo_aware(
+    message: Any,
+    text: str,
+    reply_markup: Any = None,
+    *,
+    is_photo: bool = False,
+) -> None:
+    """Photo-aware version of `edit_status`. When `is_photo` is True (or auto-
+    detected via `message.photo`), edits the message caption instead of the
+    message text — because Telegram forbids changing a photo message's text
+    via `edit_message_text`.
+    """
+    if not is_photo:
+        is_photo = _message_is_photo(message)
+    if is_photo:
+        try:
+            await message.edit_caption(
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+        except TelegramError as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.debug("Status caption edit failed: %s", exc)
+    else:
+        await edit_status(message, text, reply_markup)
+
+
+async def edit_menu_via_query(
+    query: Any,
+    text: str,
+    reply_markup: Any = None,
+    *,
+    is_photo: bool = False,
+) -> None:
+    """Photo-aware version of `query.edit_message_text`. When `is_photo` is
+    True, edits the menu message's caption (for photo menus); otherwise edits
+    the text. Used by callback handlers so they work for both the legacy text
+    menu and the new YouTube thumbnail+caption menu.
+    """
+    if not is_photo:
+        is_photo = _message_is_photo(query.message)
+    if is_photo:
+        try:
+            await query.edit_message_caption(
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+        except TelegramError as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.debug("Menu caption edit failed: %s", exc)
+    else:
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+        except TelegramError as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.debug("Menu text edit failed: %s", exc)
+
 
 
 async def send_link_feedback(
@@ -1313,7 +1400,7 @@ async def send_result_to_user(
     if progress is not None:
         await progress.begin_upload(total_size)
     else:
-        await edit_status(
+        await edit_status_photo_aware(
             status_message,
             status_card(
                 "📤 آماده شد؛ دارم برات می‌فرستم…",
@@ -1477,7 +1564,7 @@ async def send_result_to_user(
         )
     else:
         quality_line = f"\nکیفیت: <b>{html_escape(quality)}</b>" if quality else ""
-        await edit_status(
+        await edit_status_photo_aware(
             status_message,
             status_card(
                 "✅ تموم شد؛ نوش جونت!",
@@ -1574,13 +1661,22 @@ async def expire_stale_selections(application: Application) -> None:
     ]
     for session in stale:
         release_pending_selection(session)
+        expired_text = status_card("⌛ زمان انتخاب تمام شد", "لینک را دوباره بفرست تا گزینه‌های تازه دریافت شوند.")
         with contextlib.suppress(TelegramError):
-            await application.bot.edit_message_text(
-                chat_id=session.chat_id,
-                message_id=session.status_message_id,
-                text=status_card("⌛ زمان انتخاب تمام شد", "لینک را دوباره بفرست تا گزینه‌های تازه دریافت شوند."),
-                parse_mode=ParseMode.HTML,
-            )
+            if session.is_photo:
+                await application.bot.edit_message_caption(
+                    chat_id=session.chat_id,
+                    message_id=session.status_message_id,
+                    caption=expired_text,
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await application.bot.edit_message_text(
+                    chat_id=session.chat_id,
+                    message_id=session.status_message_id,
+                    text=expired_text,
+                    parse_mode=ParseMode.HTML,
+                )
 
 
 async def selection_reaper(application: Application) -> None:
@@ -2011,7 +2107,7 @@ async def _process_url(
                                 )
                             ]
                         )
-                elif not any(option.action == "caption" for option in displayed_options) and result.text:
+                elif not any(option.action == "caption" for option in displayed_options) and result.text and result.preview is None:
                     rows.append(
                         [InlineKeyboardButton("📝 متن/اطلاعات پست", callback_data=f"info:{token}")]
                     )
@@ -2021,18 +2117,35 @@ async def _process_url(
                     f"منبع: <code>{html_escape(host)}</code>\nکیفیت، صدا یا کپشن رو انتخاب کن.",
                     f"تا {int(SETTINGS.selection_ttl // 60)} دقیقه وقت داری"
                 )
+                # When cobalt provided a YouTube thumbnail + caption (video
+                # title / channel / duration), send ONE photo message with the
+                # caption (menu header + video info) + inline keyboard. This
+                # replaces the legacy flow of "send photo, delete status,
+                # send new text status, edit it with buttons" — everything is
+                # now a single Telegram photo message with caption + buttons.
+                menu_is_photo = False
                 if result.preview is not None:
                     try:
+                        # Build combined caption: menu header on top, video
+                        # info below. The bot's status_card helper produces a
+                        # neat boxed header; the cobalt gateway's text field
+                        # holds the per-video detail block.
+                        photo_caption = menu_text
+                        if result.text:
+                            photo_caption = photo_caption + "\n" + result.text
                         with result.preview.path.open("rb") as preview_handle:
-                            await context.bot.send_photo(
+                            new_photo_message = await context.bot.send_photo(
                                 chat_id=chat_id,
                                 photo=preview_handle,
-                                caption=f"🖼 پیش‌نمایش ویدیو • {host}",
+                                caption=photo_caption,
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=InlineKeyboardMarkup(rows),
                                 reply_to_message_id=reply_to,
                             )
                         with contextlib.suppress(TelegramError):
                             await status_message.delete()
-                        status_message = await send_status(context, chat_id, menu_text, None)
+                        status_message = new_photo_message
+                        menu_is_photo = True
                     except TelegramError as exc:
                         logger.warning("Thumbnail send failed for %s: %s", request_id, exc)
                 session = PendingSelection(
@@ -2055,10 +2168,12 @@ async def _process_url(
                     fallback_text=result.text if platform != Platform.INSTAGRAM else "",
                     caption_task=caption_task,
                     provider_kind=provider_kind,
+                    is_photo=menu_is_photo,
                 )
                 caption_task = None
                 PENDING_SELECTIONS[token] = session
-                await edit_status(status_message, menu_text, InlineKeyboardMarkup(rows))
+                if not menu_is_photo:
+                    await edit_status(status_message, menu_text, InlineKeyboardMarkup(rows))
                 if appended_size_note:
                     with contextlib.suppress(TelegramError):
                         await context.bot.send_message(
@@ -2948,13 +3063,22 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session.processing_task.cancel()
         else:
             release_pending_selection(session)
+            cancel_text = status_card("⏹ درخواست متوقف شد", "انتخاب کیفیت لغو شد.")
             with contextlib.suppress(TelegramError):
-                await context.bot.edit_message_text(
-                    chat_id=session.chat_id,
-                    message_id=session.status_message_id,
-                    text=status_card("⏹ درخواست متوقف شد", "انتخاب کیفیت لغو شد."),
-                    parse_mode=ParseMode.HTML,
-                )
+                if session.is_photo:
+                    await context.bot.edit_message_caption(
+                        chat_id=session.chat_id,
+                        message_id=session.status_message_id,
+                        caption=cancel_text,
+                        parse_mode=ParseMode.HTML,
+                    )
+                else:
+                    await context.bot.edit_message_text(
+                        chat_id=session.chat_id,
+                        message_id=session.status_message_id,
+                        text=cancel_text,
+                        parse_mode=ParseMode.HTML,
+                    )
     for task in tasks:
         task.cancel()
     await asyncio.sleep(0)
@@ -3079,7 +3203,7 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             if not session.options:
                 release_pending_selection(session)
-                await query.edit_message_text(unavailable, parse_mode=ParseMode.HTML)
+                await edit_menu_via_query(query, unavailable, is_photo=session.is_photo)
             else:
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
@@ -3097,9 +3221,10 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         if not session.options:
             release_pending_selection(session)
-            await query.edit_message_text(
+            await edit_menu_via_query(
+                query,
                 status_card("✅ کپشن رو فرستادم", "همون متن اصلی پست آماده‌ست."),
-                parse_mode=ParseMode.HTML,
+                is_photo=session.is_photo,
             )
         return
 
@@ -3126,9 +3251,10 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         await query.answer("درخواست لغو شد")
         release_pending_selection(session)
-        await query.edit_message_text(
+        await edit_menu_via_query(
+            query,
             status_card("⏹ درخواست متوقف شد", "انتخاب کیفیت لغو شد."),
-            parse_mode=ParseMode.HTML,
+            is_photo=session.is_photo,
         )
         return
 
@@ -3147,13 +3273,14 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await query.answer("باشه، شروع کردم 🚀")
     selection_title = "📝 دارم کپشن رو می‌گیرم…" if option.action == "caption" else "⬇️ دارم خروجی رو آماده می‌کنم…"
     selection_label = "کپشن پست" if option.action == "caption" else option.label
-    await query.edit_message_text(
+    await edit_menu_via_query(
+        query,
         status_card(
             selection_title,
             f"انتخابت: <b>{html_escape(selection_label)}</b>\nمنبع: <code>{html_escape(session.source_host)}</code>",
             "برای توقف: /cancel"
         ),
-        parse_mode=ParseMode.HTML,
+        is_photo=session.is_photo,
     )
 
     try:
@@ -3194,18 +3321,20 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     reply_to_message_id=session.reply_to,
                     disable_web_page_preview=True,
                 )
-            await query.edit_message_text(
+            await edit_menu_via_query(
+                query,
                 status_card(
                     "✅ کپشن ارسال شد",
                     f"تعداد بخش: <b>{len(chunks)}</b>",
                 ),
-                parse_mode=ParseMode.HTML,
+                is_photo=session.is_photo,
             )
             return
         if result.status != "ready":
-            await query.edit_message_text(
+            await edit_menu_via_query(
+                query,
                 failure_text([result.reason or "service_error"], session.request_id),
-                parse_mode=ParseMode.HTML,
+                is_photo=session.is_photo,
             )
             return
         await send_result_to_user(
@@ -3235,19 +3364,21 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
     except asyncio.CancelledError:
         with contextlib.suppress(TelegramError):
-            await query.edit_message_text(
-                status_card("⏹ درخواست متوقف شد", "دانلود کیفیت انتخابی لغو شد.",
-                parse_mode=ParseMode.HTML,
-            ))
+            await edit_menu_via_query(
+                query,
+                status_card("⏹ درخواست متوقف شد", "دانلود کیفیت انتخابی لغو شد."),
+                is_photo=session.is_photo,
+            )
     except Exception as exc:
         logger.exception("Selection %s failed: %s", session.request_id, exc)
         with contextlib.suppress(TelegramError):
-            await query.edit_message_text(
+            await edit_menu_via_query(
+                query,
                 status_card(
                     "❌ خطا در دانلود",
                     "هیچ فایل ناقصی ارسال نشد. لینک را دوباره امتحان کن.",
                 ),
-                parse_mode=ParseMode.HTML,
+                is_photo=session.is_photo,
             )
     finally:
         release_pending_selection(session)
@@ -3614,6 +3745,35 @@ async def post_init(application: Application) -> None:
         BotCommand("cancel", "توقف دانلودهای من"),
         BotCommand("dl", "دانلود لینک"),
     ]
+
+    # Cobalt startup probe: ping the cobalt API a few times. If it doesn't
+    # come up, disable the cobalt gateway so the routing layer falls back to
+    # the Telegram backup bots automatically. This makes the bot resilient to
+    # "All connection attempts failed" errors when cobalt isn't ready yet.
+    global COBALT_GATEWAY
+    if COBALT_GATEWAY is not None and SETTINGS.cobalt_api_url:
+        cobalt_ready = False
+        for attempt in range(1, 13):  # 12 attempts × 5s = 60s total
+            try:
+                probe = await asyncio.wait_for(
+                    _cobalt_client_probe(SETTINGS.cobalt_api_url),
+                    timeout=4.0,
+                )
+                if probe:
+                    cobalt_ready = True
+                    logger.info("Cobalt API ready (probe attempt %d)", attempt)
+                    break
+            except Exception as exc:
+                logger.debug("Cobalt probe attempt %d failed: %s", attempt, exc)
+            await asyncio.sleep(5.0)
+        if not cobalt_ready:
+            logger.error(
+                "Cobalt API at %s unreachable after 60s; disabling cobalt gateway. "
+                "YouTube/Instagram downloads will fall back to Telegram bots.",
+                SETTINGS.cobalt_api_url,
+            )
+            COBALT_GATEWAY = None
+
     group_commands = [
         BotCommand("dl", "دانلود لینک یا پیام ریپلای‌شده"),
         BotCommand("search", "جست‌وجو در YouTube"),

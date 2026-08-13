@@ -35,9 +35,23 @@ cd /opt/cobalt/api
 node src/cobalt.js &
 COBALT_PID=$!
 
-# Give cobalt a moment to bind its port before we start the bot, so the bot's
-# initial COBALT_GATEWAY health probe doesn't fail.
-sleep 3
+# Poll cobalt's / endpoint for up to 60s before starting the bot, so the bot's
+# initial COBALT_GATEWAY health probe doesn't fail and trigger a fallback to
+# the Telegram bots. If cobalt doesn't come up in 60s we proceed anyway —
+# the bot's own startup probe will disable cobalt gracefully.
+echo "[start] Waiting for cobalt API to be ready (up to 60s)..."
+COBALT_READY=0
+for i in $(seq 1 60); do
+    if curl -sf --max-time 1 "http://${API_LISTEN_ADDRESS}:${API_PORT}/" >/dev/null 2>&1; then
+        echo "[start] Cobalt API ready after ${i}s"
+        COBALT_READY=1
+        break
+    fi
+    sleep 1
+done
+if [ "$COBALT_READY" -ne 1 ]; then
+    echo "[start] WARNING: cobalt API not ready after 60s, starting bot anyway (cobalt will be auto-disabled by bot's startup probe)"
+fi
 
 # Trap SIGTERM/SIGINT and forward to both children.
 trap 'echo "[start] Shutting down..."; kill -TERM $COBALT_PID 2>/dev/null || true; kill -TERM $BOT_PID 2>/dev/null || true; wait' TERM INT

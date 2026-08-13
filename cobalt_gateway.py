@@ -18,6 +18,7 @@ unchanged.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import re
@@ -38,6 +39,12 @@ from downloader import (
     QualityOption,
 )
 from routing import Platform
+from youtube_search import (
+    YouTubeVideoInfo,
+    download_thumbnail_bytes,
+    fetch_video_info,
+    format_duration,
+)
 
 logger = logging.getLogger("MZDownloader.cobalt_gateway")
 
@@ -275,12 +282,87 @@ class CobaltGateway:
                         action="media",
                     )
                 )
+        return await self._attach_youtube_menu_assets(
+            url=url,
+            attempt_directory=attempt_directory,
+            options=tuple(options),
+        )
+
+    async def _attach_youtube_menu_assets(
+        self,
+        *,
+        url: str,
+        attempt_directory: Path,
+        options: tuple[QualityOption, ...],
+    ) -> GatewayResult:
+        """Enrich the YouTube quality menu with the video thumbnail + a caption
+        containing the title / channel / duration.
+
+        Best-effort: if yt-dlp can't fetch the video metadata (e.g. YouTube
+        bot detection, private video, network error) we fall back to the
+        legacy text-only menu with `text=""` and `preview=None`. The bot
+        handles both cases — it just sends a text status message when no
+        thumbnail is available, or a photo+caption+buttons message when
+        one is.
+        """
+        info: YouTubeVideoInfo | None = None
+        try:
+            info = await asyncio.to_thread(fetch_video_info, url)
+        except Exception:
+            logger.exception("fetch_video_info wrapper crashed for %s", url)
+            info = None
+
+        thumb_bytes: bytes | None = None
+        if info is not None and info.thumbnail_url:
+            thumb_bytes = await download_thumbnail_bytes(info.thumbnail_url)
+
+        caption = self._build_youtube_caption(info) if info is not None else ""
+
+        preview: DownloadedMedia | None = None
+        if thumb_bytes:
+            # Persist the thumbnail into the attempt directory so the bot can
+            # open it when constructing the photo message.
+            thumb_path = attempt_directory / "_yt_thumb.jpg"
+            try:
+                thumb_path.write_bytes(thumb_bytes)
+                preview = DownloadedMedia(
+                    path=thumb_path,
+                    kind=MediaKind.PHOTO,
+                    source_message_id=0,
+                    mime_type="image/jpeg",
+                    size=thumb_path.stat().st_size,
+                )
+            except OSError as exc:
+                logger.warning("Failed to persist YouTube thumbnail: %s", exc)
+                preview = None
+
         return GatewayResult(
             status="needs_selection",
             bot_username=COBALT_PROVIDER,
-            options=tuple(options),
-            text="",
+            options=options,
+            text=caption,
+            preview=preview,
         )
+
+    @staticmethod
+    def _build_youtube_caption(info: YouTubeVideoInfo) -> str:
+        """Compose the caption shown below the YouTube menu thumbnail.
+
+        The bot prepends its own `status_card(...)` header to the menu; this
+        function only produces the per-video detail block (title / channel /
+        duration). The bot will concatenate the two when sending the photo.
+        """
+        lines: list[str] = []
+        if info.title:
+            lines.append(f"<b>{html.escape(info.title)}</b>")
+        meta_parts: list[str] = []
+        if info.channel:
+            meta_parts.append(f"📺 {html.escape(info.channel)}")
+        if info.duration > 0:
+            meta_parts.append(f"⏱ {format_duration(info.duration)}")
+        if meta_parts:
+            lines.append(" • ".join(meta_parts))
+        return "\n".join(lines)
 
     async def _select_youtube(
         self,
