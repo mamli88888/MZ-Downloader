@@ -33,7 +33,7 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-ARG BGUTIL_REF=main
+ARG BGUTIL_REF=master
 RUN git clone --depth=1 --branch="${BGUTIL_REF}" https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /build/bgutil
 
 WORKDIR /build/bgutil/server
@@ -88,15 +88,16 @@ COPY --from=bgutil-builder --chown=appuser:appuser /build/bgutil/server/ /opt/bg
 RUN chmod +x /app/start.sh
 
 # Default cobalt + bgutil env (can be overridden at runtime via -e flags).
+# Note: BGUTIL_TOKEN_TTL and BGUTIL_PORT are intentionally NOT set here to
+# avoid Railway's SecretsUsedInArgOrEnv lint warning — start.sh applies
+# safe defaults at runtime.
 ENV COBALT_API_URL=http://127.0.0.1:9000/ \
     API_URL=http://127.0.0.1:9000/ \
     API_PORT=9000 \
     API_LISTEN_ADDRESS=127.0.0.1 \
     FFMPEG_PATH=/usr/bin/ffmpeg \
     YTDLP_ENABLED=true \
-    YTDLP_BGUTIL_BASE_URL=http://127.0.0.1:4416 \
-    BGUTIL_PORT=4416 \
-    BGUTIL_TOKEN_TTL=6
+    YTDLP_BGUTIL_BASE_URL=http://127.0.0.1:4416
 
 USER appuser
 
