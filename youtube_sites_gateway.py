@@ -1,5 +1,6 @@
-"""YouTubeSitesGateway — YouTube downloader that scrapes the loader.to /
-loaderr.to / y2mate.yt family of public YouTube-converter sites.
+"""YouTubeSitesGateway — multi-platform downloader that scrapes the
+loader.to / loaderr.to / y2mate.yt / downcloud.cc / downtik.to / igdown.io
+family of public converter sites.
 
 Why this exists
 ---------------
@@ -7,14 +8,30 @@ yt-dlp + bgutil kept getting blocked by YouTube's "Sign in to confirm
 you're not a bot" challenge for many videos, even with PO tokens. The
 loader.to / loaderr.to / y2mate.yt family of sites is a popular public
 frontend to a shared backend (savenow.to / lbserver.xyz) that performs
-the YouTube extraction server-side and exposes a small AJAX API.
+the extraction server-side and exposes a small AJAX API.
+
+Platform support
+-----------------
+During development we discovered that the SAME backend (savenow.to /
+lbserver.xyz) also handles SoundCloud, TikTok, and Instagram URLs —
+the downcloud.cc / downtik.to / igdown.io frontends are just branded
+skins over the exact same `/api/v2/download` endpoint, with different
+format strings per platform:
+
+    YouTube:     360, 480, 720, 1080, 1440, 4k, mp3
+    SoundCloud:  mp3, m4a, wav, flac, 720 (audio-focused)
+    TikTok:      360, 720, 1080, mp3
+    Instagram:   360, 720, 1080, mp3
+
+So we don't need separate scrapers per frontend — one unified gateway
+that picks the right format string per platform covers all six sites.
 
 Discovery
 ---------
-All three frontends share the SAME backend:
+All frontends share the SAME backend:
 
     GET https://<frontend-domain>/api/v2/download
-        ?format=<format>&url=<youtube-url>&apikey=<shared-key>
+        ?format=<format>&url=<url>&apikey=<shared-key>
 
     →  { "success": true,
          "id": "v2_stream_<id>",
@@ -38,19 +55,21 @@ Shared API key (extracted from each frontend's main.js):
 
 Rotation strategy
 -----------------
-The three frontend families (loader.to, loaderr.to, y2mate.yt) and their
+The frontend families (loader.to, loaderr.to, y2mate.yt) and their
 language subdomains all hit the same backend, but each frontend has its
 own Cloudflare rate-limit / availability window. We build a rotation list
-that interleaves the three families and tries each in turn until one
-returns a usable `download_url`. If a site's API returns 4xx/5xx or the
-progress poll times out, we move to the next site.
+that interleaves the families and tries each in turn until one returns a
+usable `download_url`. If a site's API returns 4xx/5xx or the progress
+poll times out, we move to the next site.
 
 Quality menu
 ------------
 We mirror the previous CobaltGateway / YtDlpGateway contract so the bot's
-UI stays the same:
-  - 360p / 480p / 720p / 1080p / 1440p / 2160p (video+audio muxed)
-  - MP3 128 / 256 / 320 kbps (audio only)
+UI stays the same. Per platform:
+  - YouTube:   360p / 480p / 720p / 1080p / 1440p / 2160p + MP3 128/256/320
+  - TikTok:    360p / 720p / 1080p + MP3
+  - Instagram: 360p / 720p / 1080p + MP3
+  - SoundCloud: MP3 / M4A / WAV / FLAC (audio only)
 
 Selection fingerprints encode the chosen mode/format/quality as a JSON
 blob prefixed with `ysites:` so the rest of the bot code keeps working
@@ -76,7 +95,7 @@ import shutil
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 
@@ -97,6 +116,15 @@ logger = logging.getLogger("MZDownloader.youtube_sites")
 # Sentinel "provider" name — the bot's routing layer treats this like a
 # Telegram bot username but the sites-aware branches key off it.
 YSITES_PROVIDER = "ysites"
+
+
+# A "processing" callback is invoked during the server-side extraction
+# phase (before the CDN download URL is ready). It takes (percent, title,
+# detail) so the caller can render a percent bar WITHOUT byte counts —
+# reporting byte counts during this phase is what caused the previous
+# progress-bar bug (the bar would jump backwards when the actual file
+# download started after polling finished).
+ProcessingCallback = Callable[[int, str, str], Awaitable[None]]
 
 
 # Shared API key published in every frontend's main.js bundle. It is not
@@ -149,9 +177,13 @@ BACKEND_API_SERVERS: tuple[str, ...] = (
 )
 
 
-# Quality menu offered to the user. Each row is:
+# Quality menus offered to the user (per platform). Each row is:
 #   (label, video_height_or_None, mode, audio_bitrate_or_None, api_format)
-# `api_format` is what we pass to the loader.to API as `?format=`.
+# `api_format` is what we pass to the API as `?format=`.
+#
+# These format strings were verified by hitting
+#   https://p.savenow.to/api/v2/download?format=<fmt>&url=<url>&apikey=<key>
+# for each platform — only the formats listed here return success=true.
 YOUTUBE_QUALITIES: tuple[tuple[str, int | None, str, str | None, str], ...] = (
     ("360p",        360,  "video", None,  "360"),
     ("480p",        480,  "video", None,  "480"),
@@ -163,6 +195,37 @@ YOUTUBE_QUALITIES: tuple[tuple[str, int | None, str, str | None, str], ...] = (
     ("MP3 256kbps", None, "audio", "256", "mp3"),
     ("MP3 320kbps", None, "audio", "320", "mp3"),
 )
+
+TIKTOK_QUALITIES: tuple[tuple[str, int | None, str, str | None, str], ...] = (
+    ("360p",        360,  "video", None,  "360"),
+    ("720p",        720,  "video", None,  "720"),
+    ("1080p",      1080,  "video", None,  "1080"),
+    ("MP3 128kbps", None, "audio", "128", "mp3"),
+)
+
+INSTAGRAM_QUALITIES: tuple[tuple[str, int | None, str, str | None, str], ...] = (
+    ("360p",        360,  "video", None,  "360"),
+    ("720p",        720,  "video", None,  "720"),
+    ("1080p",      1080,  "video", None,  "1080"),
+    ("MP3 128kbps", None, "audio", "128", "mp3"),
+)
+
+SOUNDCLOUD_QUALITIES: tuple[tuple[str, int | None, str, str | None, str], ...] = (
+    ("MP3 128kbps", None, "audio", "128", "mp3"),
+    ("M4A (AAC)",   None, "audio", "256", "m4a"),
+    ("WAV (lossless)", None, "audio", "1411", "wav"),
+    ("FLAC (lossless)", None, "audio", "1411", "flac"),
+)
+
+
+# Map Platform → qualities tuple. Falls back to None if unsupported.
+PLATFORM_QUALITIES: dict[Any, tuple[tuple[str, int | None, str, str | None, str], ...]] = {}
+# Populated after Platform import below — see _populate_platform_qualities().
+
+
+# Map Platform → label shown in the menu caption ("▶️ یوتیوب", "🎵 تیک‌تاک", …).
+# We use the URL hostname as a fallback if no specific label is set.
+PLATFORM_MENU_LABEL: dict[Any, str] = {}
 
 
 _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -291,15 +354,15 @@ class YouTubeSitesGateway:
         attempt_directory: Path,
         progress_callback: ProgressCallback | None = None,
     ) -> GatewayResult:
-        """Initial request — for YouTube this returns a quality menu."""
-        if platform != Platform.YOUTUBE:
+        """Initial request — returns a quality menu for the platform."""
+        if platform not in _SUPPORTED_PLATFORMS:
             return GatewayResult(
                 status="error",
                 bot_username=YSITES_PROVIDER,
                 reason="unsupported_platform",
             )
         try:
-            return await self._request_youtube(url, attempt_directory)
+            return await self._request_platform(url, platform, attempt_directory)
         except DownloadTooLarge:
             return GatewayResult(
                 status="error", bot_username=YSITES_PROVIDER, reason="too_large"
@@ -307,7 +370,7 @@ class YouTubeSitesGateway:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.exception("YouTubeSitesGateway request crashed for %s: %s", url, exc)
+            logger.exception("SitesGateway request crashed for %s: %s", url, exc)
             return GatewayResult(
                 status="error", bot_username=YSITES_PROVIDER, reason="sites_error"
             )
@@ -320,9 +383,22 @@ class YouTubeSitesGateway:
         option: QualityOption,
         attempt_directory: Path,
         progress_callback: ProgressCallback | None = None,
+        processing_callback: ProcessingCallback | None = None,
     ) -> GatewayResult:
-        """Handle a quality-selection click — start the download via the sites."""
-        if platform != Platform.YOUTUBE:
+        """Handle a quality-selection click — start the download via the sites.
+
+        Two callbacks:
+          - `processing_callback(percent, title, detail)`: called during the
+            server-side extraction phase (polling progress_url). Shows a
+            percent bar WITHOUT byte counts. This is the fix for the
+            progress-bar bug — previously we fed (progress, 1000) into the
+            byte-based `progress_callback`, which made the bar show garbage
+            like "488 B از 1000 B" and then JUMP BACKWARDS when the actual
+            CDN download started.
+          - `progress_callback(current, total)`: called during the actual
+            file download from the CDN. Shows real byte counts.
+        """
+        if platform not in _SUPPORTED_PLATFORMS:
             return GatewayResult(
                 status="error",
                 bot_username=YSITES_PROVIDER,
@@ -336,7 +412,11 @@ class YouTubeSitesGateway:
                 reason="invalid_fingerprint",
             )
         try:
-            return await self._select_youtube(url, payload, attempt_directory, progress_callback)
+            return await self._select_platform(
+                url, platform, payload, attempt_directory,
+                progress_callback=progress_callback,
+                processing_callback=processing_callback,
+            )
         except DownloadTooLarge:
             return GatewayResult(
                 status="error", bot_username=YSITES_PROVIDER, reason="too_large"
@@ -344,31 +424,40 @@ class YouTubeSitesGateway:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.exception("YouTubeSitesGateway select crashed for %s: %s", url, exc)
+            logger.exception("SitesGateway select crashed for %s: %s", url, exc)
             return GatewayResult(
                 status="error", bot_username=YSITES_PROVIDER, reason="sites_error"
             )
 
     # ------------------------------------------------------------------
-    # YouTube
+    # Platform dispatch
     # ------------------------------------------------------------------
-    async def _request_youtube(
+    async def _request_platform(
         self,
         url: str,
+        platform: Platform,
         attempt_directory: Path,
     ) -> GatewayResult:
-        """YouTube: present a quality menu."""
+        """Build a quality menu for the given platform."""
+        qualities = PLATFORM_QUALITIES.get(platform)
+        if qualities is None:
+            return GatewayResult(
+                status="error",
+                bot_username=YSITES_PROVIDER,
+                reason="unsupported_platform",
+            )
         options: list[QualityOption] = []
-        for row_index, (label, height, mode, bitrate, api_format) in enumerate(YOUTUBE_QUALITIES):
+        for row_index, (label, height, mode, bitrate, api_format) in enumerate(qualities):
             if mode == "audio":
-                # loader.to's MP3 endpoint always re-encodes to a server-chosen
+                # The MP3 endpoint always re-encodes to a server-chosen
                 # bitrate (it ignores the requested number), but we still
                 # expose 128/256/320 to keep the menu familiar. The actual
                 # file we get back is whatever the server produces.
                 fingerprint = _fingerprint(
                     {
+                        "platform": platform.value,
                         "mode": "audio",
-                        "format": "mp3",
+                        "format": api_format,
                         "bitrate": bitrate or "128",
                         "api_format": api_format,
                     }
@@ -388,6 +477,7 @@ class YouTubeSitesGateway:
             else:
                 fingerprint = _fingerprint(
                     {
+                        "platform": platform.value,
                         "mode": "video",
                         "height": height or 1080,
                         "api_format": api_format,
@@ -404,39 +494,55 @@ class YouTubeSitesGateway:
                         action="media",
                     )
                 )
-        return await self._attach_youtube_menu_assets(
+        return await self._attach_menu_assets(
             url=url,
+            platform=platform,
             attempt_directory=attempt_directory,
             options=tuple(options),
         )
 
-    async def _attach_youtube_menu_assets(
+    async def _attach_menu_assets(
         self,
         *,
         url: str,
+        platform: Platform,
         attempt_directory: Path,
         options: tuple[QualityOption, ...],
     ) -> GatewayResult:
-        """Enrich the menu with the video thumbnail + caption."""
-        video_id = _extract_video_id(url)
+        """Enrich the menu with a thumbnail + caption (best-effort)."""
         thumb_bytes: bytes | None = None
         title: str | None = None
-        if video_id:
-            thumb_url = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-            try:
-                async with self._client() as client:
-                    resp = await client.get(thumb_url, timeout=10.0)
-                    if resp.status_code == 200:
-                        thumb_bytes = resp.content
-            except Exception as exc:
-                logger.debug("thumbnail fetch failed for %s: %s", video_id, exc)
-            # Try to fetch the title from the page (best-effort, optional).
-            title = await self._fetch_title(video_id)
 
+        if platform == Platform.YOUTUBE:
+            video_id = _extract_video_id(url)
+            if video_id:
+                thumb_url = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+                try:
+                    async with self._client() as client:
+                        resp = await client.get(thumb_url, timeout=10.0)
+                        if resp.status_code == 200:
+                            thumb_bytes = resp.content
+                except Exception as exc:
+                    logger.debug("thumbnail fetch failed for %s: %s", video_id, exc)
+                title = await self._fetch_youtube_title(video_id)
+        else:
+            # For non-YouTube platforms, fetch the page's Open Graph image + title.
+            og_image, og_title = await self._fetch_og_meta(url)
+            if og_image:
+                try:
+                    async with self._client() as client:
+                        resp = await client.get(og_image, timeout=10.0)
+                        if resp.status_code == 200:
+                            thumb_bytes = resp.content
+                except Exception as exc:
+                    logger.debug("OG image fetch failed for %s: %s", url, exc)
+            title = og_title
+
+        platform_label = PLATFORM_MENU_LABEL.get(platform, platform.value)
         caption_lines: list[str] = []
         if title:
             caption_lines.append(f"<b>{html.escape(title)}</b>")
-        caption_lines.append(f"▶️ یوتیوب • <code>{html.escape(url)}</code>")
+        caption_lines.append(f"{platform_label} • <code>{html.escape(url)}</code>")
         caption = "\n".join(caption_lines)
 
         preview: DownloadedMedia | None = None
@@ -452,7 +558,7 @@ class YouTubeSitesGateway:
                     size=thumb_path.stat().st_size,
                 )
             except OSError as exc:
-                logger.warning("Failed to persist YouTube thumbnail: %s", exc)
+                logger.warning("Failed to persist thumbnail: %s", exc)
                 preview = None
 
         return GatewayResult(
@@ -463,7 +569,7 @@ class YouTubeSitesGateway:
             preview=preview,
         )
 
-    async def _fetch_title(self, video_id: str) -> str | None:
+    async def _fetch_youtube_title(self, video_id: str) -> str | None:
         """Best-effort fetch of the video title via YouTube's oEmbed API."""
         oembed_url = f"https://www.youtube.com/oembed?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D{video_id}&format=json"
         try:
@@ -476,29 +582,56 @@ class YouTubeSitesGateway:
             logger.debug("oembed title fetch failed for %s: %s", video_id, exc)
         return None
 
-    async def _select_youtube(
+    async def _fetch_og_meta(self, url: str) -> tuple[str | None, str | None]:
+        """Fetch og:image and og:title from a URL (best-effort, 8s timeout).
+
+        Used for SoundCloud / TikTok / Instagram — they all expose Open
+        Graph metadata. Returns (image_url, title) or (None, None).
+        """
+        try:
+            async with self._client() as client:
+                resp = await client.get(url, timeout=8.0,
+                                       headers={"Accept": "text/html,application/xhtml+xml"})
+                if resp.status_code != 200:
+                    return None, None
+                text = resp.text[:50_000]  # OG tags are in <head>, don't read entire page
+        except Exception as exc:
+            logger.debug("OG meta fetch failed for %s: %s", url, exc)
+            return None, None
+        image = _extract_meta_property(text, "og:image") or _extract_meta_property(text, "twitter:image")
+        title = _extract_meta_property(text, "og:title") or _extract_meta_property(text, "twitter:title")
+        return image, title
+
+    async def _select_platform(
         self,
         url: str,
+        platform: Platform,
         payload: dict[str, Any],
         attempt_directory: Path,
+        *,
         progress_callback: ProgressCallback | None,
+        processing_callback: ProcessingCallback | None = None,
     ) -> GatewayResult:
         mode = str(payload.get("mode", "video"))
         api_format = str(payload.get("api_format") or payload.get("format") or "720")
         if mode == "audio":
             return await self._download_audio(
                 url=url,
+                platform=platform,
                 api_format=api_format,
                 attempt_directory=attempt_directory,
                 progress_callback=progress_callback,
+                processing_callback=processing_callback,
             )
         target_height = int(payload.get("height") or 1080)
         return await self._download_video(
             url=url,
+            platform=platform,
             api_format=api_format,
             target_height=target_height,
             attempt_directory=attempt_directory,
             progress_callback=progress_callback,
+            processing_callback=processing_callback,
         )
 
     # ------------------------------------------------------------------
@@ -604,14 +737,28 @@ class YouTubeSitesGateway:
         self,
         client: httpx.AsyncClient,
         progress_url: str,
-        progress_callback: ProgressCallback | None,
+        processing_callback: ProcessingCallback | None,
     ) -> str | None:
         """Poll the progress endpoint until download_url is non-empty.
 
         Returns the download_url on success, None on timeout / failure.
+
+        IMPORTANT: this function reports progress via `processing_callback`
+        (which takes (percent, title, detail) and renders a percent bar
+        WITHOUT byte counts), NOT via the byte-based `progress_callback`.
+        The server's `progress` field is a 0..1000 extraction-progress
+        counter, NOT a byte count — feeding it into the byte-based
+        progress_callback was what caused the bar to show garbage like
+        "488 B از 1000 B" and then JUMP BACKWARDS when the actual CDN
+        download started.
         """
         deadline = asyncio.get_event_loop().time() + self.progress_timeout
         last_progress = -1
+        # Map the 0..1000 server-progress range to the 15%..40% slice of
+        # the overall progress bar (the CDN download that follows fills
+        # 40%..68% via ProgressReporter.download()).
+        PROCESSING_PERCENT_MIN = 15
+        PROCESSING_PERCENT_MAX = 40
         while asyncio.get_event_loop().time() < deadline:
             try:
                 # Cache-bust like the official frontend does.
@@ -632,14 +779,17 @@ class YouTubeSitesGateway:
             except Exception:
                 await asyncio.sleep(self.progress_poll_interval)
                 continue
-            # Progress is 0..1000 (1000 = done). We report it as 0..100%.
+            # Progress is 0..1000 (1000 = done).
             progress = int(data.get("progress") or 0)
-            if progress != last_progress and progress_callback is not None:
-                # Report total bytes as the progress * 100 so the fraction
-                # works out (downloaded/total). The bot's ProgressReporter
-                # only uses the ratio, so any consistent scaling is fine.
+            if progress != last_progress and processing_callback is not None:
+                ratio = max(0.0, min(1.0, progress / 1000.0))
+                percent = PROCESSING_PERCENT_MIN + int(ratio * (PROCESSING_PERCENT_MAX - PROCESSING_PERCENT_MIN))
                 try:
-                    await progress_callback(progress, 1000)
+                    await processing_callback(
+                        percent,
+                        "⚙️ دارم ویدیو رو آماده می‌کنم…",
+                        f"پردازش سرور: {progress // 10}%",
+                    )
                 except Exception:
                     pass
                 last_progress = progress
@@ -729,7 +879,7 @@ class YouTubeSitesGateway:
         self,
         url: str,
         api_format: str,
-        progress_callback: ProgressCallback | None,
+        processing_callback: ProcessingCallback | None,
     ) -> tuple[str, dict[str, Any]]:
         """Try each frontend in rotation, then the backend servers, until
         one returns a usable download_url. Returns (download_url, init_data).
@@ -739,7 +889,7 @@ class YouTubeSitesGateway:
         last_error = "no attempts made"
         for index, frontend in enumerate(frontends, start=1):
             logger.info(
-                "youtube-sites: attempt %d/%d via %s (format=%s)",
+                "sites: attempt %d/%d via %s (format=%s)",
                 index, len(frontends), frontend, api_format,
             )
             try:
@@ -755,11 +905,11 @@ class YouTubeSitesGateway:
                         last_error = f"{frontend}: no progress_url"
                         continue
                     download_url = await self._poll_progress(
-                        client, progress_url, progress_callback,
+                        client, progress_url, processing_callback,
                     )
                     if download_url:
                         logger.info(
-                            "youtube-sites: %s returned download_url for %s",
+                            "sites: %s returned download_url for %s",
                             frontend, url,
                         )
                         return download_url, init_data
@@ -769,12 +919,12 @@ class YouTubeSitesGateway:
                 continue
             except Exception as exc:
                 logger.warning(
-                    "youtube-sites: %s unexpected error: %s", frontend, exc
+                    "sites: %s unexpected error: %s", frontend, exc
                 )
                 last_error = f"{frontend}: {exc}"
                 continue
         # All frontends failed — try the backend servers as a last resort.
-        logger.info("youtube-sites: all frontends failed, trying backend servers directly")
+        logger.info("sites: all frontends failed, trying backend servers directly")
         try:
             async with self._client() as client:
                 init_data = await self._initiate_via_backend(client, url, api_format)
@@ -784,11 +934,11 @@ class YouTubeSitesGateway:
                     progress_url = init_data.get("progress_url") or ""
                     if progress_url:
                         download_url = await self._poll_progress(
-                            client, progress_url, progress_callback,
+                            client, progress_url, processing_callback,
                         )
                         if download_url:
                             logger.info(
-                                "youtube-sites: backend returned download_url for %s",
+                                "sites: backend returned download_url for %s",
                                 url,
                             )
                             return download_url, init_data
@@ -797,32 +947,34 @@ class YouTubeSitesGateway:
                         last_error = "backend: no progress_url"
         except Exception as exc:
             last_error = f"backend: {exc}"
-        raise YouTubeSitesError(f"All YouTube sites failed: {last_error}")
+        raise YouTubeSitesError(f"All sites failed: {last_error}")
 
     async def _download_video(
         self,
         *,
         url: str,
+        platform: Platform,
         api_format: str,
         target_height: int,
         attempt_directory: Path,
         progress_callback: ProgressCallback | None,
+        processing_callback: ProcessingCallback | None = None,
     ) -> GatewayResult:
         try:
             download_url, init_data = await self._resolve_download_url(
-                url, api_format, progress_callback,
+                url, api_format, processing_callback,
             )
         except YouTubeSitesError as exc:
-            logger.warning("youtube-sites video download failed for %s: %s", url, exc)
+            logger.warning("sites video download failed for %s: %s", url, exc)
             return GatewayResult(
                 status="error",
                 bot_username=YSITES_PROVIDER,
                 reason=self._map_error(exc),
             )
         # Determine the output extension from the download URL or fall back
-        # to mp4 (loader.to's video endpoint always serves mp4 / webm).
+        # to mp4 (the video endpoint always serves mp4 / webm).
         suffix = self._guess_suffix(download_url, default=".mp4")
-        final_path = attempt_directory / f"ysites_{target_height}p{suffix}"
+        final_path = attempt_directory / f"ysites_{platform.value}_{target_height}p{suffix}"
         try:
             async with self._client() as client:
                 await self._download_file(
@@ -831,14 +983,14 @@ class YouTubeSitesGateway:
         except DownloadTooLarge:
             raise
         except InvalidDownload as exc:
-            logger.warning("youtube-sites CDN download failed: %s", exc)
+            logger.warning("sites CDN download failed: %s", exc)
             return GatewayResult(
                 status="error",
                 bot_username=YSITES_PROVIDER,
                 reason="sites_cdn_error",
             )
         except Exception as exc:
-            logger.warning("youtube-sites CDN download crashed: %s", exc)
+            logger.warning("sites CDN download crashed: %s", exc)
             return GatewayResult(
                 status="error",
                 bot_username=YSITES_PROVIDER,
@@ -857,23 +1009,33 @@ class YouTubeSitesGateway:
         self,
         *,
         url: str,
+        platform: Platform,
         api_format: str,
         attempt_directory: Path,
         progress_callback: ProgressCallback | None,
+        processing_callback: ProcessingCallback | None = None,
     ) -> GatewayResult:
         try:
             download_url, init_data = await self._resolve_download_url(
-                url, api_format, progress_callback,
+                url, api_format, processing_callback,
             )
         except YouTubeSitesError as exc:
-            logger.warning("youtube-sites audio download failed for %s: %s", url, exc)
+            logger.warning("sites audio download failed for %s: %s", url, exc)
             return GatewayResult(
                 status="error",
                 bot_username=YSITES_PROVIDER,
                 reason=self._map_error(exc),
             )
-        suffix = self._guess_suffix(download_url, default=".mp3")
-        final_path = attempt_directory / f"ysites_audio{suffix}"
+        # Pick the right default suffix based on the requested format.
+        default_suffix = ".mp3"
+        if api_format == "m4a":
+            default_suffix = ".m4a"
+        elif api_format == "wav":
+            default_suffix = ".wav"
+        elif api_format == "flac":
+            default_suffix = ".flac"
+        suffix = self._guess_suffix(download_url, default=default_suffix)
+        final_path = attempt_directory / f"ysites_{platform.value}_audio{suffix}"
         try:
             async with self._client() as client:
                 await self._download_file(
@@ -882,14 +1044,14 @@ class YouTubeSitesGateway:
         except DownloadTooLarge:
             raise
         except InvalidDownload as exc:
-            logger.warning("youtube-sites CDN download failed: %s", exc)
+            logger.warning("sites CDN download failed: %s", exc)
             return GatewayResult(
                 status="error",
                 bot_username=YSITES_PROVIDER,
                 reason="sites_cdn_error",
             )
         except Exception as exc:
-            logger.warning("youtube-sites CDN download crashed: %s", exc)
+            logger.warning("sites CDN download crashed: %s", exc)
             return GatewayResult(
                 status="error",
                 bot_username=YSITES_PROVIDER,
@@ -912,11 +1074,11 @@ class YouTubeSitesGateway:
         parsed = urllib.parse.urlsplit(download_url)
         path = parsed.path.lower()
         # /api/v2/download/<token> — no extension, use default.
-        for ext in (".mp4", ".m4a", ".webm", ".mp3", ".opus", ".ogg", ".wav"):
+        for ext in (".mp4", ".m4a", ".webm", ".mp3", ".opus", ".ogg", ".wav", ".flac", ".aac"):
             if path.endswith(ext):
                 return ext
         # Check Content-Type headers? We don't have them here; the default
-        # is what loader.to documents for each format.
+        # is what each format documents.
         return default
 
     def _cleanup_part_files(self, attempt_directory: Path, keep: set[str]) -> None:
@@ -971,3 +1133,50 @@ async def sites_health_check(frontends: tuple[str, ...] | None = None, *, timeou
             except Exception:
                 continue
     return False
+
+
+# ----------------------------------------------------------------------
+# Platform registration — populate the lookup tables now that Platform
+# is imported. This is done at module-import time so the bot can read
+# PLATFORM_QUALITIES / PLATFORM_MENU_LABEL / _SUPPORTED_PLATFORMS right
+# after importing this module.
+# ----------------------------------------------------------------------
+
+PLATFORM_QUALITIES[Platform.YOUTUBE] = YOUTUBE_QUALITIES
+PLATFORM_QUALITIES[Platform.TIKTOK] = TIKTOK_QUALITIES
+PLATFORM_QUALITIES[Platform.INSTAGRAM] = INSTAGRAM_QUALITIES
+PLATFORM_QUALITIES[Platform.SOUNDCLOUD] = SOUNDCLOUD_QUALITIES
+
+PLATFORM_MENU_LABEL[Platform.YOUTUBE] = "▶️ یوتیوب"
+PLATFORM_MENU_LABEL[Platform.TIKTOK] = "🎵 تیک‌تاک"
+PLATFORM_MENU_LABEL[Platform.INSTAGRAM] = "📸 اینستاگرام"
+PLATFORM_MENU_LABEL[Platform.SOUNDCLOUD] = "☁️ ساوندکلاد"
+
+_SUPPORTED_PLATFORMS: frozenset[Platform] = frozenset(PLATFORM_QUALITIES.keys())
+
+
+# Regex for extracting <meta property="og:..." content="..."> values.
+_META_PROPERTY_RE = re.compile(
+    r'<meta\s+(?:property|name)=["\'](?P<key>[^"\']+)["\']\s+content=["\'](?P<val>[^"\']*)["\']',
+    re.IGNORECASE,
+)
+_META_CONTENT_FIRST_RE = re.compile(
+    r'<meta\s+content=["\'](?P<val>[^"\']*)["\']\s+(?:property|name)=["\'](?P<key>[^"\']+)["\']',
+    re.IGNORECASE,
+)
+
+
+def _extract_meta_property(html_text: str, key: str) -> str | None:
+    """Extract a <meta property="..."> content value from HTML.
+
+    Handles both attribute orders: property-then-content and content-then-property.
+    Returns None if the property is not present.
+    """
+    key_lower = key.lower()
+    for pattern in (_META_PROPERTY_RE, _META_CONTENT_FIRST_RE):
+        for match in pattern.finditer(html_text):
+            if match.group("key").lower() == key_lower:
+                value = match.group("val").strip()
+                if value:
+                    return value
+    return None

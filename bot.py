@@ -483,6 +483,21 @@ class ProgressReporter:
             f"{size_line}\n{timing}",
         )
 
+    async def processing(self, percent: int, title: str, detail: str = "", *, force: bool = False) -> None:
+        """Show a 'processing' status — percent bar WITHOUT byte counts.
+
+        Used by the YouTube-sites gateway during the server-side extraction
+        phase (polling the progress_url). The server returns a 0..1000
+        extraction-progress counter, NOT a byte count — feeding that into
+        `download()` was what caused the bar to show garbage like
+        "488 B از 1000 B" and then JUMP BACKWARDS when the actual CDN
+        download started.
+
+        This method shows the percent bar + an arbitrary detail line (e.g.
+        "پردازش سرور: 42%") with no byte / time-remaining fields.
+        """
+        await self.update(percent, title, detail, force=force)
+
     async def begin_upload(self, total_size: int) -> None:
         self.upload_started_at = time.monotonic()
         self.upload_total = max(1, int(total_size))
@@ -1782,13 +1797,15 @@ async def _process_url(
             raise PoolUnavailable("Fallback queue is full")
 
         # ── YouTube: try the sites gateway FIRST (no Telegram account needed) ──
-        # The YouTube-sites gateway scrapes loader.to / loaderr.to / y2mate.yt
-        # in rotation. It does not need a Telegram worker, so we try it before
-        # acquiring one. If it returns a quality menu or a ready file, we ship
-        # it directly; if it fails, we fall through to the Telegram downloader
-        # bots below.
+        # The sites gateway scrapes loader.to / loaderr.to / y2mate.yt /
+        # downcloud.cc / downtik.to / igdown.io in rotation (all six share
+        # the same savenow.to / lbserver.xyz backend, just with different
+        # format strings per platform). It does not need a Telegram worker,
+        # so we try it before acquiring one. If it returns a quality menu
+        # or a ready file, we ship it directly; if it fails, we fall
+        # through to the Telegram downloader bots below.
         if (
-            platform == Platform.YOUTUBE
+            platform in {Platform.YOUTUBE, Platform.TIKTOK, Platform.INSTAGRAM, Platform.SOUNDCLOUD}
             and YOUTUBE_SITES_GATEWAY is not None
             and not is_spotify_collection
         ):
@@ -3253,13 +3270,33 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         selection_progress = ProgressReporter(query.message, session.request_id)
         await selection_progress.update(10, selection_title, selection_label, force=True)
         if session.use_youtube_sites and YOUTUBE_SITES_GATEWAY is not None:
-            # YouTube-sites selection path: no Telegram worker, just HTTP.
+            # Show an immediate "processing" status so the user sees the bar
+            # start moving before the first progress poll comes back (which
+            # can take 2-5 seconds). The gateway's _poll_progress will then
+            # take over and update the bar from 15% to 40% as the server
+            # extracts the media, followed by the CDN download (40%→68%).
+            await selection_progress.processing(
+                12,
+                "⚙️ دارم ویدیو رو آماده می‌کنم…",
+                "ارتباط با سرور…",
+                force=True,
+            )
+            # Sites selection path: no Telegram worker, just HTTP.
+            # Two callbacks:
+            #   - processing_callback: percent bar WITHOUT byte counts, used
+            #     during the server-side extraction phase (polling progress_url).
+            #     This is the fix for the progress-bar bug — previously the
+            #     0..1000 server-progress counter was fed into the byte-based
+            #     download() callback, producing garbage like "488 B از 1000 B"
+            #     and a backwards jump when the actual CDN download started.
+            #   - progress_callback: byte-based, used during the CDN download.
             result = await YOUTUBE_SITES_GATEWAY.select(
                 url=session.source_url,
                 platform=session.platform,
                 option=option,
                 attempt_directory=session.attempt_directory,
                 progress_callback=selection_progress.download,
+                processing_callback=selection_progress.processing,
             )
         else:
             if session.lease is None:
