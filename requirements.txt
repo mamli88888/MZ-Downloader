@@ -5,6 +5,10 @@ python-socks==2.8.2
 python-dotenv==1.2.2
 httpx[socks]==0.28.1
 Pillow==12.3.0
+# yt-dlp is used by youtube_search.py for /music search and for estimating
+# file sizes shown next to quality buttons. Both have fallbacks (search has
+# none, size estimation falls back to downsub.com). YouTube DOWNLOADS do
+# NOT use yt-dlp — they go through the youtube_sites_gateway instead.
 yt-dlp==2026.7.4
 shazamio==0.8.1
 pycryptodome==3.23.0

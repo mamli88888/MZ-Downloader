@@ -69,6 +69,12 @@ from downloader import (
 from instagram_caption import InstagramCaptionError, fetch_instagram_caption
 from routing import Platform, all_providers, detect_platform, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
 from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
+from youtube_sites_gateway import (
+    DEFAULT_FRONTENDS as YOUTUBE_SITES_DEFAULT_FRONTENDS,
+    YSITES_PROVIDER,
+    YouTubeSitesGateway,
+    sites_health_check,
+)
 from youtube_search import (
     MAX_RESULTS as YOUTUBE_SEARCH_MAX_RESULTS,
     RESULTS_PER_PAGE as YOUTUBE_RESULTS_PER_PAGE,
@@ -133,6 +139,32 @@ GATEWAY = DownloaderGateway(
         else None
     ),
 )
+# YouTube-sites gateway: a rotational scraper over loader.to / loaderr.to /
+# y2mate.yt that does NOT need a Telegram account. When enabled, YouTube
+# URLs hit this gateway first; the Telegram downloader bots are only
+# tried as a fallback if the sites are unreachable.
+YOUTUBE_SITES_GATEWAY: YouTubeSitesGateway | None = None
+if SETTINGS.youtube_sites_enabled:
+    YOUTUBE_SITES_GATEWAY = YouTubeSitesGateway(
+        api_key=SETTINGS.youtube_sites_api_key,
+        frontends=SETTINGS.youtube_sites_frontends,
+        proxy_url=(
+            f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+            if SETTINGS.use_proxy
+            else None
+        ),
+        max_download_size=SETTINGS.max_download_size,
+        progress_timeout=SETTINGS.youtube_sites_progress_timeout,
+        max_attempts=SETTINGS.youtube_sites_max_attempts,
+    )
+    logger.info(
+        "youtube-sites gateway enabled (frontends=%d, max_attempts=%d, progress_timeout=%ss)",
+        len(SETTINGS.youtube_sites_frontends),
+        SETTINGS.youtube_sites_max_attempts,
+        SETTINGS.youtube_sites_progress_timeout,
+    )
+else:
+    logger.info("youtube-sites gateway disabled — YouTube will use Telegram downloader bots only")
 YOUTUBE_SEARCH = YouTubeSearchService(
     proxy_url=(
         f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
@@ -184,8 +216,14 @@ class PendingSelection:
     request_message_id: int
     menu_message_id: int
     options: tuple[QualityOption, ...]
-    lease: WorkerLease
+    # None when this selection is being served by YOUTUBE_SITES_GATEWAY
+    # (which does the download via HTTP, not via a Telegram account). The
+    # Telegram-bot path keeps a real WorkerLease here.
+    lease: WorkerLease | None
     attempt_directory: Path
+    # True when this session should be fulfilled by YOUTUBE_SITES_GATEWAY
+    # instead of GATEWAY (the Telegram downloader-bot gateway).
+    use_youtube_sites: bool = False
     fallback_text: str = ""
     instagram_caption: str = ""
     caption_task: asyncio.Task[str] | None = None
@@ -1490,7 +1528,10 @@ def release_pending_selection(session: PendingSelection) -> None:
         PENDING_SELECTIONS.pop(session.token, None)
     if session.caption_task is not None and not session.caption_task.done():
         session.caption_task.cancel()
-    ACCOUNT_POOL.release(session.lease)
+    # YouTube-sites sessions don't hold a Telegram worker lease — skip the
+    # pool release in that case.
+    if session.lease is not None:
+        ACCOUNT_POOL.release(session.lease)
     cleanup_request_directory(session.attempt_directory, SETTINGS.download_root)
 
 
@@ -1738,6 +1779,164 @@ async def _process_url(
             raise PoolUnavailable("No Telegram fallback account is connected")
         if ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
             raise PoolUnavailable("Fallback queue is full")
+
+        # ── YouTube: try the sites gateway FIRST (no Telegram account needed) ──
+        # The YouTube-sites gateway scrapes loader.to / loaderr.to / y2mate.yt
+        # in rotation. It does not need a Telegram worker, so we try it before
+        # acquiring one. If it returns a quality menu or a ready file, we ship
+        # it directly; if it fails, we fall through to the Telegram downloader
+        # bots below.
+        if (
+            platform == Platform.YOUTUBE
+            and YOUTUBE_SITES_GATEWAY is not None
+            and not is_spotify_collection
+        ):
+            await progress.update(
+                15,
+                "▶️ دارم از طریق سرویس‌های آنلاین آماده‌اش می‌کنم…",
+                f"{info.icon} {info.label} • مسیر اصلی (sites)",
+                force=True,
+            )
+            sites_attempt_dir = create_attempt_directory(
+                SETTINGS.download_root, request_id, "ysites",
+            )
+            try:
+                sites_result = await YOUTUBE_SITES_GATEWAY.request(
+                    url=url,
+                    platform=platform,
+                    attempt_directory=sites_attempt_dir,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("youtube-sites gateway crashed for %s: %s", request_id, exc)
+                sites_result = GatewayResult(
+                    status="error",
+                    bot_username=YSITES_PROVIDER,
+                    reason="sites_error",
+                )
+
+            if sites_result.status == "ready":
+                # Rare for YouTube (the gateway returns needs_selection first),
+                # but handle it for completeness.
+                await send_result_to_user(
+                    update, context, status_message, sites_result,
+                    reply_to=reply_to, request_id=request_id, progress=progress,
+                )
+                if platform == Platform.YOUTUBE:
+                    await send_subtitle_followup(
+                        context, chat_id=chat_id, reply_to=reply_to,
+                        youtube_url=url, result=sites_result,
+                    )
+                cleanup_request_directory(sites_attempt_dir, SETTINGS.download_root)
+                return
+
+            if sites_result.status == "needs_selection":
+                # Show the quality menu WITHOUT acquiring a Telegram worker.
+                # The selection handler will call YOUTUBE_SITES_GATEWAY.select().
+                displayed_options = sites_result.options[:24]
+                token = uuid.uuid4().hex[:12]
+                rows: list[list[InlineKeyboardButton]] = []
+                video_choices = [
+                    (i, o) for i, o in enumerate(displayed_options)
+                    if o.action == "media" and o.expected_kind == MediaKind.VIDEO
+                ]
+                audio_choices = [
+                    (i, o) for i, o in enumerate(displayed_options)
+                    if o.action == "media" and o.expected_kind == MediaKind.AUDIO
+                ]
+                quick_row: list[InlineKeyboardButton] = []
+                if video_choices:
+                    best_index, best_option = max(
+                        video_choices,
+                        key=lambda item: item[1].expected_height or 0,
+                    )
+                    quick_row.append(InlineKeyboardButton(
+                        f"⭐ بهترین کیفیت — {best_option.label}",
+                        callback_data=f"sel:{token}:{best_index}",
+                    ))
+                if audio_choices:
+                    audio_index, audio_option = max(
+                        audio_choices,
+                        key=lambda item: item[1].expected_bitrate_kbps or 0,
+                    )
+                    quick_row.append(InlineKeyboardButton(
+                        f"🎵 فقط صدا — {audio_option.label}",
+                        callback_data=f"sel:{token}:{audio_index}",
+                    ))
+                if quick_row:
+                    rows.append(quick_row)
+                row: list[InlineKeyboardButton] = []
+                for option_index, option in enumerate(displayed_options):
+                    prefix = "🎵" if option.expected_kind == MediaKind.AUDIO else "🎬"
+                    raw_label = option.label if len(option.label) <= 40 else option.label[:37] + "…"
+                    row.append(InlineKeyboardButton(
+                        f"{prefix} {raw_label}",
+                        callback_data=f"sel:{token}:{option_index}",
+                    ))
+                    if len(row) == 2:
+                        rows.append(row)
+                        row = []
+                if row:
+                    rows.append(row)
+                rows.append([InlineKeyboardButton("لغو درخواست", callback_data=f"cancel:{token}")])
+                menu_text = status_card(
+                    "🎚 کدوم خروجی رو می‌خوای؟",
+                    f"منبع: <code>{html_escape(host)}</code>\nکیفیت یا صدا رو انتخاب کن.",
+                    f"تا {int(SETTINGS.selection_ttl // 60)} دقیقه وقت داری",
+                )
+                if sites_result.preview is not None:
+                    try:
+                        with sites_result.preview.path.open("rb") as preview_handle:
+                            await context.bot.send_photo(
+                                chat_id=chat_id, photo=preview_handle,
+                                caption=f"🖼 پیش‌نمایش ویدیو • {host}",
+                                reply_to_message_id=reply_to,
+                            )
+                        with contextlib.suppress(TelegramError):
+                            await status_message.delete()
+                        status_message = await send_status(context, chat_id, menu_text, None)
+                    except TelegramError as exc:
+                        logger.warning("Thumbnail send failed for %s: %s", request_id, exc)
+                session = PendingSelection(
+                    token=token,
+                    created_at=time.monotonic(),
+                    chat_id=chat_id,
+                    user_id=update.effective_user.id,
+                    status_message_id=status_message.message_id,
+                    reply_to=reply_to,
+                    request_id=request_id,
+                    source_host=host,
+                    source_url=url,
+                    platform=platform,
+                    bot_username=YSITES_PROVIDER,
+                    request_message_id=0,
+                    menu_message_id=0,
+                    options=displayed_options,
+                    lease=None,  # No Telegram worker — sites gateway does the download
+                    attempt_directory=sites_attempt_dir,
+                    use_youtube_sites=True,
+                    fallback_text=sites_result.text,
+                )
+                PENDING_SELECTIONS[token] = session
+                await edit_status(status_message, menu_text, InlineKeyboardMarkup(rows))
+                hold_lease = True  # Prevents the finally block from cleaning up
+                return
+
+            # sites_result.status == "error" — fall through to Telegram bots
+            logger.info(
+                "youtube-sites gateway failed for %s (reason=%s); falling back to Telegram bots",
+                request_id, sites_result.reason,
+            )
+            await progress.update(
+                20,
+                "🔄 سرویس آنلاین جواب نداد، امتحان می‌کنم با بات‌های دانلود…",
+                f"{info.icon} {info.label} • مسیر جایگزین",
+                force=True,
+            )
+            cleanup_request_directory(sites_attempt_dir, SETTINGS.download_root)
+            reasons.append(sites_result.reason or "sites_error")
+
         lease = await asyncio.wait_for(
             ACCOUNT_POOL.acquire(),
             timeout=SETTINGS.worker_acquire_timeout,
@@ -3050,20 +3249,32 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     try:
-        if session.lease.worker.lease_id != session.lease.lease_id:
-            raise RuntimeError("Selection lease is no longer active")
         selection_progress = ProgressReporter(query.message, session.request_id)
         await selection_progress.update(10, selection_title, selection_label, force=True)
-        result = await GATEWAY.select(
-            client=session.lease.worker.client,
-            worker_name=session.lease.worker.name,
-            bot_username=session.bot_username,
-            request_message_id=session.request_message_id,
-            menu_message_id=session.menu_message_id,
-            option=option,
-            attempt_directory=session.attempt_directory,
-            progress_callback=selection_progress.download,
-        )
+        if session.use_youtube_sites and YOUTUBE_SITES_GATEWAY is not None:
+            # YouTube-sites selection path: no Telegram worker, just HTTP.
+            result = await YOUTUBE_SITES_GATEWAY.select(
+                url=session.source_url,
+                platform=session.platform,
+                option=option,
+                attempt_directory=session.attempt_directory,
+                progress_callback=selection_progress.download,
+            )
+        else:
+            if session.lease is None:
+                raise RuntimeError("Selection has no Telegram worker lease and sites gateway is not enabled")
+            if session.lease.worker.lease_id != session.lease.lease_id:
+                raise RuntimeError("Selection lease is no longer active")
+            result = await GATEWAY.select(
+                client=session.lease.worker.client,
+                worker_name=session.lease.worker.name,
+                bot_username=session.bot_username,
+                request_message_id=session.request_message_id,
+                menu_message_id=session.menu_message_id,
+                option=option,
+                attempt_directory=session.attempt_directory,
+                progress_callback=selection_progress.download,
+            )
         if result.status == "text":
             chunks = [result.text[index:index + 3500] for index in range(0, len(result.text), 3500)] or [""]
             for index, chunk in enumerate(chunks):

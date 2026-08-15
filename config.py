@@ -68,6 +68,12 @@ class Settings:
     proxy_port: int
     pixeldrain_delete_delay: float
     pixeldrain_api_key: str | None
+    # YouTube-sites gateway (rotational scraper over loader.to family)
+    youtube_sites_enabled: bool
+    youtube_sites_api_key: str
+    youtube_sites_frontends: tuple[str, ...]
+    youtube_sites_progress_timeout: float
+    youtube_sites_max_attempts: int
 
 
 def _as_bool(value: str | None, default: bool) -> bool:
@@ -209,6 +215,20 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         music_finder_bots=music_finder_bots,
         pixeldrain_delete_delay=_as_float(env, "PIXELDRAIN_DELETE_DELAY_SECONDS", 1800.0),
         pixeldrain_api_key=env.get("PIXELDRAIN_API_KEY", "").strip() or None,
+        youtube_sites_enabled=_as_bool(env.get("YOUTUBE_SITES_ENABLED"), True),
+        youtube_sites_api_key=env.get("YOUTUBE_SITES_API_KEY", "").strip() or "dfcb6d76f2f6a9894gjkege8a4ab232222",
+        youtube_sites_frontends=tuple(
+            host.strip()
+            for host in env.get(
+                "YOUTUBE_SITES_FRONTENDS",
+                "loader.to,en.loader.to,es.loader.to,de.loader.to,fr.loader.to,"
+                "it.loader.to,pt.loader.to,ru.loader.to,ja.loader.to,zh.loader.to,"
+                "nl.loader.to,pl.loader.to,p.savenow.to,p.lbserver.xyz",
+            ).split(",")
+            if host.strip()
+        ),
+        youtube_sites_progress_timeout=_as_float(env, "YOUTUBE_SITES_PROGRESS_TIMEOUT_SECONDS", 180.0, minimum=10.0),
+        youtube_sites_max_attempts=_as_int(env, "YOUTUBE_SITES_MAX_ATTEMPTS", 6, minimum=1),
         download_root=download_root,
         max_file_size=_as_int(env, "MAX_FILE_SIZE_MB", 30) * 1024 * 1024,
         # Zero disables the application-level source-size cap. Telegram upload

@@ -6,6 +6,7 @@
   },
   "deploy": {
     "runtime": "V2",
+    "startCommand": "python -u bot.py",
     "numReplicas": 1,
     "sleepApplication": false,
     "restartPolicyType": "ON_FAILURE",
