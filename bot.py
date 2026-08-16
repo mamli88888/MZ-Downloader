@@ -75,6 +75,11 @@ from youtube_sites_gateway import (
     YouTubeSitesGateway,
     sites_health_check,
 )
+from social_gateway import (
+    SOCIAL_PROVIDER,
+    SocialSitesGateway,
+    social_health_check,
+)
 from youtube_search import (
     MAX_RESULTS as YOUTUBE_SEARCH_MAX_RESULTS,
     RESULTS_PER_PAGE as YOUTUBE_RESULTS_PER_PAGE,
@@ -165,6 +170,25 @@ if SETTINGS.youtube_sites_enabled:
     )
 else:
     logger.info("youtube-sites gateway disabled — YouTube will use Telegram downloader bots only")
+
+# ── Social-sites gateway (TikTok via tikwm.com, SoundCloud via yt-dlp,
+# Instagram via yt-dlp-with-cookies). None of these need a Telegram
+# account. Instagram requires a cookies.txt file — if absent, Instagram
+# URLs fall back to the Telegram downloader bots.
+SOCIAL_GATEWAY: SocialSitesGateway | None = None
+_instagram_cookies = PROJECT_DIR / "cookies.txt" if (PROJECT_DIR / "cookies.txt").exists() else None
+if _instagram_cookies is not None:
+    logger.info("Instagram cookies.txt found — Instagram will use yt-dlp with cookies")
+else:
+    logger.info("Instagram cookies.txt not found — Instagram will fall back to Telegram downloader bots")
+SOCIAL_GATEWAY = SocialSitesGateway(
+    instagram_cookies_path=_instagram_cookies,
+    max_download_size=SETTINGS.max_download_size,
+)
+logger.info(
+    "social-sites gateway enabled (TikTok=tikwm.com, SoundCloud=yt-dlp, Instagram=%s)",
+    "yt-dlp+cookies" if _instagram_cookies is not None else "Telegram-bots-only",
+)
 YOUTUBE_SEARCH = YouTubeSearchService(
     proxy_url=(
         f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
@@ -224,6 +248,10 @@ class PendingSelection:
     # True when this session should be fulfilled by YOUTUBE_SITES_GATEWAY
     # instead of GATEWAY (the Telegram downloader-bot gateway).
     use_youtube_sites: bool = False
+    # True when this session should be fulfilled by SOCIAL_GATEWAY
+    # (TikTok via tikwm.com / SoundCloud via yt-dlp / Instagram via
+    # yt-dlp-with-cookies) instead of GATEWAY.
+    use_social_sites: bool = False
     fallback_text: str = ""
     instagram_caption: str = ""
     caption_task: asyncio.Task[str] | None = None
@@ -1215,8 +1243,8 @@ async def send_large_file(
                     text=status_card(
                         "☁️ فایل آماده دانلوده!",
                         f"حجم: <b>{fmt_size(item.size)}</b>\n\n"
-                        "روی دکمه زیر بزن تا فایل رو دانلود کنی:",
-                        "وقتی وارد لینک زیر شدی، بالای صفحه سمت چپ روی سه خط بزن و بعد گزینه Download.",
+                        "روی دکمه زیر بزن تا فایل رو دانلود کنی.\n"
+                        "وقتی وارد لینک شدی، بالای صفحه سمت چپ روی سه خط بزن و بعد گزینه Download.",
                         "لینک موقته و بعد از ۳۰ دقیقه به‌صورت خودکار پاک می‌شه.",
                     ),
                     parse_mode=ParseMode.HTML,
@@ -1797,15 +1825,13 @@ async def _process_url(
             raise PoolUnavailable("Fallback queue is full")
 
         # ── YouTube: try the sites gateway FIRST (no Telegram account needed) ──
-        # The sites gateway scrapes loader.to / loaderr.to / y2mate.yt /
-        # downcloud.cc / downtik.to / igdown.io in rotation (all six share
-        # the same savenow.to / lbserver.xyz backend, just with different
-        # format strings per platform). It does not need a Telegram worker,
-        # so we try it before acquiring one. If it returns a quality menu
-        # or a ready file, we ship it directly; if it fails, we fall
-        # through to the Telegram downloader bots below.
+        # The sites gateway scrapes loader.to / loaderr.to / y2mate.yt in
+        # rotation. It does not need a Telegram worker, so we try it before
+        # acquiring one. If it returns a quality menu or a ready file, we
+        # ship it directly; if it fails, we fall through to the Telegram
+        # downloader bots below.
         if (
-            platform in {Platform.YOUTUBE, Platform.TIKTOK, Platform.INSTAGRAM, Platform.SOUNDCLOUD}
+            platform == Platform.YOUTUBE
             and YOUTUBE_SITES_GATEWAY is not None
             and not is_spotify_collection
         ):
@@ -1954,6 +1980,156 @@ async def _process_url(
             )
             cleanup_request_directory(sites_attempt_dir, SETTINGS.download_root)
             reasons.append(sites_result.reason or "sites_error")
+
+        # ── TikTok / SoundCloud / Instagram: try the social gateway FIRST ──
+        # The social gateway uses tikwm.com for TikTok, yt-dlp for
+        # SoundCloud (no auth needed), and yt-dlp+cookies for Instagram.
+        # It does not need a Telegram worker. If Instagram has no cookies
+        # file, the gateway returns `instagram_no_cookies` immediately
+        # and we fall through to the Telegram downloader bots below.
+        if (
+            platform in {Platform.TIKTOK, Platform.SOUNDCLOUD, Platform.INSTAGRAM}
+            and SOCIAL_GATEWAY is not None
+            and not is_spotify_collection
+        ):
+            await progress.update(
+                15,
+                "▶️ دارم از طریق سرویس‌های آنلاین آماده‌اش می‌کنم…",
+                f"{info.icon} {info.label} • مسیر اصلی (social)",
+                force=True,
+            )
+            social_attempt_dir = create_attempt_directory(
+                SETTINGS.download_root, request_id, "social",
+            )
+            try:
+                social_result = await SOCIAL_GATEWAY.request(
+                    url=url,
+                    platform=platform,
+                    attempt_directory=social_attempt_dir,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("social gateway crashed for %s: %s", request_id, exc)
+                social_result = GatewayResult(
+                    status="error",
+                    bot_username=SOCIAL_PROVIDER,
+                    reason="social_error",
+                )
+
+            if social_result.status == "ready":
+                # Rare (the gateway returns needs_selection first), but handle it.
+                await send_result_to_user(
+                    update, context, status_message, social_result,
+                    reply_to=reply_to, request_id=request_id, progress=progress,
+                )
+                cleanup_request_directory(social_attempt_dir, SETTINGS.download_root)
+                return
+
+            if social_result.status == "needs_selection":
+                # Show the quality menu WITHOUT acquiring a Telegram worker.
+                displayed_options = social_result.options[:24]
+                token = uuid.uuid4().hex[:12]
+                rows: list[list[InlineKeyboardButton]] = []
+                video_choices = [
+                    (i, o) for i, o in enumerate(displayed_options)
+                    if o.action == "media" and o.expected_kind == MediaKind.VIDEO
+                ]
+                audio_choices = [
+                    (i, o) for i, o in enumerate(displayed_options)
+                    if o.action == "media" and o.expected_kind == MediaKind.AUDIO
+                ]
+                quick_row: list[InlineKeyboardButton] = []
+                if video_choices:
+                    best_index, best_option = max(
+                        video_choices,
+                        key=lambda item: item[1].expected_height or 0,
+                    )
+                    quick_row.append(InlineKeyboardButton(
+                        f"⭐ بهترین کیفیت — {best_option.label}",
+                        callback_data=f"sel:{token}:{best_index}",
+                    ))
+                if audio_choices:
+                    audio_index, audio_option = max(
+                        audio_choices,
+                        key=lambda item: item[1].expected_bitrate_kbps or 0,
+                    )
+                    quick_row.append(InlineKeyboardButton(
+                        f"🎵 فقط صدا — {audio_option.label}",
+                        callback_data=f"sel:{token}:{audio_index}",
+                    ))
+                if quick_row:
+                    rows.append(quick_row)
+                row: list[InlineKeyboardButton] = []
+                for option_index, option in enumerate(displayed_options):
+                    prefix = "🎵" if option.expected_kind == MediaKind.AUDIO else "🎬"
+                    raw_label = option.label if len(option.label) <= 40 else option.label[:37] + "…"
+                    row.append(InlineKeyboardButton(
+                        f"{prefix} {raw_label}",
+                        callback_data=f"sel:{token}:{option_index}",
+                    ))
+                    if len(row) == 2:
+                        rows.append(row)
+                        row = []
+                if row:
+                    rows.append(row)
+                rows.append([InlineKeyboardButton("لغو درخواست", callback_data=f"cancel:{token}")])
+                menu_text = status_card(
+                    "🎚 کدوم خروجی رو می‌خوای؟",
+                    f"منبع: <code>{html_escape(host)}</code>\nکیفیت یا صدا رو انتخاب کن.",
+                    f"تا {int(SETTINGS.selection_ttl // 60)} دقیقه وقت داری",
+                )
+                if social_result.preview is not None:
+                    try:
+                        with social_result.preview.path.open("rb") as preview_handle:
+                            await context.bot.send_photo(
+                                chat_id=chat_id, photo=preview_handle,
+                                caption=f"🖼 پیش‌نمایش • {host}",
+                                reply_to_message_id=reply_to,
+                            )
+                        with contextlib.suppress(TelegramError):
+                            await status_message.delete()
+                        status_message = await send_status(context, chat_id, menu_text, None)
+                    except TelegramError as exc:
+                        logger.warning("Thumbnail send failed for %s: %s", request_id, exc)
+                session = PendingSelection(
+                    token=token,
+                    created_at=time.monotonic(),
+                    chat_id=chat_id,
+                    user_id=update.effective_user.id,
+                    status_message_id=status_message.message_id,
+                    reply_to=reply_to,
+                    request_id=request_id,
+                    source_host=host,
+                    source_url=url,
+                    platform=platform,
+                    bot_username=SOCIAL_PROVIDER,
+                    request_message_id=0,
+                    menu_message_id=0,
+                    options=displayed_options,
+                    lease=None,  # No Telegram worker — social gateway does the download
+                    attempt_directory=social_attempt_dir,
+                    use_social_sites=True,
+                    fallback_text=social_result.text,
+                )
+                PENDING_SELECTIONS[token] = session
+                await edit_status(status_message, menu_text, InlineKeyboardMarkup(rows))
+                hold_lease = True  # Prevents the finally block from cleaning up
+                return
+
+            # social_result.status == "error" — fall through to Telegram bots
+            logger.info(
+                "social gateway failed for %s (reason=%s); falling back to Telegram bots",
+                request_id, social_result.reason,
+            )
+            await progress.update(
+                20,
+                "🔄 سرویس آنلاین جواب نداد، امتحان می‌کنم با بات‌های دانلود…",
+                f"{info.icon} {info.label} • مسیر جایگزین",
+                force=True,
+            )
+            cleanup_request_directory(social_attempt_dir, SETTINGS.download_root)
+            reasons.append(social_result.reason or "social_error")
 
         lease = await asyncio.wait_for(
             ACCOUNT_POOL.acquire(),
@@ -3269,7 +3445,25 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         selection_progress = ProgressReporter(query.message, session.request_id)
         await selection_progress.update(10, selection_title, selection_label, force=True)
-        if session.use_youtube_sites and YOUTUBE_SITES_GATEWAY is not None:
+        if session.use_social_sites and SOCIAL_GATEWAY is not None:
+            # Show an immediate "processing" status so the user sees the bar
+            # start moving before yt-dlp / tikwm.com returns.
+            await selection_progress.processing(
+                12,
+                "⚙️ دارم ویدیو رو آماده می‌کنم…",
+                "ارتباط با سرور…",
+                force=True,
+            )
+            # Social selection path: no Telegram worker, just HTTP / yt-dlp.
+            result = await SOCIAL_GATEWAY.select(
+                url=session.source_url,
+                platform=session.platform,
+                option=option,
+                attempt_directory=session.attempt_directory,
+                progress_callback=selection_progress.download,
+                processing_callback=selection_progress.processing,
+            )
+        elif session.use_youtube_sites and YOUTUBE_SITES_GATEWAY is not None:
             # Show an immediate "processing" status so the user sees the bar
             # start moving before the first progress poll comes back (which
             # can take 2-5 seconds). The gateway's _poll_progress will then
@@ -3365,9 +3559,9 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except asyncio.CancelledError:
         with contextlib.suppress(TelegramError):
             await query.edit_message_text(
-                status_card("⏹ درخواست متوقف شد", "دانلود کیفیت انتخابی لغو شد.",
+                status_card("⏹ درخواست متوقف شد", "دانلود کیفیت انتخابی لغو شد."),
                 parse_mode=ParseMode.HTML,
-            ))
+            )
     except Exception as exc:
         logger.exception("Selection %s failed: %s", session.request_id, exc)
         with contextlib.suppress(TelegramError):
@@ -3769,6 +3963,15 @@ async def post_init(application: Application) -> None:
             logger.error("Health endpoint failed to start: %s", exc)
     SELECTION_REAPER_TASK = asyncio.create_task(selection_reaper(application), name="selection-reaper")
     logger.info("Bot initialized with %d downloader account(s)", ACCOUNT_POOL.total)
+    # Best-effort connectivity probe for the social-sites gateway backends.
+    if SOCIAL_GATEWAY is not None:
+        try:
+            social_status = await asyncio.wait_for(social_health_check(), timeout=8.0)
+            logger.info("social-sites health: tiktok=%s soundcloud=%s instagram=%s",
+                        social_status.get("tiktok"), social_status.get("soundcloud"),
+                        social_status.get("instagram"))
+        except Exception as exc:
+            logger.debug("social-sites health probe failed: %s", exc)
 
 
 async def post_shutdown(application: Application) -> None:
