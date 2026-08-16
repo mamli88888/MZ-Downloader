@@ -213,7 +213,11 @@ REQUIRED_CHANNELS = (
 MEMBERSHIP_CACHE_TTL = 5 * 60
 FEEDBACK_STICKER_SET = "MZDownloader"
 DEFAULT_UPLOAD_RATE = 2 * 1024 * 1024
-UPLOAD_PROGRESS_INTERVAL = 2.0
+UPLOAD_PROGRESS_INTERVAL = 1.0
+# Minimum gap between two progress-bar edits. Telegram allows ~30
+# edits per minute per message — 0.4s keeps us comfortably under the
+# limit while still feeling live to the user.
+PROGRESS_MIN_EDIT_INTERVAL = 0.4
 YOUTUBE_SEARCH_TTL = 10 * 60
 YOUTUBE_SEARCH_RATE_LIMIT = 5
 YOUTUBE_SEARCH_RATE_WINDOW = 60.0
@@ -471,14 +475,25 @@ class ProgressReporter:
         self.upload_rate = float(DEFAULT_UPLOAD_RATE)
         self.last_edit = 0.0
         self.last_percent = -1
+        # High-water mark — the bar NEVER goes backwards. Once we reach
+        # 40% (e.g. download done, entering upload phase) we won't drop
+        # back to 12% even if a downstream callback fires an old value.
+        self.max_percent = -1
         self.lock = asyncio.Lock()
 
     async def update(self, percent: int, title: str, detail: str = "", *, force: bool = False) -> None:
         value = max(0, min(100, int(percent)))
         now = time.monotonic()
+        # Never go backwards. The download→upload→processing transitions
+        # can fire out-of-order callbacks (e.g. a stale download progress
+        # arriving after the upload has already begun); clamp to max_percent.
+        if value < self.max_percent:
+            value = self.max_percent
+        else:
+            self.max_percent = value
         if not force and value == self.last_percent:
             return
-        if not force and now - self.last_edit < 1.0 and value < 100:
+        if not force and now - self.last_edit < PROGRESS_MIN_EDIT_INTERVAL and value < 100:
             return
         async with self.lock:
             await edit_status(
@@ -1640,7 +1655,7 @@ async def _process_url(
             chat_id,
             status_card(
                 "🙃 این لینک رو نمی‌شناسم",
-                "فعلاً لینک‌های اینستاگرام، یوتیوب، تیک‌تاک، توییتر/X، فیسبوک، VK، اسپاتیفای و ساوندکلاد رو بفرست.",
+                "لینک رو درست بفرست — باید با <code>http://</code> یا <code>https://</code> شروع بشه.",
             ),
             reply_to,
         )
@@ -1649,11 +1664,22 @@ async def _process_url(
     is_spotify_collection = platform == Platform.SPOTIFY and spotify_collection_type in {"album", "playlist"}
     normal_providers = () if is_spotify_collection else providers_for_platform(platform, SETTINGS)
     providers = tuple(dict.fromkeys((*normal_providers, *all_providers(SETTINGS))))
-    if not providers:
+    # Platforms handled entirely by SOCIAL_GATEWAY (Pinterest, generic
+    # yt-dlp URLs) have NO Telegram fallback. Don't bail out just because
+    # `providers` is empty — we'll try yt-dlp first and only fail later
+    # if yt-dlp also fails.
+    _social_only = platform in {
+        Platform.PINTEREST,
+        Platform.YTDLP_GENERIC,
+    }
+    if not providers and not is_spotify_collection and not _social_only:
         STATS.failed += 1
         return
     info = platform_info(platform)
-    if not is_spotify_collection and ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
+    # Platforms that don't need a Telegram worker (handled entirely by
+    # SOCIAL_GATEWAY) skip the queue / pool availability checks so users
+    # can download even when no Telegram account is configured.
+    if not is_spotify_collection and not _social_only and ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
         STATS.failed += 1
         await send_status(
             context,
@@ -1662,7 +1688,7 @@ async def _process_url(
             reply_to,
         )
         return
-    if not is_spotify_collection and ACCOUNT_POOL.total == 0:
+    if not is_spotify_collection and not _social_only and ACCOUNT_POOL.total == 0:
         STATS.failed += 1
         await send_status(
             context,
@@ -1981,14 +2007,25 @@ async def _process_url(
             cleanup_request_directory(sites_attempt_dir, SETTINGS.download_root)
             reasons.append(sites_result.reason or "sites_error")
 
-        # ── TikTok / SoundCloud / Instagram: try the social gateway FIRST ──
+        # ── Social-gateway platforms (TikTok / SoundCloud / Instagram /
+        # Pinterest / Twitter / Facebook / generic yt-dlp URLs): try the
+        # social gateway FIRST ──
         # The social gateway uses tikwm.com for TikTok, yt-dlp for
-        # SoundCloud (no auth needed), and yt-dlp+cookies for Instagram.
-        # It does not need a Telegram worker. If Instagram has no cookies
-        # file, the gateway returns `instagram_no_cookies` immediately
-        # and we fall through to the Telegram downloader bots below.
+        # SoundCloud (no auth), yt-dlp+cookies for Instagram / Pinterest /
+        # Twitter / Facebook, and yt-dlp for anything else. It does not
+        # need a Telegram worker. If Instagram has no cookies file, the
+        # gateway returns `instagram_no_cookies` immediately and we fall
+        # through to the Telegram downloader bots below.
         if (
-            platform in {Platform.TIKTOK, Platform.SOUNDCLOUD, Platform.INSTAGRAM}
+            platform in {
+                Platform.TIKTOK,
+                Platform.SOUNDCLOUD,
+                Platform.INSTAGRAM,
+                Platform.PINTEREST,
+                Platform.TWITTER,
+                Platform.FACEBOOK,
+                Platform.YTDLP_GENERIC,
+            }
             and SOCIAL_GATEWAY is not None
             and not is_spotify_collection
         ):
@@ -2122,14 +2159,25 @@ async def _process_url(
                 "social gateway failed for %s (reason=%s); falling back to Telegram bots",
                 request_id, social_result.reason,
             )
+            cleanup_request_directory(social_attempt_dir, SETTINGS.download_root)
+            reasons.append(social_result.reason or "social_error")
+            # Pinterest and generic yt-dlp URLs have NO Telegram fallback
+            # (no dedicated downloader bots exist for them). If providers
+            # is empty, surface a clean error to the user instead of
+            # trying to acquire a Telegram worker we'll never use.
+            if not providers:
+                await edit_status(
+                    status_message,
+                    failure_text(reasons, request_id),
+                )
+                STATS.failed += 1
+                return
             await progress.update(
                 20,
                 "🔄 سرویس آنلاین جواب نداد، امتحان می‌کنم با بات‌های دانلود…",
                 f"{info.icon} {info.label} • مسیر جایگزین",
                 force=True,
             )
-            cleanup_request_directory(social_attempt_dir, SETTINGS.download_root)
-            reasons.append(social_result.reason or "social_error")
 
         lease = await asyncio.wait_for(
             ACCOUNT_POOL.acquire(),
@@ -2961,14 +3009,25 @@ def _is_admin(user: Any) -> bool:
     return bool(user and (user.username or "").lower() == ADMIN_USERNAME.lower())
 
 
+_BROADCAST_PREFIX_RE = re.compile(r"^\s*/broadcast(?:@\w+)?\s*", re.IGNORECASE)
+
+
 def _strip_broadcast_command(text: str) -> str:
-    """Remove the /broadcast (or /broadcast@botname) prefix and return the rest."""
+    """Remove the /broadcast (or /broadcast@botname) prefix and return the rest.
+
+    Handles edge cases the old `split(None, 1)` approach missed:
+      - Leading whitespace before the command
+      - /broadcast@BotName (group form)
+      - /broadcast followed by a newline (no space)
+      - /BROADCAST (case-insensitive — Telegram allows this in private chats)
+      - Trailing whitespace/newlines after the message body
+    """
     if not text:
         return ""
-    parts = text.split(None, 1)
-    if len(parts) < 2:
-        return ""
-    return parts[1].strip()
+    # Strip the command prefix. If the entire text is JUST the command
+    # (with optional whitespace), return "".
+    stripped = _BROADCAST_PREFIX_RE.sub("", text, count=1)
+    return stripped.strip()
 
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2993,7 +3052,8 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     msg = update.effective_message
 
     # 1) Reply form: /broadcast as a reply to some other message -> copy that target
-    target_msg = msg.reply_to_message if msg.reply_to_message else msg
+    is_reply = msg.reply_to_message is not None
+    target_msg = msg.reply_to_message if is_reply else msg
 
     caption_text = _strip_broadcast_command(msg.text or msg.caption or "")
 
@@ -3001,6 +3061,13 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         getattr(target_msg, attr, None) is not None
         for attr in ("photo", "video", "audio", "voice", "document", "animation", "sticker")
     )
+
+    # Text-only broadcast path:
+    #   - Admin sent "/broadcast <text>" → broadcast the stripped text.
+    #   - Admin replied to a text message with "/broadcast" (no extra text)
+    #     → broadcast the replied message's text.
+    if not has_media and not caption_text and is_reply and target_msg.text:
+        caption_text = target_msg.text
 
     is_text_only = not has_media and bool(caption_text)
 
@@ -4019,10 +4086,10 @@ def main() -> None:
         Application.builder()
         .token(SETTINGS.bot_token)
         .concurrent_updates(SETTINGS.max_concurrent_updates)
-        .connect_timeout(30)
-        .read_timeout(90)
-        .write_timeout(90)
-        .media_write_timeout(180)
+        .connect_timeout(15)
+        .read_timeout(120)
+        .write_timeout(120)
+        .media_write_timeout(300)
         .pool_timeout(30)
         .post_init(post_init)
         .post_shutdown(post_shutdown)

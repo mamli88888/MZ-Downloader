@@ -1,22 +1,24 @@
-"""SocialSitesGateway — multi-platform scraper gateway for TikTok,
-SoundCloud, and Instagram.
+"""SocialSitesGateway — multi-platform scraper gateway.
 
-Why this exists
----------------
+Supported platforms
+-------------------
+  - TikTok      → tikwm.com (free public API, returns direct CDN URLs)
+  - SoundCloud  → yt-dlp (works without auth)
+  - Instagram   → yt-dlp with optional cookies (falls back to Telegram
+                  bots via the `instagram_no_cookies` reason if absent)
+  - Pinterest   → yt-dlp with optional cookies
+  - Twitter/X   → yt-dlp with optional cookies
+  - Facebook    → yt-dlp with optional cookies
+  - Generic     → yt-dlp for anything else it supports (Vimeo,
+                  Dailymotion, Streamable, Reddit, Twitch, …)
+
+Why yt-dlp
+----------
 The youtube_sites_gateway scrapes the loader.to / savenow.to backend,
 which works perfectly for YouTube but FAILS for TikTok, SoundCloud, and
-Instagram — the backend accepts the URL and returns an id, but the
-extraction phase always ends with `text='Failed'` and no download_url.
-The sister frontends (downcloud.cc / downtik.to / igdown.io) are just
-branded skins over the same broken backend.
-
-So we need a separate gateway that uses real working scrapers per
-platform:
-
-  - TikTok     → tikwm.com (free public API, returns direct CDN URLs)
-  - SoundCloud → yt-dlp (works without auth)
-  - Instagram  → yt-dlp with optional cookies (falls back to Telegram
-                 bots via the `unsupported` reason if no cookies)
+Instagram. Sister frontends (downcloud.cc / downtik.to / igdown.io) are
+just branded skins over the same broken backend. So we use real working
+backends per platform: tikwm.com for TikTok, yt-dlp for everything else.
 
 API contract with the bot
 -------------------------
@@ -25,10 +27,11 @@ menu (needs_selection) or a ready file; `select()` performs the actual
 download. Both return `GatewayResult` (defined in downloader.py).
 
 The bot routes by platform — it calls SocialSitesGateway for TikTok /
-SoundCloud / Instagram and YouTubeSitesGateway for YouTube. If
-SocialSitesGateway returns `status='error'` with `reason='unsupported'`
-or `reason='no_cookies'`, the bot falls back to Telegram downloader
-bots (the existing `providers_for_platform` path).
+SoundCloud / Instagram / Pinterest / Twitter / Facebook / generic
+yt-dlp URLs, and YouTubeSitesGateway for YouTube. If SocialSitesGateway
+returns `status='error'` with `reason='unsupported'` or `reason='no_cookies'`,
+the bot falls back to Telegram downloader bots (the existing
+`providers_for_platform` path).
 """
 
 from __future__ import annotations
@@ -198,6 +201,40 @@ INSTAGRAM_QUALITIES: tuple[tuple[str, int | None, str, str | None, str], ...] = 
     ("صدا (MP3)",          None, "audio", "128", "audio"),
 )
 
+PINTEREST_QUALITIES: tuple[tuple[str, int | None, str, str | None, str], ...] = (
+    ("ویدیو (بهترین کیفیت)", 1080, "video", None, "video"),
+    ("صدا (MP3)",            None, "audio", "128", "audio"),
+)
+
+TWITTER_QUALITIES: tuple[tuple[str, int | None, str, str | None, str], ...] = (
+    ("ویدیو (بهترین کیفیت)", 1080, "video", None, "video"),
+    ("صدا (MP3)",            None, "audio", "128", "audio"),
+)
+
+FACEBOOK_QUALITIES: tuple[tuple[str, int | None, str, str | None, str], ...] = (
+    ("ویدیو (HD)",   1080, "video", None, "video"),
+    ("ویدیو (SD)",    480, "video", None, "video_sd"),
+    ("صدا (MP3)",    None, "audio", "128", "audio"),
+)
+
+# Generic yt-dlp quality menu — used for Vimeo, Dailymotion, Streamable,
+# Reddit, Twitch, and any other URL yt-dlp supports.
+GENERIC_QUALITIES: tuple[tuple[str, int | None, str, str | None, str], ...] = (
+    ("ویدیو (بهترین کیفیت)", 1080, "video", None, "video"),
+    ("ویدیو ۷۲۰p",            720, "video", None, "video_720"),
+    ("ویدیو ۴۸۰p",            480, "video", None, "video_480"),
+    ("صدا (MP3)",            None, "audio", "128", "audio"),
+)
+
+
+# Platforms whose yt-dlp extractor benefits from cookies. The shared
+# cookies.txt is offered to all of them; if it doesn't contain session
+# cookies for that platform yt-dlp will still try and may fail, after
+# which the bot falls back to Telegram downloader bots.
+_PLATFORMS_WANTING_COOKIES = frozenset({
+    "instagram", "pinterest", "twitter", "facebook", "ytdlp_generic",
+})
+
 
 # ----------------------------------------------------------------------
 # TikTok via tikwm.com
@@ -356,10 +393,19 @@ def _run_yt_dlp_sync(
     extract_audio: bool = False,
     audio_format: str | None = None,
     audio_quality: str | None = None,
+    max_download_size: int = 0,
+    progress_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run yt-dlp synchronously and return its info_dict.
 
     Raises `InvalidDownload` on yt-dlp errors.
+
+    Speed knobs:
+      - `concurrent_fragment_downloads=4` — DASH/HLS streams download in
+        parallel fragments (4x faster for big videos).
+      - `buffersize=1MiB` — bigger I/O buffer for less syscall overhead.
+      - `retries=3` + `fragment_retries=3` — quick retry on transient
+        CDN hiccups instead of failing immediately.
     """
     # Lazy import so the module loads even if yt-dlp isn't installed.
     from yt_dlp import YoutubeDL
@@ -375,7 +421,20 @@ def _run_yt_dlp_sync(
         "noplaylist": True,
         # Skip sponsor blocks etc. — we want the raw file.
         "postprocessors": [],
+        # Speed: download fragments in parallel.
+        "concurrent_fragment_downloads": 4,
+        # Bigger I/O buffer — less syscall overhead on large files.
+        "buffersize": 1024 * 1024,
+        # Quick retry on transient CDN errors.
+        "retries": 3,
+        "fragment_retries": 3,
+        # Don't abort the whole playlist if one entry fails (defensive —
+        # we always pass noplaylist=True so this is a no-op for single
+        # URLs, but keeps behavior sane if yt-dlp returns a playlist).
+        "ignoreerrors": False,
     }
+    if max_download_size > 0:
+        opts["max_filesize"] = max_download_size
     if extract_audio:
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
@@ -385,6 +444,8 @@ def _run_yt_dlp_sync(
         opts["format"] = "bestaudio/best"
     if cookies_path is not None:
         opts["cookiefile"] = str(cookies_path)
+    if progress_hook is not None:
+        opts["progress_hooks"] = [progress_hook]
     # Use a sane UA + impersonation (if available) to dodge bot detection.
     opts["http_headers"] = {
         "User-Agent": (
@@ -420,6 +481,8 @@ async def _run_yt_dlp(
     extract_audio: bool = False,
     audio_format: str | None = None,
     audio_quality: str | None = None,
+    max_download_size: int = 0,
+    progress_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Async wrapper around _run_yt_dlp_sync — runs in a thread."""
     return await asyncio.to_thread(
@@ -431,6 +494,8 @@ async def _run_yt_dlp(
         extract_audio=extract_audio,
         audio_format=audio_format,
         audio_quality=audio_quality,
+        max_download_size=max_download_size,
+        progress_hook=progress_hook,
     )
 
 
@@ -665,6 +730,158 @@ def _cleanup_part_files(attempt_directory: Path, keep: set[str]) -> None:
 
 
 # ----------------------------------------------------------------------
+# Generic yt-dlp downloader (Pinterest / Twitter / Facebook / generic)
+# ----------------------------------------------------------------------
+
+
+# Map quality `kind` to a yt-dlp format string. `kind` values are the
+# fifth element of each *_QUALITIES tuple entry.
+_FORMAT_SPECS: dict[str, str] = {
+    # Video — best MP4
+    "video": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
+    # Video at 720p
+    "video_720": (
+        "best[height<=720][ext=mp4]/"
+        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+        "best[height<=720]/best"
+    ),
+    # Video at 480p
+    "video_480": (
+        "best[height<=480][ext=mp4]/"
+        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
+        "best[height<=480]/best"
+    ),
+    # Facebook SD (lower-bitrate variant)
+    "video_sd": (
+        "best[height<=480]/bestvideo[height<=480]+bestaudio/"
+        "worst[ext=mp4]/best"
+    ),
+}
+
+
+async def _ytdlp_generic_download(
+    *,
+    url: str,
+    kind: str,
+    file_prefix: str,
+    attempt_directory: Path,
+    progress_callback: ProgressCallback | None,
+    cookies_path: Path | None = None,
+    max_download_size: int = 0,
+    reason_prefix: str = "ytdlp",
+) -> GatewayResult:
+    """Generic yt-dlp downloader used by Pinterest / Twitter / Facebook /
+    generic yt-dlp URLs.
+
+    `kind` is one of: 'video', 'video_720', 'video_480', 'video_sd', 'audio'.
+    `file_prefix` is used to name the output file (e.g. 'pinterest',
+    'twitter', 'facebook', 'generic').
+    `reason_prefix` is used in error reason codes for logging clarity
+    (e.g. 'pinterest_extract_failed', 'twitter_no_file').
+    """
+    is_audio = kind == "audio"
+
+    if is_audio:
+        out_path = attempt_directory / f"{file_prefix}_%(id)s.mp3"
+        format_spec = "bestaudio/best"
+        try:
+            await _run_yt_dlp(
+                url,
+                out_path=out_path,
+                format_spec=format_spec,
+                cookies_path=cookies_path,
+                extract_audio=True,
+                audio_format="mp3",
+                audio_quality="0",
+                max_download_size=max_download_size,
+            )
+        except InvalidDownload as exc:
+            logger.warning("%s audio yt-dlp failed: %s", file_prefix, exc)
+            return GatewayResult(
+                status="error",
+                bot_username=SOCIAL_PROVIDER,
+                reason=f"{reason_prefix}_extract_failed",
+            )
+        except Exception as exc:
+            logger.warning("%s audio yt-dlp crashed: %s", file_prefix, exc)
+            return GatewayResult(
+                status="error",
+                bot_username=SOCIAL_PROVIDER,
+                reason=f"{reason_prefix}_extract_failed",
+            )
+        # Find the produced MP3
+        candidates = sorted(
+            attempt_directory.glob(f"{file_prefix}_*.mp3"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        if not candidates:
+            candidates = sorted(
+                attempt_directory.glob(f"{file_prefix}_*"),
+                key=lambda p: p.stat().st_mtime, reverse=True,
+            )
+        if not candidates:
+            return GatewayResult(
+                status="error",
+                bot_username=SOCIAL_PROVIDER,
+                reason=f"{reason_prefix}_no_file",
+            )
+        final_path = candidates[0]
+        media = _build_media(final_path, MediaKind.AUDIO)
+    else:
+        # Pick the format spec for the requested kind.
+        format_spec = _FORMAT_SPECS.get(kind, _FORMAT_SPECS["video"])
+        out_path = attempt_directory / f"{file_prefix}_%(id)s.mp4"
+        try:
+            info = await _run_yt_dlp(
+                url,
+                out_path=out_path,
+                format_spec=format_spec,
+                cookies_path=cookies_path,
+                max_download_size=max_download_size,
+            )
+        except InvalidDownload as exc:
+            logger.warning("%s video yt-dlp failed: %s", file_prefix, exc)
+            return GatewayResult(
+                status="error",
+                bot_username=SOCIAL_PROVIDER,
+                reason=f"{reason_prefix}_extract_failed",
+            )
+        except Exception as exc:
+            logger.warning("%s video yt-dlp crashed: %s", file_prefix, exc)
+            return GatewayResult(
+                status="error",
+                bot_username=SOCIAL_PROVIDER,
+                reason=f"{reason_prefix}_extract_failed",
+            )
+        # yt-dlp may produce a different container if MP4 isn't available
+        # (e.g. .webm). Fall back to any file matching the prefix.
+        candidates = sorted(
+            attempt_directory.glob(f"{file_prefix}_*.mp4"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        if not candidates:
+            candidates = sorted(
+                attempt_directory.glob(f"{file_prefix}_*"),
+                key=lambda p: p.stat().st_mtime, reverse=True,
+            )
+        if not candidates:
+            return GatewayResult(
+                status="error",
+                bot_username=SOCIAL_PROVIDER,
+                reason=f"{reason_prefix}_no_file",
+            )
+        final_path = candidates[0]
+        media = _build_media(final_path, MediaKind.VIDEO)
+
+    _cleanup_part_files(attempt_directory, keep={final_path.name})
+    return GatewayResult(
+        status="ready",
+        bot_username=SOCIAL_PROVIDER,
+        media=(media,),
+    )
+
+
+# ----------------------------------------------------------------------
 # Gateway class
 # ----------------------------------------------------------------------
 
@@ -674,7 +891,12 @@ class SocialSitesError(RuntimeError):
 
 
 class SocialSitesGateway:
-    """Multi-platform scraper gateway for TikTok / SoundCloud / Instagram."""
+    """Multi-platform scraper gateway.
+
+    Supported platforms: TikTok (tikwm.com), SoundCloud (yt-dlp, no
+    cookies), Instagram (yt-dlp + cookies), Pinterest / Twitter / Facebook
+    / generic (yt-dlp + optional cookies).
+    """
 
     def __init__(
         self,
@@ -683,6 +905,11 @@ class SocialSitesGateway:
         max_download_size: int = 0,
         http_timeout: float = 30.0,
     ) -> None:
+        # Single shared cookies path used for every yt-dlp-backed platform.
+        # Instagram historically required this file; Pinterest / Twitter /
+        # Facebook will use it opportunistically (if the file contains
+        # session cookies for them, yt-dlp will succeed; otherwise it will
+        # fail and the bot falls back to Telegram downloader bots).
         self.instagram_cookies_path = instagram_cookies_path
         self.max_download_size = max_download_size
         self.http_timeout = http_timeout
@@ -775,6 +1002,14 @@ class SocialSitesGateway:
                     reason="instagram_no_cookies",
                 )
             qualities = INSTAGRAM_QUALITIES
+        elif platform == Platform.PINTEREST:
+            qualities = PINTEREST_QUALITIES
+        elif platform == Platform.TWITTER:
+            qualities = TWITTER_QUALITIES
+        elif platform == Platform.FACEBOOK:
+            qualities = FACEBOOK_QUALITIES
+        elif platform == Platform.YTDLP_GENERIC:
+            qualities = GENERIC_QUALITIES
         else:
             return GatewayResult(
                 status="error",
@@ -934,7 +1169,7 @@ class SocialSitesGateway:
             # Report "processing" since yt-dlp can take 10-30s.
             if processing_callback is not None:
                 try:
-                    await processing_callback(15, "⚙️ دارم پردازش می‌کنم…", "استخراج از SoundCloud", )
+                    await processing_callback(15, "⚙️ دارم پردازش می‌کنم…", "استخراج از SoundCloud")
                 except Exception:
                     pass
             return await _soundcloud_download(
@@ -947,7 +1182,7 @@ class SocialSitesGateway:
         if platform == Platform.INSTAGRAM:
             if processing_callback is not None:
                 try:
-                    await processing_callback(15, "⚙️ دارم پردازش می‌کنم…", "استخراج از Instagram", )
+                    await processing_callback(15, "⚙️ دارم پردازش می‌کنم…", "استخراج از Instagram")
                 except Exception:
                     pass
             return await _instagram_download(
@@ -956,6 +1191,72 @@ class SocialSitesGateway:
                 attempt_directory=attempt_directory,
                 progress_callback=progress_callback,
                 cookies_path=self.instagram_cookies_path,
+            )
+        # New yt-dlp-backed platforms — Pinterest / Twitter / Facebook /
+        # generic. They share the same cookies.txt and download path.
+        if platform == Platform.PINTEREST:
+            if processing_callback is not None:
+                try:
+                    await processing_callback(15, "⚙️ دارم پردازش می‌کنم…", "استخراج از Pinterest")
+                except Exception:
+                    pass
+            return await _ytdlp_generic_download(
+                url=url,
+                kind=kind,
+                file_prefix="pinterest",
+                attempt_directory=attempt_directory,
+                progress_callback=progress_callback,
+                cookies_path=self.instagram_cookies_path,
+                max_download_size=self.max_download_size,
+                reason_prefix="pinterest",
+            )
+        if platform == Platform.TWITTER:
+            if processing_callback is not None:
+                try:
+                    await processing_callback(15, "⚙️ دارم پردازش می‌کنم…", "استخراج از X / توییتر")
+                except Exception:
+                    pass
+            return await _ytdlp_generic_download(
+                url=url,
+                kind=kind,
+                file_prefix="twitter",
+                attempt_directory=attempt_directory,
+                progress_callback=progress_callback,
+                cookies_path=self.instagram_cookies_path,
+                max_download_size=self.max_download_size,
+                reason_prefix="twitter",
+            )
+        if platform == Platform.FACEBOOK:
+            if processing_callback is not None:
+                try:
+                    await processing_callback(15, "⚙️ دارم پردازش می‌کنم…", "استخراج از Facebook")
+                except Exception:
+                    pass
+            return await _ytdlp_generic_download(
+                url=url,
+                kind=kind,
+                file_prefix="facebook",
+                attempt_directory=attempt_directory,
+                progress_callback=progress_callback,
+                cookies_path=self.instagram_cookies_path,
+                max_download_size=self.max_download_size,
+                reason_prefix="facebook",
+            )
+        if platform == Platform.YTDLP_GENERIC:
+            if processing_callback is not None:
+                try:
+                    await processing_callback(15, "⚙️ دارم پردازش می‌کنم…", "استخراج با yt-dlp")
+                except Exception:
+                    pass
+            return await _ytdlp_generic_download(
+                url=url,
+                kind=kind,
+                file_prefix="generic",
+                attempt_directory=attempt_directory,
+                progress_callback=progress_callback,
+                cookies_path=self.instagram_cookies_path,
+                max_download_size=self.max_download_size,
+                reason_prefix="ytdlp",
             )
         return GatewayResult(
             status="error",

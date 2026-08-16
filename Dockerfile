@@ -6,6 +6,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# ffmpeg is required by yt-dlp's FFmpegExtractAudio postprocessor (used
+# by SoundCloud / Pinterest / Twitter / Facebook / generic audio downloads).
+# Without it, yt-dlp can download video but cannot convert to MP3.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && adduser --disabled-password --gecos "" appuser \

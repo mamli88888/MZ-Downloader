@@ -8,13 +8,15 @@ Pillow==12.3.0
 # yt-dlp is used by:
 #   - youtube_search.py for /music search and for estimating file sizes
 #     shown next to quality buttons (both have fallbacks).
-#   - social_gateway.py for SoundCloud and Instagram downloads.
+#   - social_gateway.py for SoundCloud / Instagram / Pinterest / Twitter /
+#     Facebook / generic downloads.
 # YouTube DOWNLOADS do NOT use yt-dlp — they go through the
 # youtube_sites_gateway (loader.to scraper) instead.
 yt-dlp==2026.7.4
 # curl_cffi enables yt-dlp's browser impersonation (Chrome), which
-# SoundCloud and (with cookies) Instagram require to dodge bot detection.
-# Without it, yt-dlp falls back to plain requests and may get blocked.
+# SoundCloud, Pinterest, Twitter, Facebook, and (with cookies) Instagram
+# require to dodge bot detection. Without it, yt-dlp falls back to plain
+# requests and may get blocked.
 curl_cffi==0.15.0
 shazamio==0.8.1
 pycryptodome==3.23.0
