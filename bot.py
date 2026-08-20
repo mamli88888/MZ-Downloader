@@ -892,6 +892,28 @@ async def send_status(
         )
 
 
+async def _ensure_sticker_ids(
+    context: ContextTypes.DEFAULT_TYPE,
+    count: int = 5,
+) -> None:
+    """Populate FEEDBACK_STICKER_IDS if not yet cached (or if more are needed)."""
+    global FEEDBACK_STICKER_IDS
+    if len(FEEDBACK_STICKER_IDS) >= count:
+        return
+    try:
+        sticker_set = await asyncio.wait_for(
+            context.bot.get_sticker_set(FEEDBACK_STICKER_SET),
+            timeout=8.0,
+        )
+        FEEDBACK_STICKER_IDS = tuple(
+            sticker.file_id
+            for sticker in getattr(sticker_set, "stickers", ())[:count]
+            if getattr(sticker, "file_id", None)
+        )
+    except (asyncio.TimeoutError, TelegramError):
+        pass
+
+
 async def send_link_feedback(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -900,18 +922,8 @@ async def send_link_feedback(
     valid: bool,
 ) -> None:
     """Reply with the matching sticker without ever blocking link processing."""
-    global FEEDBACK_STICKER_IDS
     try:
-        if len(FEEDBACK_STICKER_IDS) < 2:
-            sticker_set = await asyncio.wait_for(
-                context.bot.get_sticker_set(FEEDBACK_STICKER_SET),
-                timeout=8.0,
-            )
-            FEEDBACK_STICKER_IDS = tuple(
-                sticker.file_id
-                for sticker in getattr(sticker_set, "stickers", ())[:2]
-                if getattr(sticker, "file_id", None)
-            )
+        await _ensure_sticker_ids(context)
         index = 0 if valid else 1
         if len(FEEDBACK_STICKER_IDS) <= index:
             return
@@ -923,6 +935,28 @@ async def send_link_feedback(
                 reply_to_message_id=reply_to,
             )
 
+        await telegram_retry(send)
+    except (asyncio.TimeoutError, TelegramError) as exc:
+        logger.debug("Feedback sticker could not be sent: %s", exc)
+
+
+async def send_feedback_sticker(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    index: int,
+    reply_to: int | None = None,
+) -> None:
+    """Send a sticker from the feedback set by zero-based index (non-blocking)."""
+    try:
+        await _ensure_sticker_ids(context)
+        if len(FEEDBACK_STICKER_IDS) <= index:
+            return
+        async def send() -> None:
+            await context.bot.send_sticker(
+                chat_id=chat_id,
+                sticker=FEEDBACK_STICKER_IDS[index],
+                reply_to_message_id=reply_to,
+            )
         await telegram_retry(send)
     except (asyncio.TimeoutError, TelegramError) as exc:
         logger.debug("Feedback sticker could not be sent: %s", exc)
@@ -1551,6 +1585,7 @@ async def send_result_to_user(
                 f"تعداد فایل: <b>{len(media)}</b> • حجم کل: <b>{fmt_size(total_size)}</b>{quality_line}",
             ),
         )
+    await send_feedback_sticker(context, chat_id, index=3)
 
 
 def failure_text(reasons: list[str], request_id: str) -> str:
@@ -2171,6 +2206,7 @@ async def _process_url(
                     failure_text(reasons, request_id),
                 )
                 STATS.failed += 1
+                await send_feedback_sticker(context, chat_id, index=4)
                 return
             await progress.update(
                 20,
@@ -2409,12 +2445,14 @@ async def _process_url(
 
         STATS.failed += 1
         await edit_status(status_message, failure_text(reasons, request_id))
+        await send_feedback_sticker(context, chat_id, index=4)
     except (PoolUnavailable, asyncio.TimeoutError):
         STATS.failed += 1
         await edit_status(
             status_message,
             status_card("🛠 بخش دانلود آماده نیست", "لطفاً کمی بعد دوباره امتحان کن."
         ))
+        await send_feedback_sticker(context, chat_id, index=4)
     except asyncio.CancelledError:
         await edit_status(
             status_message,
@@ -2432,6 +2470,7 @@ async def _process_url(
 
             ),
         )
+        await send_feedback_sticker(context, chat_id, index=4)
     finally:
         if caption_task is not None:
             if not caption_task.done():
@@ -3002,6 +3041,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+    )
+    await send_feedback_sticker(
+        context, update.effective_chat.id, index=2,
     )
 
 
@@ -3597,6 +3639,7 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 failure_text([result.reason or "service_error"], session.request_id),
                 parse_mode=ParseMode.HTML,
             )
+            await send_feedback_sticker(context, session.chat_id, index=4)
             return
         await send_result_to_user(
             update,
@@ -3639,6 +3682,8 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 ),
                 parse_mode=ParseMode.HTML,
             )
+        with contextlib.suppress(Exception):
+            await send_feedback_sticker(context, session.chat_id, index=4)
     finally:
         release_pending_selection(session)
 
