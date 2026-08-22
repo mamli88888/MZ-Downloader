@@ -137,7 +137,13 @@ def _validate_username(username: str) -> str:
     return cleaned
 
 
-async def _ig_api_get(path: str, *, proxy_url: str | None = None, referer: str = "") -> httpx.Response:
+async def _ig_api_get(
+    path: str,
+    *,
+    proxy_url: str | None = None,
+    referer: str = "",
+    _authenticated: bool = False,
+) -> httpx.Response:
     """Call an Instagram API endpoint.
 
     Strategy:
@@ -146,9 +152,10 @@ async def _ig_api_get(path: str, *, proxy_url: str | None = None, referer: str =
       3. curl_cffi without cookies (works from residential IPs)
       4. httpx     without cookies (last resort)
 
-    Stories / reels endpoints REQUIRE the ``x-csrftoken`` header set to
-    the ``csrftoken`` cookie value — without it Instagram returns HTML
-    instead of JSON even with valid sessionid cookies.
+    Set ``_authenticated=True`` for stories/reels endpoints — this adds
+    the ``x-csrftoken`` and ``x-ig-ajax`` headers that Instagram requires
+    for those endpoints.  Do NOT use it for ``web_profile_info`` which
+    returns 429 when those headers are present.
     """
     url = f"https://www.instagram.com{path}"
     cookies_dict = None
@@ -159,12 +166,14 @@ async def _ig_api_get(path: str, *, proxy_url: str | None = None, referer: str =
         except Exception as exc:
             logger.warning("cookies.txt parse failed: %s", exc)
 
-    # Build headers with x-csrftoken from cookies (critical for stories API)
-    headers = {**_BASE_HEADERS, "Referer": referer, "X-Ig-Ajax": "1"}
-    csrf_token = (cookies_dict or {}).get("csrftoken", "")
-    if csrf_token:
-        headers["X-Csrftoken"] = csrf_token
-        logger.debug("_ig_api_get: x-csrftoken set from cookies (%s…)", csrf_token[:8])
+    headers = {**_BASE_HEADERS, "Referer": referer}
+    csrf_token = ""
+    if _authenticated:
+        headers["X-Ig-Ajax"] = "1"
+        csrf_token = (cookies_dict or {}).get("csrftoken", "")
+        if csrf_token:
+            headers["X-Csrftoken"] = csrf_token
+            logger.debug("_ig_api_get: x-csrftoken set from cookies (%s…)", csrf_token[:8])
 
     # 1 & 3 — curl_cffi
     if _CURL_CFFI:
@@ -187,17 +196,14 @@ async def _ig_api_get(path: str, *, proxy_url: str | None = None, referer: str =
                 if cookies_dict:
                     for name, value in cookies_dict.items():
                         s.cookies.set(name, value, domain=".instagram.com")
-                # If cookies had no csrftoken, try to pick one from the
-                # session (set during the homepage visit or by ig itself).
-                if not csrf_token:
-                    session_csrf = None
+                # If authenticated but no csrftoken in cookies file,
+                # try to grab one from the session cookie jar.
+                if _authenticated and not csrf_token:
                     for c in s.cookies:
                         if c.name == "csrftoken":
-                            session_csrf = c.value
+                            headers["X-Csrftoken"] = c.value
+                            logger.debug("_ig_api_get: x-csrftoken from session cookie")
                             break
-                    if session_csrf:
-                        headers["X-Csrftoken"] = session_csrf
-                        logger.debug("_ig_api_get: x-csrftoken from session cookie")
                 resp = await s.get(url, headers=headers)
                 return _resp(resp)
         except Exception as exc:
@@ -214,13 +220,6 @@ async def _ig_api_get(path: str, *, proxy_url: str | None = None, referer: str =
     ) as client:
         try:
             resp = await client.get(url)
-            # If we didn't have csrftoken in our cookies file, httpx may
-            # have picked one up from a Set-Cookie response — update header.
-            if not csrf_token:
-                for c_name, c_val in client.cookies.items():
-                    if c_name == "csrftoken":
-                        logger.debug("_ig_api_get: x-csrftoken from httpx cookie jar")
-                        break
             return resp
         except httpx.HTTPError as exc:
             raise InstagramProfileError(f"خطا در دریافت: {exc}") from exc
@@ -431,6 +430,7 @@ async def fetch_stories(
         f"/api/v1/feed/user/{_profile.user_id}/story/",
         proxy_url=proxy_url,
         referer=f"https://www.instagram.com/{username}/",
+        _authenticated=True,
     )
 
     logger.info(
@@ -466,6 +466,7 @@ async def fetch_stories(
             "/api/v1/feed/reels_tray/",
             proxy_url=proxy_url,
             referer=f"https://www.instagram.com/{username}/",
+            _authenticated=True,
         )
         if resp2.status_code == 200:
             stories = _parse_reels_tray(resp2, _profile.user_id)
@@ -493,6 +494,7 @@ async def fetch_stories(
             f"/graphql/query/?query_hash=cb0d0479eba6b93c5114e3269cb0f1f3&variables=%7B%22reel_ids%22%3A%5B%22{_profile.user_id}%22%5D%2C%22precomposed_overlay%22%3Afalse%7D",
             proxy_url=proxy_url,
             referer=f"https://www.instagram.com/stories/{username}/",
+            _authenticated=True,
         )
         if gql_resp.status_code == 200:
             stories = _parse_stories_response(gql_resp)
