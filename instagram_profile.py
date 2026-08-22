@@ -43,7 +43,7 @@ def _proxy_url() -> str | None:
 
 def _cookies_path() -> str | None:
     from config import PROJECT_DIR
-    p = PROJECT_DIR / "cookies.txt"
+    p = PROJECT_DIR / "cookiesins.txt"
     return str(p) if p.exists() else None
 
 
