@@ -394,31 +394,158 @@ async def fetch_stories(
         logger.warning("No user-id for @%s; cannot fetch stories", username)
         return []
 
+    logger.info(
+        "fetch_stories: user=@%s user_id=%s", username, _profile.user_id
+    )
+
+    # ── Try the primary endpoint ───────────────────────────────────
     resp = await _ig_api_get(
         f"/api/v1/feed/user/{_profile.user_id}/story/",
         proxy_url=proxy_url,
         referer=f"https://www.instagram.com/{username}/",
     )
 
+    logger.info(
+        "fetch_stories: status=%d body_len=%d",
+        resp.status_code,
+        len(resp.text),
+    )
     if resp.status_code != 200:
-        logger.warning("Stories API returned %d for @%s", resp.status_code, username)
+        logger.warning(
+            "Stories API returned %d for @%s – body: %.500s",
+            resp.status_code,
+            username,
+            resp.text[:500],
+        )
+        # Don't give up yet – try the alternative endpoint below
+    else:
+        stories = _parse_stories_response(resp)
+        if stories:
+            logger.info("fetch_stories: got %d stories (primary endpoint)", len(stories))
+            return stories
+        # Primary returned 200 but no stories – could be empty or bad format
+        logger.info(
+            "fetch_stories: primary endpoint returned 0 stories, body: %.800s",
+            resp.text[:800],
+        )
+
+    # ── Fallback: try the highlight/tray endpoint ──────────────────
+    # /api/v1/feed/reels_tray/ returns all visible story reels including
+    # the target user (if they have active stories).
+    logger.info("fetch_stories: trying fallback reels_tray endpoint")
+    try:
+        resp2 = await _ig_api_get(
+            "/api/v1/feed/reels_tray/",
+            proxy_url=proxy_url,
+            referer=f"https://www.instagram.com/{username}/",
+        )
+        if resp2.status_code == 200:
+            stories = _parse_reels_tray(resp2, _profile.user_id)
+            if stories:
+                logger.info(
+                    "fetch_stories: got %d stories (reels_tray fallback)",
+                    len(stories),
+                )
+                return stories
+            logger.info(
+                "fetch_stories: reels_tray returned 0 stories, body: %.800s",
+                resp2.text[:800],
+            )
+        else:
+            logger.warning(
+                "fetch_stories: reels_tray returned %d", resp2.status_code
+            )
+    except Exception as exc:
+        logger.warning("fetch_stories: reels_tray fallback failed: %s", exc)
+
+    # ── Fallback 2: try graphql query ──────────────────────────────
+    logger.info("fetch_stories: trying graphql fallback")
+    try:
+        gql_resp = await _ig_api_get(
+            f"/graphql/query/?query_hash=cb0d0479eba6b93c5114e3269cb0f1f3&variables=%7B%22reel_ids%22%3A%5B%22{_profile.user_id}%22%5D%2C%22precomposed_overlay%22%3Afalse%7D",
+            proxy_url=proxy_url,
+            referer=f"https://www.instagram.com/stories/{username}/",
+        )
+        if gql_resp.status_code == 200:
+            stories = _parse_stories_response(gql_resp)
+            if stories:
+                logger.info(
+                    "fetch_stories: got %d stories (graphql fallback)", len(stories)
+                )
+                return stories
+            logger.info(
+                "fetch_stories: graphql returned 0 stories, body: %.800s",
+                gql_resp.text[:800],
+            )
+        else:
+            logger.warning(
+                "fetch_stories: graphql returned %d", gql_resp.status_code
+            )
+    except Exception as exc:
+        logger.warning("fetch_stories: graphql fallback failed: %s", exc)
+
+    logger.warning("fetch_stories: all endpoints returned 0 stories for @%s", username)
+    return []
+
+
+def _parse_stories_response(resp) -> list[InstagramStory]:
+    """Parse a stories API response, handling multiple formats.
+
+    Known formats:
+      {"data": {"reels_media": [{"items": [...]}]}}
+      {"reels_media": [{"items": [...]}]}
+      {"data": {"user": {"edge_highlight_reels": ...}}}
+    """
+    try:
+        data = resp.json()
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("_parse_stories_response: invalid JSON")
         return []
 
+    # Try multiple paths to find reels_media
+    reels_media = (
+        data.get("reels_media")
+        or data.get("data", {}).get("reels_media")
+        or []
+    )
+
+    return _extract_stories_from_reels(reels_media)
+
+
+def _parse_reels_tray(resp, target_user_id: str) -> list[InstagramStory]:
+    """Parse /api/v1/feed/reels_tray/ and filter for one user."""
     try:
         data = resp.json()
     except (json.JSONDecodeError, ValueError):
         return []
 
-    items = data.get("data", {}).get("reels_media", [])
-    if not items:
-        return []
+    tray = (
+        data.get("tray")
+        or data.get("data", {}).get("tray")
+        or []
+    )
 
+    for reel in tray:
+        reel_user = reel.get("user", {})
+        if str(reel_user.get("pk", "")) == str(target_user_id) or \
+           reel_user.get("username", "") == str(target_user_id):
+            items = reel.get("items", [])
+            stories = _extract_stories_from_reels([reel])
+            if stories:
+                return stories
+
+    return []
+
+
+def _extract_stories_from_reels(reels_media: list) -> list[InstagramStory]:
+    """Extract InstagramStory list from a reels_media array."""
     stories: list[InstagramStory] = []
-    for reel in items:
+    for reel in reels_media:
         for item in reel.get("items", []):
             is_video = bool(item.get("video_versions"))
             media_type = "video" if is_video else "photo"
 
+            url = ""
             if is_video:
                 versions = item.get("video_versions", [])
                 if versions:
@@ -427,21 +554,29 @@ async def fetch_stories(
                         reverse=True,
                     )
                     url = versions[0].get("url", "")
-                else:
+                if not url:
                     url = item.get("video_url", "")
             else:
-                candidates = item.get("image_versions2", {}).get("candidates", [])
+                candidates = (
+                    item.get("image_versions2", {}).get("candidates", [])
+                )
                 if candidates:
                     candidates.sort(
                         key=lambda v: v.get("width", 0) * v.get("height", 0),
                         reverse=True,
                     )
                     url = candidates[0].get("url", "")
-                else:
+                if not url:
                     url = item.get("display_url", "")
 
             if url:
                 stories.append(InstagramStory(url=url, media_type=media_type))
+            else:
+                logger.debug(
+                    "_extract_stories: item %s has no URL (video=%s)",
+                    item.get("id", "?"),
+                    is_video,
+                )
 
     return stories
 
