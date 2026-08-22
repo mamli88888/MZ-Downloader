@@ -74,6 +74,13 @@ class Settings:
     youtube_sites_frontends: tuple[str, ...]
     youtube_sites_progress_timeout: float
     youtube_sites_max_attempts: int
+    # Apify Actors for public YouTube and Instagram downloads. Tokens rotate
+    # when a token-side error, quota problem, or billing limit is reported.
+    apify_enabled: bool
+    apify_tokens: tuple[str, ...]
+    apify_run_timeout: float
+    apify_poll_interval: float
+    apify_token_cooldown: float
 
 
 def _as_bool(value: str | None, default: bool) -> bool:
@@ -229,6 +236,17 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         ),
         youtube_sites_progress_timeout=_as_float(env, "YOUTUBE_SITES_PROGRESS_TIMEOUT_SECONDS", 180.0, minimum=10.0),
         youtube_sites_max_attempts=_as_int(env, "YOUTUBE_SITES_MAX_ATTEMPTS", 6, minimum=1),
+        apify_enabled=_as_bool(env.get("APIFY_ENABLED"), True),
+        # APIFY_TOKEN remains accepted for backward compatibility. Prefer the
+        # comma-separated APIFY_TOKENS variable for rotation and failover.
+        apify_tokens=tuple(dict.fromkeys(
+            token.strip()
+            for token in (env.get("APIFY_TOKENS") or env.get("APIFY_TOKEN", "")).split(",")
+            if token.strip()
+        )),
+        apify_run_timeout=_as_float(env, "APIFY_RUN_TIMEOUT_SECONDS", 360.0, minimum=30.0),
+        apify_poll_interval=_as_float(env, "APIFY_POLL_INTERVAL_SECONDS", 3.0, minimum=0.2),
+        apify_token_cooldown=_as_float(env, "APIFY_TOKEN_COOLDOWN_SECONDS", 600.0, minimum=5.0),
         download_root=download_root,
         max_file_size=_as_int(env, "MAX_FILE_SIZE_MB", 30) * 1024 * 1024,
         # Zero disables the application-level source-size cap. Telegram upload

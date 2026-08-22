@@ -6,7 +6,7 @@
 
 ## مسیریابی
 
-- Instagram / YouTube: به‌ترتیب `allsaverbot`، `instadowbot`، `download_it_bot` و `AllSavesBot`
+- Instagram / YouTube: اگر `APIFY_TOKENS` تنظیم باشد، ابتدا منوی دکمه‌ای کیفیت یا فقط‌صدا از Apify نمایش داده می‌شود؛ YouTube با `streamers/youtube-video-downloader` و Instagram با `apify/instagram-scraper` اجرا می‌شوند. توکن‌ها چرخشی‌اند و در خطا سریع به توکن بعدی می‌روند. اگر Apify خطا دهد یا تنظیم نشده باشد، همان مسیرهای قبلیِ `allsaverbot`، `instadowbot`، `download_it_bot` و `AllSavesBot` به‌عنوان fallback اجرا می‌شوند.
 - TikTok: `download_it_bot` و سپس `AllSavesBot`
 - Twitter/X / Facebook / VK: فقط `download_it_bot`
 - Spotify track: فقط `spotifysavesbot`
@@ -53,6 +53,11 @@
 ```text
 BOT_TOKEN=...
 TELEGRAM_ACCOUNTS=[...]
+APIFY_ENABLED=true
+APIFY_TOKENS=token-اول,token-دوم
+APIFY_RUN_TIMEOUT_SECONDS=360
+APIFY_POLL_INTERVAL_SECONDS=3
+APIFY_TOKEN_COOLDOWN_SECONDS=600
 USE_PROXY=false
 DOWNLOAD_DIR=/tmp/mz-downloader
 MAX_FILE_SIZE_MB=30
@@ -71,6 +76,8 @@ TIKTOK_DOWNLOADER_BOTS=download_it_bot,AllSavesBot
 Railway متغیر `PORT` را خودش می‌سازد. مسیر `/health` پس از اتصال حداقل یک اکانت، پاسخ 200 می‌دهد.
 
 `MAX_DOWNLOAD_SIZE_MB=0` فقط سقف داخلی برنامه را غیرفعال می‌کند. فایل بزرگ‌تر از `MAX_FILE_SIZE_MB` روی Gofile آپلود می‌شود و کاربر لینک Cloudflare Worker را می‌گیرد؛ اگر تنظیمات Gofile/Worker ناقص باشد یا آپلود شکست بخورد، فایل طبق رفتار قبلی بخش‌بندی می‌شود.
+
+راهنمای کامل ساخت Token و تنظیم Actorهای Apify در [APIFY_SETUP_FA.md](APIFY_SETUP_FA.md) قرار دارد. Token را فقط در Variables سرویس نگه دارید و هرگز commit نکنید.
 
 ## راه‌اندازی Gofile با Cloudflare Worker
 

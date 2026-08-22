@@ -49,6 +49,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from config import ConfigError, PROJECT_DIR, SETTINGS
+from apify_gateway import APIFY_PROVIDER, ApifyGateway, apify_health_check
 import users_db
 from pixeldrain_upload import PixeldrainUploader, build_pixeldrain_worker_url
 from downloader import (
@@ -155,6 +156,20 @@ GATEWAY = DownloaderGateway(
         else None
     ),
 )
+# Apify Actors are an optional first-choice gateway for public YouTube and
+# Instagram URLs. APIFY_TOKENS is round-robin with failover on token-side
+# errors; all existing paths remain available as fallbacks.
+APIFY_GATEWAY: ApifyGateway | None = None
+if SETTINGS.apify_enabled and SETTINGS.apify_tokens:
+    APIFY_GATEWAY = ApifyGateway(
+        tokens=SETTINGS.apify_tokens,
+        run_timeout=SETTINGS.apify_run_timeout,
+        poll_interval=SETTINGS.apify_poll_interval,
+        token_cooldown=SETTINGS.apify_token_cooldown,
+        max_download_size=SETTINGS.max_download_size,
+    )
+logger.info("Apify gateway %s", apify_health_check(APIFY_GATEWAY))
+
 # YouTube-sites gateway: a rotational scraper over loader.to / loaderr.to /
 # y2mate.yt that does NOT need a Telegram account. When enabled, YouTube
 # URLs hit this gateway first; the Telegram downloader bots are only
@@ -267,6 +282,9 @@ class PendingSelection:
     # (TikTok via tikwm.com / SoundCloud via yt-dlp / Instagram via
     # yt-dlp-with-cookies) instead of GATEWAY.
     use_social_sites: bool = False
+    # True when the selected quality is fulfilled by APIFY_GATEWAY, which
+    # starts the Actor only after the user chooses a button.
+    use_apify: bool = False
     fallback_text: str = ""
     instagram_caption: str = ""
     caption_task: asyncio.Task[str] | None = None
@@ -1691,6 +1709,8 @@ async def _process_url(
     context: ContextTypes.DEFAULT_TYPE,
     url: str,
     reply_to: int | None,
+    *,
+    skip_apify: bool = False,
 ) -> None:
     request_id = uuid.uuid4().hex[:10]
     host = source_host(url)
@@ -1721,14 +1741,26 @@ async def _process_url(
         Platform.PINTEREST,
         Platform.YTDLP_GENERIC,
     }
-    if not providers and not is_spotify_collection and not _social_only:
+    # Apify can serve the two requested platforms without a Telethon worker.
+    # It is deliberately optional: when no APIFY_TOKEN is configured, all
+    # existing routing and fallback behavior is retained.
+    use_apify = not skip_apify and APIFY_GATEWAY is not None and platform in {
+        Platform.YOUTUBE,
+        Platform.INSTAGRAM,
+    }
+    if not providers and not is_spotify_collection and not _social_only and not use_apify:
         STATS.failed += 1
         return
     info = platform_info(platform)
     # Platforms that don't need a Telegram worker (handled entirely by
     # SOCIAL_GATEWAY) skip the queue / pool availability checks so users
     # can download even when no Telegram account is configured.
-    if not is_spotify_collection and not _social_only and ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
+    if (
+        not is_spotify_collection
+        and not _social_only
+        and not use_apify
+        and ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size
+    ):
         STATS.failed += 1
         await send_status(
             context,
@@ -1737,7 +1769,12 @@ async def _process_url(
             reply_to,
         )
         return
-    if not is_spotify_collection and not _social_only and ACCOUNT_POOL.total == 0:
+    if (
+        not is_spotify_collection
+        and not _social_only
+        and not use_apify
+        and ACCOUNT_POOL.total == 0
+    ):
         STATS.failed += 1
         await send_status(
             context,
@@ -1750,7 +1787,11 @@ async def _process_url(
         )
         return
 
-    queued = ACCOUNT_POOL.total > 0 and ACCOUNT_POOL.busy_count >= ACCOUNT_POOL.total
+    queued = (
+        not use_apify
+        and ACCOUNT_POOL.total > 0
+        and ACCOUNT_POOL.busy_count >= ACCOUNT_POOL.total
+    )
     initial = status_card(
         "⏳ لینک رفت توی صف" if queued else "🔎 بذار لینکت رو بررسی کنم…",
         (
@@ -1773,6 +1814,116 @@ async def _process_url(
     hold_lease = False
     reasons: list[str] = []
     try:
+        # ── Apify: choose first; start an Actor only after the click ─────
+        # This preserves the existing inline-button UX and avoids spending an
+        # Apify credit before the user has selected video quality or audio.
+        if use_apify and APIFY_GATEWAY is not None:
+            apify_attempt_dir = create_attempt_directory(
+                SETTINGS.download_root, request_id, "apify",
+            )
+            apify_result = await APIFY_GATEWAY.request(
+                url=url,
+                platform=platform,
+                attempt_directory=apify_attempt_dir,
+                progress_callback=progress.download,
+            )
+            if apify_result.status == "needs_selection":
+                displayed_options = apify_result.options[:24]
+                token = uuid.uuid4().hex[:12]
+                rows: list[list[InlineKeyboardButton]] = []
+                video_choices = [
+                    (index, option)
+                    for index, option in enumerate(displayed_options)
+                    if option.action == "media" and option.expected_kind == MediaKind.VIDEO
+                ]
+                audio_choices = [
+                    (index, option)
+                    for index, option in enumerate(displayed_options)
+                    if option.action == "media" and option.expected_kind == MediaKind.AUDIO
+                ]
+                quick_row: list[InlineKeyboardButton] = []
+                if video_choices:
+                    best_index, best_option = max(
+                        video_choices,
+                        key=lambda item: item[1].expected_height or 0,
+                    )
+                    quick_row.append(InlineKeyboardButton(
+                        "⭐ بهترین کیفیت",
+                        callback_data=f"sel:{token}:{best_index}",
+                    ))
+                if audio_choices:
+                    audio_index, _ = max(
+                        audio_choices,
+                        key=lambda item: item[1].expected_bitrate_kbps or 0,
+                    )
+                    quick_row.append(InlineKeyboardButton(
+                        "🎵 فقط صدا",
+                        callback_data=f"sel:{token}:{audio_index}",
+                    ))
+                if quick_row:
+                    rows.append(quick_row)
+                row: list[InlineKeyboardButton] = []
+                for option_index, option in enumerate(displayed_options):
+                    prefix = "🎵" if option.expected_kind == MediaKind.AUDIO else "🎬"
+                    row.append(InlineKeyboardButton(
+                        f"{prefix} {option.label}",
+                        callback_data=f"sel:{token}:{option_index}",
+                    ))
+                    if len(row) == 2:
+                        rows.append(row)
+                        row = []
+                if row:
+                    rows.append(row)
+                if platform == Platform.INSTAGRAM:
+                    rows.append([InlineKeyboardButton("📝 کپشن این پست", callback_data=f"caption:{token}")])
+                    if is_instagram_reel(url):
+                        REEL_MUSIC_URLS[token] = (url, time.monotonic(), chat_id, update.effective_user.id)
+                        rows.append([InlineKeyboardButton("🎵 موزیک ریلز", callback_data=f"reel_music:{token}")])
+                rows.append([InlineKeyboardButton("لغو درخواست", callback_data=f"cancel:{token}")])
+                menu_text = status_card(
+                    "🎚 کدوم خروجی رو می‌خوای؟",
+                    f"منبع: <code>{html_escape(host)}</code>\nکیفیت یا صدا رو انتخاب کن.",
+                    f"تا {int(SETTINGS.selection_ttl // 60)} دقیقه وقت داری",
+                )
+                session = PendingSelection(
+                    token=token,
+                    created_at=time.monotonic(),
+                    chat_id=chat_id,
+                    user_id=update.effective_user.id,
+                    status_message_id=status_message.message_id,
+                    reply_to=reply_to,
+                    request_id=request_id,
+                    source_host=host,
+                    source_url=url,
+                    platform=platform,
+                    bot_username=APIFY_PROVIDER,
+                    request_message_id=0,
+                    menu_message_id=0,
+                    options=displayed_options,
+                    lease=None,
+                    attempt_directory=apify_attempt_dir,
+                    use_apify=True,
+                    caption_task=caption_task,
+                )
+                caption_task = None
+                PENDING_SELECTIONS[token] = session
+                await edit_status(status_message, menu_text, InlineKeyboardMarkup(rows))
+                hold_lease = True
+                return
+            logger.info(
+                "Apify gateway could not create a menu for %s (reason=%s); using existing fallback chain",
+                request_id,
+                apify_result.reason,
+            )
+            reasons.append(apify_result.reason or "apify_error")
+            cleanup_request_directory(apify_attempt_dir, SETTINGS.download_root)
+            await progress.update(
+                20,
+                "🔄 Apify جواب نداد؛ مسیرهای قبلی را امتحان می‌کنم…",
+                f"{info.icon} {info.label} • مسیر جایگزین",
+                force=True,
+            )
+
         if is_spotify_collection:
             collection_label = "آلبوم" if spotify_collection_type == "album" else "پلی‌لیست"
 
@@ -3833,7 +3984,21 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         selection_progress = ProgressReporter(query.message, session.request_id)
         await selection_progress.update(10, selection_title, selection_label, force=True)
-        if session.use_social_sites and SOCIAL_GATEWAY is not None:
+        if session.use_apify and APIFY_GATEWAY is not None:
+            await selection_progress.processing(
+                12,
+                "☁️ دارم خروجی انتخاب‌شده رو با Apify آماده می‌کنم…",
+                "اجرای Actor…",
+                force=True,
+            )
+            result = await APIFY_GATEWAY.select(
+                url=session.source_url,
+                platform=session.platform,
+                option=option,
+                attempt_directory=session.attempt_directory,
+                progress_callback=selection_progress.download,
+            )
+        elif session.use_social_sites and SOCIAL_GATEWAY is not None:
             # Show an immediate "processing" status so the user sees the bar
             # start moving before yt-dlp / tikwm.com returns.
             await selection_progress.processing(
@@ -3882,7 +4047,7 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
         else:
             if session.lease is None:
-                raise RuntimeError("Selection has no Telegram worker lease and sites gateway is not enabled")
+                raise RuntimeError("Selection has no Telegram worker lease and no direct gateway is enabled")
             if session.lease.worker.lease_id != session.lease.lease_id:
                 raise RuntimeError("Selection lease is no longer active")
             result = await GATEWAY.select(
@@ -3914,6 +4079,24 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
         if result.status != "ready":
+            if session.use_apify:
+                await query.edit_message_text(
+                    status_card(
+                        "🔄 Apify جواب نداد",
+                        "دارم مسیرهای قبلی ربات رو امتحان می‌کنم…",
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+                # Re-enter the normal flow without Apify so a total token/Actor
+                # failure cannot remove the site's established fallbacks.
+                await _process_url(
+                    update,
+                    context,
+                    session.source_url,
+                    session.reply_to,
+                    skip_apify=True,
+                )
+                return
             await query.edit_message_text(
                 failure_text([result.reason or "service_error"], session.request_id),
                 parse_mode=ParseMode.HTML,
