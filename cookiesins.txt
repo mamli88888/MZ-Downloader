@@ -8,10 +8,10 @@
 .instagram.com	TRUE	/	TRUE	1817095086	ps_l	1
 .instagram.com	TRUE	/	TRUE	1817095086	ps_n	1
 .instagram.com	TRUE	/	TRUE	1820303148	oo	v1
-.instagram.com	TRUE	/	TRUE	1787984968	dpr	1.25
-.instagram.com	TRUE	/	TRUE	1787984968	wd	1536x742
+.instagram.com	TRUE	/	TRUE	1787989675	dpr	1.25
 .instagram.com	TRUE	/	TRUE	1787466194	rd_challenge	Q_6hBQTVqAzuO3ld6SGm-IWqw0hKiGoDeeJfUUuKVIuHH-AKwNudk7Q4dCs0YoLklykjxTRUN8q5ec0YvdmafkD7lMdCTOs
-.instagram.com	TRUE	/	TRUE	1821940168	csrftoken	OlpPijqImbX27DuKGb9OeZF3ei5Eh1Qa
-.instagram.com	TRUE	/	TRUE	1795156168	ds_user_id	67859680068
+.instagram.com	TRUE	/	TRUE	1821944874	csrftoken	OlpPijqImbX27DuKGb9OeZF3ei5Eh1Qa
+.instagram.com	TRUE	/	TRUE	1795160874	ds_user_id	67859680068
 .instagram.com	TRUE	/	TRUE	1818915967	sessionid	67859680068%3ATvtoIv9zOCs2w5%3A5%3AAYgFwZRJ6Vfj24uZPHIztdo2feTaYNV8Ul9gGxUwSw
-.instagram.com	TRUE	/	TRUE	0	rur	LDC%2C17841467682062460%2C1788589699%3A01ff38329465b4da5abcc072998aab8e0fb5ca800cdbeeb67b0b962878ecb9b6540630e5
+.instagram.com	TRUE	/	TRUE	1787989675	wd	1536x742
+.instagram.com	TRUE	/	TRUE	0	rur	LDC%2C17841467682062460%2C1788594387%3A01ff15aa584fe9c7b190501c0eb0cdb4a9cff638fc52148f6f8a10f5864f61194a91b393
