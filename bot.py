@@ -76,6 +76,7 @@ from instagram_profile import (
     fetch_latest_post_url,
     fetch_stories,
     format_profile_caption,
+    download_media as ig_download_media,
 )
 from routing import Platform, all_providers, detect_platform, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
 from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
@@ -3260,15 +3261,7 @@ async def on_ig_profile_callback(update: Update, context: ContextTypes.DEFAULT_T
         sent_count = 0
         for i, story in enumerate(stories):
             try:
-                async with httpx.AsyncClient(
-                    proxy=proxy_url,
-                    timeout=httpx.Timeout(30.0, connect=10.0),
-                    follow_redirects=True,
-                    trust_env=False,
-                ) as client:
-                    resp = await client.get(story.url)
-                    resp.raise_for_status()
-                    media_bytes = resp.content
+                media_bytes = await ig_download_media(story.url, proxy_url=proxy_url)
 
                 if story.media_type == "video":
                     if len(media_bytes) > 50 * 1024 * 1024:

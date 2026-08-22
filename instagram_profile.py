@@ -27,6 +27,9 @@ from typing import Any
 
 import httpx
 
+# Re-export httpx so bot.py story-download code can import it from here
+# without adding a second import line to bot.py.
+
 logger = logging.getLogger("MZDownloader.ig_profile")
 
 
@@ -43,7 +46,7 @@ def _proxy_url() -> str | None:
 
 def _cookies_path() -> str | None:
     from config import PROJECT_DIR
-    p = PROJECT_DIR / "cookiesins.txt"
+    p = PROJECT_DIR / "cookies.txt"
     return str(p) if p.exists() else None
 
 
@@ -208,6 +211,37 @@ class _Resp:
 
 def _resp(r: Any) -> _Resp:
     return _Resp(r)
+
+
+async def download_media(url: str, *, proxy_url: str | None = None) -> bytes:
+    """Download a binary file (image/video) using curl_cffi when available.
+
+    Instagram CDN URLs often require browser-like TLS fingerprints.
+    Falls back to plain httpx if curl_cffi is missing.
+    """
+    if _CURL_CFFI:
+        try:
+            async with _CurlSession(
+                impersonate="chrome131",
+                proxy=proxy_url or "",
+                timeout=30,
+            ) as s:
+                r = await s.get(url, headers={"User-Agent": _BASE_HEADERS["User-Agent"]})
+                r.raise_for_status()
+                return r.content
+        except Exception as exc:
+            logger.debug("curl_cffi media download failed: %s", exc)
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": _BASE_HEADERS["User-Agent"]},
+        proxy=proxy_url,
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        follow_redirects=True,
+        trust_env=False,
+    ) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.content
 
 
 # ── Profile info ─────────────────────────────────────────────────────
