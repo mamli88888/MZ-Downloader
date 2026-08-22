@@ -49,7 +49,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from config import ConfigError, PROJECT_DIR, SETTINGS
-from apify_gateway import APIFY_PROVIDER, ApifyGateway, apify_health_check
+from apify_gateway import APIFY_PROVIDER, ApifyGateway, apify_health_check, option_size_hint
 import users_db
 from pixeldrain_upload import PixeldrainUploader, build_pixeldrain_worker_url
 from downloader import (
@@ -558,6 +558,34 @@ class ProgressReporter:
             f"{size_line}\n{timing}",
         )
 
+    async def apify_download(self, current: int, total: int) -> None:
+        """Show Apify CDN transfer in the 60–70% progress range.
+
+        The Apify Actor itself occupies 16–58%; the real byte transfer then
+        owns 60–70% before the existing Telegram-upload phase starts at 70%.
+        """
+        current = max(0, int(current or 0))
+        total = max(current, int(total or 0))
+        now = time.monotonic()
+        if self.download_started_at is None or current < self.download_last_current:
+            self.download_started_at = now
+        self.download_last_current = current
+        elapsed = max(0.001, now - self.download_started_at)
+        ratio = current / total if total > 0 else 0.0
+        rate = current / elapsed if current > 0 else 0.0
+        remaining = (total - current) / rate if total > current and rate > 0 else 0.0
+        size_line = fmt_size(current)
+        if total > 0:
+            size_line += f" از {fmt_size(total)}"
+        timing = f"⏱ گذشته: {fmt_duration(elapsed)}"
+        if remaining > 0:
+            timing += f" • باقی‌مونده حدودی: {fmt_duration(remaining)}"
+        await self.update(
+            60 + int(max(0.0, min(1.0, ratio)) * 10),
+            "⬇️ Apify فایل آماده‌شده را می‌گیرد…",
+            f"{size_line}\n{timing}",
+        )
+
     async def processing(self, percent: int, title: str, detail: str = "", *, force: bool = False) -> None:
         """Show a 'processing' status — percent bar WITHOUT byte counts.
 
@@ -889,13 +917,21 @@ async def health_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def edit_status(message: Any, text: str, reply_markup: Any = None) -> None:
+    """Edit either a plain status message or a thumbnail-card caption."""
     try:
-        await message.edit_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-        )
+        if getattr(message, "photo", None):
+            await message.edit_caption(
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+        else:
+            await message.edit_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
     except TelegramError as exc:
         if "message is not modified" not in str(exc).lower():
             logger.debug("Status edit failed: %s", exc)
@@ -1841,6 +1877,17 @@ async def _process_url(
                     for index, option in enumerate(displayed_options)
                     if option.action == "media" and option.expected_kind == MediaKind.AUDIO
                 ]
+                # A practical mobile default gives users a one-tap option
+                # between the tiny low resolutions and costly 4K downloads.
+                if platform == Platform.YOUTUBE and video_choices:
+                    smart_index, smart_option = min(
+                        video_choices,
+                        key=lambda item: abs((item[1].expected_height or 720) - 720),
+                    )
+                    rows.append([InlineKeyboardButton(
+                        f"⚡ پیشنهادی: {smart_option.label} • {option_size_hint(smart_option)}",
+                        callback_data=f"sel:{token}:{smart_index}",
+                    )])
                 quick_row: list[InlineKeyboardButton] = []
                 if video_choices:
                     best_index, best_option = max(
@@ -1848,16 +1895,16 @@ async def _process_url(
                         key=lambda item: item[1].expected_height or 0,
                     )
                     quick_row.append(InlineKeyboardButton(
-                        "⭐ بهترین کیفیت",
+                        f"⭐ بهترین • {option_size_hint(best_option)}",
                         callback_data=f"sel:{token}:{best_index}",
                     ))
                 if audio_choices:
-                    audio_index, _ = max(
+                    audio_index, audio_option = max(
                         audio_choices,
                         key=lambda item: item[1].expected_bitrate_kbps or 0,
                     )
                     quick_row.append(InlineKeyboardButton(
-                        "🎵 فقط صدا",
+                        f"🎵 MP3 • {option_size_hint(audio_option)}",
                         callback_data=f"sel:{token}:{audio_index}",
                     ))
                 if quick_row:
@@ -1866,7 +1913,7 @@ async def _process_url(
                 for option_index, option in enumerate(displayed_options):
                     prefix = "🎵" if option.expected_kind == MediaKind.AUDIO else "🎬"
                     row.append(InlineKeyboardButton(
-                        f"{prefix} {option.label}",
+                        f"{prefix} {option.label} • {option_size_hint(option)}",
                         callback_data=f"sel:{token}:{option_index}",
                     ))
                     if len(row) == 2:
@@ -1880,11 +1927,36 @@ async def _process_url(
                         REEL_MUSIC_URLS[token] = (url, time.monotonic(), chat_id, update.effective_user.id)
                         rows.append([InlineKeyboardButton("🎵 موزیک ریلز", callback_data=f"reel_music:{token}")])
                 rows.append([InlineKeyboardButton("لغو درخواست", callback_data=f"cancel:{token}")])
+                card_intro = (apify_result.text or "").strip()
+                if len(card_intro) > 500:
+                    card_intro = card_intro[:497].rstrip() + "…"
                 menu_text = status_card(
                     "🎚 کدوم خروجی رو می‌خوای؟",
-                    f"منبع: <code>{html_escape(host)}</code>\nکیفیت یا صدا رو انتخاب کن.",
+                    (card_intro + "\n\n" if card_intro else "")
+                    + "حجم‌های کنار دکمه‌ها تقریبی و برای هر دقیقه هستند.\n"
+                    + "کیفیت یا صدا رو انتخاب کن.",
                     f"تا {int(SETTINGS.selection_ttl // 60)} دقیقه وقت داری",
                 )
+                keyboard = InlineKeyboardMarkup(rows)
+                if apify_result.preview is not None:
+                    try:
+                        with apify_result.preview.path.open("rb") as preview_handle:
+                            card_message = await context.bot.send_photo(
+                                chat_id=chat_id,
+                                photo=preview_handle,
+                                caption=menu_text,
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=keyboard,
+                                reply_to_message_id=reply_to,
+                            )
+                        with contextlib.suppress(TelegramError):
+                            await status_message.delete()
+                        status_message = card_message
+                    except TelegramError as exc:
+                        logger.warning("Apify thumbnail send failed for %s: %s", request_id, exc)
+                        await edit_status(status_message, menu_text, keyboard)
+                else:
+                    await edit_status(status_message, menu_text, keyboard)
                 session = PendingSelection(
                     token=token,
                     created_at=time.monotonic(),
@@ -1907,7 +1979,6 @@ async def _process_url(
                 )
                 caption_task = None
                 PENDING_SELECTIONS[token] = session
-                await edit_status(status_message, menu_text, InlineKeyboardMarkup(rows))
                 hold_lease = True
                 return
             logger.info(
@@ -3951,9 +4022,9 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         await query.answer("درخواست لغو شد")
         release_pending_selection(session)
-        await query.edit_message_text(
+        await edit_status(
+            query.message,
             status_card("⏹ درخواست متوقف شد", "انتخاب کیفیت لغو شد."),
-            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -3972,13 +4043,13 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await query.answer("باشه، شروع کردم 🚀")
     selection_title = "📝 دارم کپشن رو می‌گیرم…" if option.action == "caption" else "⬇️ دارم خروجی رو آماده می‌کنم…"
     selection_label = "کپشن پست" if option.action == "caption" else option.label
-    await query.edit_message_text(
+    await edit_status(
+        query.message,
         status_card(
             selection_title,
             f"انتخابت: <b>{html_escape(selection_label)}</b>\nمنبع: <code>{html_escape(session.source_host)}</code>",
             "برای توقف: /cancel"
         ),
-        parse_mode=ParseMode.HTML,
     )
 
     try:
@@ -3996,7 +4067,8 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 platform=session.platform,
                 option=option,
                 attempt_directory=session.attempt_directory,
-                progress_callback=selection_progress.download,
+                progress_callback=selection_progress.apify_download,
+                processing_callback=selection_progress.processing,
             )
         elif session.use_social_sites and SOCIAL_GATEWAY is not None:
             # Show an immediate "processing" status so the user sees the bar
@@ -4070,22 +4142,22 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     reply_to_message_id=session.reply_to,
                     disable_web_page_preview=True,
                 )
-            await query.edit_message_text(
+            await edit_status(
+                query.message,
                 status_card(
                     "✅ کپشن ارسال شد",
                     f"تعداد بخش: <b>{len(chunks)}</b>",
                 ),
-                parse_mode=ParseMode.HTML,
             )
             return
         if result.status != "ready":
             if session.use_apify:
-                await query.edit_message_text(
+                await edit_status(
+                    query.message,
                     status_card(
                         "🔄 Apify جواب نداد",
                         "دارم مسیرهای قبلی ربات رو امتحان می‌کنم…",
                     ),
-                    parse_mode=ParseMode.HTML,
                 )
                 # Re-enter the normal flow without Apify so a total token/Actor
                 # failure cannot remove the site's established fallbacks.
@@ -4097,9 +4169,9 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     skip_apify=True,
                 )
                 return
-            await query.edit_message_text(
+            await edit_status(
+                query.message,
                 failure_text([result.reason or "service_error"], session.request_id),
-                parse_mode=ParseMode.HTML,
             )
             await send_feedback_sticker(context, session.chat_id, index=4)
             return
@@ -4130,19 +4202,19 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
     except asyncio.CancelledError:
         with contextlib.suppress(TelegramError):
-            await query.edit_message_text(
+            await edit_status(
+                query.message,
                 status_card("⏹ درخواست متوقف شد", "دانلود کیفیت انتخابی لغو شد."),
-                parse_mode=ParseMode.HTML,
             )
     except Exception as exc:
         logger.exception("Selection %s failed: %s", session.request_id, exc)
         with contextlib.suppress(TelegramError):
-            await query.edit_message_text(
+            await edit_status(
+                query.message,
                 status_card(
                     "❌ خطا در دانلود",
                     "هیچ فایل ناقصی ارسال نشد. لینک را دوباره امتحان کن.",
                 ),
-                parse_mode=ParseMode.HTML,
             )
         with contextlib.suppress(Exception):
             await send_feedback_sticker(context, session.chat_id, index=4)

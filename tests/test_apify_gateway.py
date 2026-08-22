@@ -8,6 +8,7 @@ from apify_gateway import (
     _actor_reference,
     _instagram_media_specs,
     _instagram_results_type,
+    option_size_hint,
 )
 from config import load_settings
 from downloader import MediaKind
@@ -76,6 +77,13 @@ class ApifyGatewayHelpersTests(unittest.TestCase):
         self.assertEqual(options[-1].expected_kind, MediaKind.AUDIO)
         self.assertEqual(options[-1].label, "فقط صدا (MP3)")
 
+    def test_quality_size_hints_are_human_readable(self) -> None:
+        options = ApifyGateway._youtube_options()
+        self.assertEqual(option_size_hint(options[0]), "≈2MB/min")
+        self.assertEqual(option_size_hint(options[4]), "≈19MB/min")
+        self.assertEqual(option_size_hint(options[-1]), "≈1.4MB/min")
+        self.assertEqual(option_size_hint(ApifyGateway._instagram_options()[0]), "حجم اصلی")
+
     def test_actor_request_uses_selected_youtube_quality_or_mp3(self) -> None:
         gateway = ApifyGateway(tokens=("token-a",))
         video = gateway._actor_request(
@@ -119,8 +127,8 @@ class ApifyGatewayTokenRotationTests(unittest.IsolatedAsyncioTestCase):
         gateway = ApifyGateway(tokens=("first", "second"), token_cooldown=60)
         used_tokens: list[str] = []
 
-        async def fake_run_actor(client, actor_id, actor_input):
-            del actor_id, actor_input
+        async def fake_run_actor(client, actor_id, actor_input, processing_callback=None):
+            del actor_id, actor_input, processing_callback
             used_tokens.append(client.headers["Authorization"])
             if len(used_tokens) == 1:
                 raise ApifyError("temporary Actor failure", status_code=500)
