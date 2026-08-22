@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import socks
+import httpx
 from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
@@ -67,6 +68,15 @@ from downloader import (
     request_dr_downloader_album,
 )
 from instagram_caption import InstagramCaptionError, fetch_instagram_caption
+from instagram_profile import (
+    InstagramProfileError,
+    InstagramProfileNotFound,
+    InstagramProfilePrivate,
+    fetch_profile,
+    fetch_latest_post_url,
+    fetch_stories,
+    format_profile_caption,
+)
 from routing import Platform, all_providers, detect_platform, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
 from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
 from youtube_sites_gateway import (
@@ -309,6 +319,9 @@ REEL_MUSIC_TTL = 600  # 10 minutes
 # the original YouTube URL when the user clicks 🇮🇷 فارسی or 🇬🇧 English.
 YOUTUBE_SUBTITLE_URLS: dict[str, tuple[str, float, int, int]] = {}
 YOUTUBE_SUBTITLE_TTL = 600  # 10 minutes
+# token → (username, created_at, chat_id, user_id)
+IG_PROFILE_SESSIONS: dict[str, tuple[str, float, int, int]] = {}
+IG_PROFILE_TTL = 600  # 10 minutes
 ADMIN_USERNAME = "iR0nin"  # only this user can use /broadcast
 
 # Pixeldrain uploader
@@ -3031,6 +3044,279 @@ WELCOME_GROUP = status_card(
 )
 
 
+# ── Instagram Profile Feature ─────────────────────────────────────────
+
+
+@membership_required
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /profile <username> — fetch and display an Instagram public profile."""
+    message = update.effective_message
+    args = (message.text or message.caption or "").split(None, 1)
+    username = args[1].strip() if len(args) > 1 else ""
+
+    if not username:
+        await message.reply_text(
+            status_card(
+                "نام‌کاربری نیومد",
+                "بعد از <code>/profile</code> نام‌کاربری اینستاگرام رو بنویس. مثال: <code>/profile natgeo</code>",
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Clean @ prefix
+    username = username.strip("@/").strip()
+
+    status_message = await message.reply_text(
+        status_card(
+            "🔍 دارم پروفایل رو می‌گیرم…",
+            f"در حال دریافت اطلاعات صفحه عمومی <b>@{html_escape(username)}</b>",
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+    proxy_url = (
+        f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+        if SETTINGS.use_proxy
+        else None
+    )
+
+    try:
+        profile = await fetch_profile(username, proxy_url=proxy_url)
+    except InstagramProfileNotFound:
+        await edit_status(
+            status_message,
+            status_card(
+                "❌ پیج پیدا نشد",
+                f"نام‌کاربری <b>@{html_escape(username)}</b> وجود ندارد یا حذف شده است.",
+            ),
+        )
+        return
+    except InstagramProfilePrivate:
+        await edit_status(
+            status_message,
+            status_card(
+                "🔒 پیج خصوصی",
+                f"پیج <b>@{html_escape(username)}</b> خصوصی است و اطلاعات آن در دسترس نیست.",
+            ),
+        )
+        return
+    except InstagramProfileError as exc:
+        await edit_status(
+            status_message,
+            status_card(
+                "❌ خطا",
+                str(exc),
+            ),
+        )
+        return
+    except Exception as exc:
+        logger.exception("Profile fetch failed for @%s", username)
+        await edit_status(
+            status_message,
+            status_card(
+                "❌ خطای غیرمنتظره",
+                "در دریافت پروفایل خطایی رخ داد. لطفاً بعداً دوباره امتحان کن.",
+            ),
+        )
+        return
+
+    # Build caption
+    caption = format_profile_caption(profile)
+
+    # Build glass-style inline keyboard
+    token = uuid.uuid4().hex[:12]
+    IG_PROFILE_SESSIONS[token] = (username, time.monotonic(), update.effective_chat.id, update.effective_user.id)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📸 دریافت آخرین پست", callback_data=f"ig_prof:{token}:post"),
+        ],
+        [
+            InlineKeyboardButton("📖 دریافت آخرین استوری‌ها", callback_data=f"ig_prof:{token}:stories"),
+        ],
+    ])
+
+    # Send profile photo with caption + buttons
+    try:
+        if profile.avatar_url:
+            await status_message.delete()
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=profile.avatar_url,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        else:
+            await edit_status(
+                status_message,
+                caption,
+                reply_markup=keyboard,
+            )
+    except TelegramError:
+        # If sending the photo fails, send as text
+        with contextlib.suppress(TelegramError):
+            await status_message.delete()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+
+@membership_required
+async def on_ig_profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Instagram profile callback buttons (latest post / stories)."""
+    query = update.callback_query
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) < 3:
+        await query.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+
+    token = parts[1]
+    action = parts[2]  # "post" or "stories"
+
+    entry = IG_PROFILE_SESSIONS.get(token)
+    if entry is None:
+        await query.answer("این درخواست منقضی شده است.", show_alert=True)
+        return
+
+    username, created_at, orig_chat_id, orig_user_id = entry
+    if time.monotonic() - created_at > IG_PROFILE_TTL:
+        IG_PROFILE_SESSIONS.pop(token, None)
+        await query.answer("این درخواست منقضی شده است.", show_alert=True)
+        return
+    if update.effective_user.id != orig_user_id or update.effective_chat.id != orig_chat_id:
+        await query.answer("این درخواست متعلق به شما نیست.", show_alert=True)
+        return
+
+    # Don't pop the token — the user may click the other button too.
+
+    proxy_url = (
+        f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+        if SETTINGS.use_proxy
+        else None
+    )
+    chat_id = update.effective_chat.id
+    reply_to = query.message.message_id if query.message else None
+
+    if action == "post":
+        await query.answer("دارم آخرین پست رو پیدا می‌کنم…")
+        with contextlib.suppress(TelegramError):
+            await query.edit_message_reply_markup(reply_markup=None)
+
+        post_url = await fetch_latest_post_url(username, proxy_url=proxy_url)
+        if not post_url:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=status_card(
+                    "❌ پستی پیدا نشد",
+                    f"پیج <b>@{html_escape(username)}</b> پستی ندارد یا اطلاعات در دسترس نیست.",
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=reply_to,
+            )
+            return
+
+        # Use the existing download flow to download and send the post
+        await process_urls(
+            update,
+            context,
+            [post_url],
+            reply_to,
+        )
+
+    elif action == "stories":
+        await query.answer("دارم استوری‌ها رو می‌گیرم…")
+        with contextlib.suppress(TelegramError):
+            await query.edit_message_reply_markup(reply_markup=None)
+
+        stories = await fetch_stories(username, proxy_url=proxy_url)
+        if not stories:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=status_card(
+                    "📖 استوری فعالی نیست",
+                    f"پیج <b>@{html_escape(username)}</b> فعلاً استوری فعالی نداره یا کوکی‌ها تنظیم نشده‌اند.",
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=reply_to,
+            )
+            return
+
+        status_msg = await send_status(
+            context,
+            chat_id,
+            status_card(
+                f"📖 دارم {len(stories)} استوری رو دانلود می‌کنم",
+                f"در حال دریافت تمام استوری‌های فعال <b>@{html_escape(username)}</b>…",
+            ),
+            reply_to,
+        )
+
+        sent_count = 0
+        for i, story in enumerate(stories):
+            try:
+                async with httpx.AsyncClient(
+                    proxy=proxy_url,
+                    timeout=httpx.Timeout(30.0, connect=10.0),
+                    follow_redirects=True,
+                    trust_env=False,
+                ) as client:
+                    resp = await client.get(story.url)
+                    resp.raise_for_status()
+                    media_bytes = resp.content
+
+                if story.media_type == "video":
+                    if len(media_bytes) > 50 * 1024 * 1024:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=io.BytesIO(media_bytes),
+                            filename=f"story_{username}_{i + 1}.mp4",
+                            caption=f"📖 استوری {i + 1} از @{username}",
+                            reply_to_message_id=reply_to if sent_count == 0 else None,
+                        )
+                    else:
+                        await context.bot.send_video(
+                            chat_id=chat_id,
+                            video=io.BytesIO(media_bytes),
+                            caption=f"📖 استوری {i + 1} از @{username}",
+                            reply_to_message_id=reply_to if sent_count == 0 else None,
+                            supports_streaming=True,
+                        )
+                else:
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=io.BytesIO(media_bytes),
+                        caption=f"📖 استوری {i + 1} از @{username}",
+                        reply_to_message_id=reply_to if sent_count == 0 else None,
+                    )
+                sent_count += 1
+            except Exception as exc:
+                logger.warning("Failed to send story %d for @%s: %s", i + 1, username, exc)
+                continue
+
+        with contextlib.suppress(TelegramError):
+            await status_msg.delete()
+
+        if sent_count == 0:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=status_card(
+                    "❌ ارسال استوری شکست خورد",
+                    "در دانلود استوری‌ها خطایی رخ داد. لطفاً بعداً دوباره امتحان کن.",
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=reply_to,
+            )
+    else:
+        await query.answer("عملیات نامعتبر.", show_alert=True)
+
+
+
 @membership_required
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -4044,6 +4330,7 @@ async def post_init(application: Application) -> None:
         BotCommand("platforms", "پلتفرم‌های پشتیبانی‌شده"),
         BotCommand("stats", "آمار این اجرا"),
         BotCommand("caption", "دریافت کپشن Instagram"),
+        BotCommand("profile", "پروفایل Instagram"),
         BotCommand("search", "جست‌وجو در YouTube"),
         BotCommand("song", "جست‌و‌جو آهنگ"),
         BotCommand("cancel", "توقف دانلودهای من"),
@@ -4057,6 +4344,7 @@ async def post_init(application: Application) -> None:
         BotCommand("status", "وضعیت صف"),
         BotCommand("platforms", "پلتفرم‌ها"),
         BotCommand("caption", "دریافت کپشن Instagram"),
+        BotCommand("profile", "پروفایل Instagram"),
         BotCommand("help", "راهنما"),
     ]
     with contextlib.suppress(TelegramError):
@@ -4111,6 +4399,7 @@ async def post_shutdown(application: Application) -> None:
     ACTIVE_YOUTUBE_SEARCHES.clear()
     SHAZAM_SEARCH_SESSIONS.clear()
     ACTIVE_SHAZAM_SEARCHES.clear()
+    IG_PROFILE_SESSIONS.clear()
     for worker in ACCOUNT_POOL.workers:
         with contextlib.suppress(Exception):
             await worker.client.disconnect()
@@ -4164,11 +4453,13 @@ def main() -> None:
     application.add_handler(CommandHandler("song", song_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("dl", dl_command))
+    application.add_handler(CommandHandler("profile", profile_command))
     application.add_handler(CallbackQueryHandler(on_selection, pattern=r"^(?:sel|cancel|info|caption):"))
     application.add_handler(CallbackQueryHandler(on_reel_music_callback, pattern=r"^reel_music:"))
     application.add_handler(CallbackQueryHandler(on_youtube_search_callback, pattern=r"^(?:ys|yp):"))
     application.add_handler(CallbackQueryHandler(on_shazam_search_callback, pattern=r"^(?:ss|sp):"))
     application.add_handler(CallbackQueryHandler(on_youtube_subtitle_callback, pattern=r"^yt_sub:"))
+    application.add_handler(CallbackQueryHandler(on_ig_profile_callback, pattern=r"^ig_prof:"))
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
