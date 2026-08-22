@@ -183,8 +183,18 @@ async def _ig_api_get(
                 proxy=proxy_url or "",
                 timeout=25,
             ) as s:
-                # First visit main page to pick up csrf/did cookies
-                if cookies_dict is None:
+                # Load file cookies first so the homepage visit sends them
+                if cookies_dict:
+                    for name, value in cookies_dict.items():
+                        s.cookies.set(name, value, domain=".instagram.com")
+
+                # Visit the homepage to obtain a fresh csrftoken from
+                # Instagram's Set-Cookie response.  This is REQUIRED for
+                # authenticated endpoints (stories, reels).  When
+                # _authenticated is False we skip it for speed; when
+                # True we MUST do it — without a csrftoken Instagram
+                # returns HTML instead of JSON.
+                if _authenticated or cookies_dict is None:
                     await s.get(
                         "https://www.instagram.com/",
                         headers={
@@ -193,17 +203,24 @@ async def _ig_api_get(
                                       "Sec-Ch-Ua-Platform", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua")
                         },
                     )
-                if cookies_dict:
-                    for name, value in cookies_dict.items():
-                        s.cookies.set(name, value, domain=".instagram.com")
-                # If authenticated but no csrftoken in cookies file,
-                # try to grab one from the session cookie jar.
-                if _authenticated and not csrf_token:
+
+                # Extract csrftoken from session cookies
+                if _authenticated:
                     for c in s.cookies:
                         if c.name == "csrftoken":
                             headers["X-Csrftoken"] = c.value
-                            logger.debug("_ig_api_get: x-csrftoken from session cookie")
+                            logger.info(
+                                "_ig_api_get: x-csrftoken=%s… (from %s)",
+                                c.value[:8],
+                                "cookies file" if csrf_token else "session",
+                            )
                             break
+                    if "X-Csrftoken" not in headers:
+                        logger.warning(
+                            "_ig_api_get: _authenticated=True but no csrftoken "
+                            "found in cookies file or session — stories will fail"
+                        )
+
                 resp = await s.get(url, headers=headers)
                 return _resp(resp)
         except Exception as exc:
@@ -219,6 +236,19 @@ async def _ig_api_get(
         trust_env=False,
     ) as client:
         try:
+            # For authenticated requests, visit homepage first to get csrftoken
+            if _authenticated and "X-Csrftoken" not in headers:
+                await client.get(
+                    "https://www.instagram.com/",
+                    headers={"User-Agent": _BASE_HEADERS["User-Agent"]},
+                )
+                csrf = client.cookies.get("csrftoken")
+                if csrf:
+                    headers["X-Csrftoken"] = csrf
+                    client.headers["X-Csrftoken"] = csrf
+                    logger.info(
+                        "_ig_api_get: x-csrftoken=%s… (httpx session)", csrf[:8]
+                    )
             resp = await client.get(url)
             return resp
         except httpx.HTTPError as exc:
