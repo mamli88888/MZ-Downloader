@@ -32,7 +32,7 @@ from downloader import (
     ProgressCallback,
     QualityOption,
 )
-from routing import Platform
+from routing import Platform, is_instagram_image_post
 from apify_platforms import (
     NEW_APIFY_PLATFORMS,
     PLATFORM_RATE_PER_MINUTE,
@@ -316,7 +316,7 @@ class ApifyGateway:
         if platform == Platform.YOUTUBE:
             options = self._youtube_options()
         elif platform == Platform.INSTAGRAM:
-            options = self._instagram_options()
+            options = self._instagram_options(url=url)
         elif platform in NEW_APIFY_PLATFORMS and FLAGS.apify_new_platforms:
             if platform == Platform.SPOTIFY and not spotify_track_url(url):
                 # The verified actor schema only accepts single-track URLs;
@@ -547,16 +547,35 @@ class ApifyGateway:
         return tuple(options)
 
     @staticmethod
-    def _instagram_options() -> tuple[QualityOption, ...]:
+    def _instagram_options(url: str = "") -> tuple[QualityOption, ...]:
+        """Build the inline-button menu for an Instagram post.
+
+        For image carousel posts (URL carries ``img_index``), only a photo
+        option is offered — the audio option requires a video track to
+        extract from, so on a photo-only post it would always fail. The
+        ``instagram-scraper`` Actor transparently returns whatever the
+        post actually contains (photos and/or videos), so the photo option
+        works for both single-image and multi-slide carousel posts.
+        """
+        is_image = bool(url) and is_instagram_image_post(url)
+        primary_label = "تصاویر (کیفیت اصلی)" if is_image else "ویدیو (کیفیت اصلی)"
+        primary = QualityOption(
+            label=primary_label,
+            row=0,
+            column=0,
+            # The fingerprint kind stays "video" so ``_actor_request`` runs
+            # the same ``instagram-scraper`` Actor (whose input schema does
+            # not distinguish photo vs. video posts). ``expected_kind``
+            # carries the user-facing kind so the menu button gets a 📷
+            # prefix and the bot's media-type filtering is consistent.
+            fingerprint=_fingerprint({"platform": "instagram", "kind": "video"}),
+            expected_kind=MediaKind.PHOTO if is_image else MediaKind.VIDEO,
+            expected_height=1080,
+        )
+        if is_image:
+            return (primary,)
         return (
-            QualityOption(
-                label="ویدیو (کیفیت اصلی)",
-                row=0,
-                column=0,
-                fingerprint=_fingerprint({"platform": "instagram", "kind": "video"}),
-                expected_kind=MediaKind.VIDEO,
-                expected_height=1080,
-            ),
+            primary,
             QualityOption(
                 label="فقط صدا (MP3)",
                 row=0,

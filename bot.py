@@ -89,7 +89,7 @@ from instagram_profile import (
     format_profile_caption,
     download_media as ig_download_media,
 )
-from routing import Platform, all_providers, detect_platform, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
+from routing import Platform, all_providers, detect_platform, is_instagram_image_post, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
 from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
 from social_gateway import (
     SOCIAL_PROVIDER,
@@ -455,6 +455,20 @@ class RuntimeStats:
     successful: int = 0
     failed: int = 0
     bytes_sent: int = 0
+
+
+def _option_prefix(option) -> str:
+    """Pick the leading emoji for a quality-menu button.
+
+    PHOTO options get 📷 so Instagram image carousel posts — which are now
+    routed through Apify as their primary downloader — show a clear
+    photo label instead of the default 🎬 video icon.
+    """
+    if option.expected_kind == MediaKind.AUDIO:
+        return "🎵"
+    if option.expected_kind == MediaKind.PHOTO:
+        return "📷"
+    return "🎬"
 
 
 STATS = RuntimeStats()
@@ -1953,11 +1967,19 @@ async def _process_url(
     # (TikTok / Instagram / Facebook / X / Reddit / Snapchat / SoundCloud /
     # CapCut / SnackVideo / Douyin). The fallback chain (Apify where
     # applicable → Telegram bots) only kicks in when AHM7 fails.
+    #
+    # Instagram image carousels (URLs carrying ``img_index``) are an
+    # exception: AHM7's ``alldl`` endpoint only returns ``videoUrl`` /
+    # ``audioUrl`` and cannot serve photo carousels, so these posts are
+    # routed through Apify's ``instagram-scraper`` Actor as their
+    # *primary* downloader. Instagram Reels and other non-carousel posts
+    # still hit AHM7 first.
     use_ahm7 = (
         not skip_ahm7
         and AHM7_GATEWAY is not None
         and platform in AHM7_SUPPORTED_PLATFORMS
         and not is_spotify_collection
+        and not is_instagram_image_post(url)
     )
     if not providers and not is_spotify_collection and not _social_only and not use_apify and not use_yoinku and not use_ahm7:
         STATS.failed += 1
@@ -2097,7 +2119,7 @@ async def _process_url(
                     rows.append(quick_row)
                 row: list[InlineKeyboardButton] = []
                 for option_index, option in enumerate(displayed_options):
-                    prefix = "🎵" if option.expected_kind == MediaKind.AUDIO else "🎬"
+                    prefix = _option_prefix(option)
                     row.append(InlineKeyboardButton(
                         _truncate_button_label(f"{prefix} {option.label}"),
                         callback_data=f"sel:{token}:{option_index}",
@@ -2255,7 +2277,7 @@ async def _process_url(
                     rows.append(quick_row)
                 row: list[InlineKeyboardButton] = []
                 for option_index, option in enumerate(displayed_options):
-                    prefix = "🎵" if option.expected_kind == MediaKind.AUDIO else "🎬"
+                    prefix = _option_prefix(option)
                     row.append(InlineKeyboardButton(
                         _truncate_button_label(f"{prefix} {option.label}"),
                         callback_data=f"sel:{token}:{option_index}",
@@ -2401,7 +2423,7 @@ async def _process_url(
                     rows.append(quick_row)
                 row: list[InlineKeyboardButton] = []
                 for option_index, option in enumerate(displayed_options):
-                    prefix = "🎵" if option.expected_kind == MediaKind.AUDIO else "🎬"
+                    prefix = _option_prefix(option)
                     row.append(InlineKeyboardButton(
                         _truncate_button_label(f"{prefix} {option.label} • {option_size_hint(option)}"),
                         callback_data=f"sel:{token}:{option_index}",
@@ -2707,7 +2729,7 @@ async def _process_url(
                     rows.append(quick_row)
                 row: list[InlineKeyboardButton] = []
                 for option_index, option in enumerate(displayed_options):
-                    prefix = "🎵" if option.expected_kind == MediaKind.AUDIO else "🎬"
+                    prefix = _option_prefix(option)
                     raw_label = option.label if len(option.label) <= 40 else option.label[:37] + "…"
                     row.append(InlineKeyboardButton(
                         _truncate_button_label(f"{prefix} {raw_label}"),
@@ -2919,7 +2941,7 @@ async def _process_url(
                     if option.action == "caption":
                         label = "📝 دریافت کپشن"
                     else:
-                        prefix = "🎵" if option.expected_kind == MediaKind.AUDIO else "🎬"
+                        prefix = _option_prefix(option)
                         raw_label = option.label if len(option.label) <= 40 else option.label[:37] + "…"
                         label = f"{prefix} {raw_label}"
                         option_size = estimate_youtube_size(

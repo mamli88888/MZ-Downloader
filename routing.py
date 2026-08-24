@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 class Platform(str, Enum):
@@ -194,3 +194,34 @@ def is_instagram_reel(url: str) -> bool:
     if not (host == "instagram.com" or host.endswith(".instagram.com")):
         return False
     return path.startswith("/reel/") or path.startswith("/reels/") or path.startswith("/tv/")
+
+
+def is_instagram_image_post(url: str) -> bool:
+    """Return True if the URL is an Instagram image carousel post.
+
+    Instagram adds the ``img_index`` query parameter when a user shares a
+    specific slide of a multi-image carousel. Its presence is a strong,
+    URL-only signal of an image (not video) post.
+
+    These posts are routed through Apify as their *primary* downloader
+    because the AHM7 ``alldl`` endpoint only returns ``videoUrl`` /
+    ``audioUrl`` — it cannot serve photo carousels. Apify's
+    ``instagram-scraper`` Actor extracts ``displayUrl`` / ``images`` /
+    ``childPosts`` recursively, so it handles both single-image and
+    multi-slide carousel posts.
+
+    Reels (``/reel/``, ``/reels/``, ``/tv/``) are always video and return
+    ``False`` — they keep AHM7 as their primary downloader.
+    """
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower().strip(".")
+    if not (host == "instagram.com" or host.endswith(".instagram.com")):
+        return False
+    path = parsed.path.lower()
+    if not path.startswith("/p/"):
+        return False
+    query = parse_qs(parsed.query)
+    return any(key.lower() == "img_index" for key in query)
