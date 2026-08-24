@@ -421,7 +421,7 @@ class Ahm7Gateway:
                 reason="ahm7_no_video_url",
             )
         suffix = _suffix_for_url(video_url, default=".mp4")
-        final_path = attempt_directory / f"ahm7_video{suffix}"
+        final_path = attempt_directory / f"video{suffix}"
         await self._download_file(video_url, final_path, progress_callback)
         media = _build_media(final_path, MediaKind.VIDEO)
         return GatewayResult(
@@ -442,7 +442,7 @@ class Ahm7Gateway:
         # Prefer the API-provided direct audio URL when present.
         if audio_url:
             suffix = _suffix_for_url(audio_url, default=".mp3")
-            final_path = attempt_directory / f"ahm7_audio{suffix}"
+            final_path = attempt_directory / f"audio{suffix}"
             await self._download_file(audio_url, final_path, progress_callback)
             media = _build_media(final_path, MediaKind.AUDIO)
             return GatewayResult(
@@ -463,9 +463,9 @@ class Ahm7Gateway:
             except Exception:  # pragma: no cover
                 logger.exception("processing_callback failed")
         video_suffix = _suffix_for_url(video_url, default=".mp4")
-        video_path = attempt_directory / f"ahm7_source{video_suffix}"
+        video_path = attempt_directory / f"source{video_suffix}"
         await self._download_file(video_url, video_path, progress_callback)
-        audio_path = attempt_directory / "ahm7_audio.mp3"
+        audio_path = attempt_directory / "audio.mp3"
         if processing_callback is not None:
             try:
                 await processing_callback(60, "🎵 استخراج صدا با ffmpeg…", "مرحله ۲ از ۲")
@@ -563,7 +563,7 @@ class Ahm7Gateway:
         attempt_directory: Path,
     ) -> DownloadedMedia | None:
         suffix = _suffix_for_url(thumbnail_url, default=".jpg")
-        path = attempt_directory / f"ahm7_thumb{suffix}"
+        path = attempt_directory / f"thumb{suffix}"
         client = await self._ensure_client()
         try:
             response = await client.get(thumbnail_url)

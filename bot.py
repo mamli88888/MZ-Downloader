@@ -576,6 +576,10 @@ def bot_attribution(bot_username: str | None) -> str:
     username = (bot_username or "").strip().lstrip("@")
     if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
         return "دانلود شده توسط <b>MZ Downloader</b>"
+    # Internal download-provider sentinels are not real Telegram accounts;
+    # never render them as a visible @link in the user-facing caption.
+    if username in {AHM7_PROVIDER, YOINKU_PROVIDER}:
+        return "دانلود شده توسط <b>MZ Downloader</b>"
     return (
         "دانلود شده توسط "
         f'<a href="https://t.me/{username}">@{html_escape(username)}</a>'
@@ -2047,8 +2051,8 @@ async def _process_url(
         if use_yoinku and YOINKU_GATEWAY is not None:
             await progress.update(
                 15,
-                "▶️ دارم از طریق Yoinku آماده‌اش می‌کنم…",
-                f"{info.icon} {info.label} • مسیر اصلی (Yoinku)",
+                "▶️ در حال آماده‌سازی ویدیو…",
+                f"{info.icon} {info.label} • مسیر اصلی",
                 force=True,
             )
             yoinku_attempt_dir = create_attempt_directory(
@@ -2182,7 +2186,7 @@ async def _process_url(
             reasons.append(yoinku_result.reason or "yoinku_error")
             await progress.update(
                 20,
-                "🔄 Yoinku جواب نداد، امتحان می‌کنم با مسیرهای بعدی…",
+                "🔄 مسیر اصلی جواب نداد، امتحان می‌کنم با مسیرهای بعدی…",
                 f"{info.icon} {info.label} • مسیر جایگزین",
                 force=True,
             )
@@ -2195,8 +2199,8 @@ async def _process_url(
         if use_ahm7 and AHM7_GATEWAY is not None:
             await progress.update(
                 15,
-                "▶️ دارم از طریق AHM7 آماده‌اش می‌کنم…",
-                f"{info.icon} {info.label} • مسیر اصلی (AHM7)",
+                "▶️ در حال آماده‌سازی…",
+                f"{info.icon} {info.label} • مسیر اصلی",
                 force=True,
             )
             ahm7_attempt_dir = create_attempt_directory(
@@ -2357,7 +2361,7 @@ async def _process_url(
             reasons.append(ahm7_result.reason or "ahm7_error")
             await progress.update(
                 20,
-                "🔄 سرویس AHM7 جواب نداد، امتحان می‌کنم با مسیرهای بعدی…",
+                "🔄 مسیر اصلی جواب نداد، امتحان می‌کنم با مسیرهای بعدی…",
                 f"{info.icon} {info.label} • مسیر جایگزین",
                 force=True,
             )
@@ -4426,7 +4430,7 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if session.use_yoinku and YOINKU_GATEWAY is not None:
             await selection_progress.processing(
                 12,
-                "▶️ دارم از طریق Yoinku خروجی رو آماده می‌کنم…",
+                "▶️ دارم خروجی رو آماده می‌کنم…",
                 "ارتباط با سرور…",
                 force=True,
             )
@@ -4441,7 +4445,7 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         elif session.use_ahm7 and AHM7_GATEWAY is not None:
             await selection_progress.processing(
                 12,
-                "▶️ دارم از طریق AHM7 خروجی رو آماده می‌کنم…",
+                "▶️ دارم خروجی رو آماده می‌کنم…",
                 "ارتباط با سرور…",
                 force=True,
             )
@@ -4532,7 +4536,7 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await edit_status(
                     query.message,
                     status_card(
-                        "🔄 Yoinku جواب نداد",
+                        "🔄 مسیر اصلی جواب نداد",
                         "دارم مسیرهای قبلی ربات رو امتحان می‌کنم…",
                     ),
                 )
@@ -4551,7 +4555,7 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await edit_status(
                     query.message,
                     status_card(
-                        "🔄 AHM7 جواب نداد",
+                        "🔄 مسیر اصلی جواب نداد",
                         "دارم مسیرهای قبلی ربات رو امتحان می‌کنم…",
                     ),
                 )

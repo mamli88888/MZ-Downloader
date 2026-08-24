@@ -416,7 +416,7 @@ class YoinkuGateway:
                 reason="yoinku_no_download_url",
             )
         suffix = self._suffix_for_filename(filename, expected_kind)
-        final_path = attempt_directory / f"yoinku_{kind_label}{suffix}"
+        final_path = attempt_directory / f"{kind_label}{suffix}"
         try:
             await self._download_file(download_url, final_path, progress_callback)
         except DownloadTooLarge:
