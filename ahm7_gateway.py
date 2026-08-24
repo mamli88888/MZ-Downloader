@@ -25,6 +25,7 @@ import contextlib
 import json
 import logging
 import re
+import ssl
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
@@ -156,6 +157,44 @@ def _platform_label(platform: Platform) -> str:
     return mapping.get(platform, "media")
 
 
+def _build_ssl_context(*, bound_tls12: bool = False) -> ssl.SSLContext:
+    """Build an SSL context tuned for CDN compatibility.
+
+    Some CDNs (notably Hostinger's ``hcdn`` fronting ahm7xmakki.com)
+    terminate TLS with configs that reject OpenSSL's default TLS 1.3
+    ClientHello, sending back a ``tlsv1 alert internal error`` alert
+    during the handshake. Two mitigations are applied:
+
+    * A broad cipher set (``DEFAULT:!aNULL:!eNULL:!MD5``) so OpenSSL
+      can negotiate any server-supported suite rather than the
+      restrictive default list.
+    * When ``bound_tls12`` is set, the context is pinned to TLS 1.2
+      only, sidestepping TLS 1.3 handshake quirks entirely. This is
+      used by the fallback client when the primary (TLS 1.2 + 1.3)
+      client triggers a TLS alert.
+    """
+    ctx = ssl.create_default_context()
+    if bound_tls12:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        ctx.set_ciphers("DEFAULT:!aNULL:!eNULL:!MD5")
+    except ssl.SSLError:  # pragma: no cover — fall back to OpenSSL defaults
+        pass
+    return ctx
+
+
+def _is_tls_error(exc: BaseException) -> bool:
+    """Return True when an exception looks like a TLS handshake failure.
+
+    Used to decide whether to retry on the TLS-1.2-bounded fallback
+    client (CDN handshake rejections) vs. propagate the error as-is
+    (HTTP 4xx/5xx, timeouts, DNS, etc.).
+    """
+    text = str(exc).lower()
+    return "tls" in text or "ssl" in text or "handshake" in text
+
+
 class Ahm7Gateway:
     """AHM7 AllDL gateway."""
 
@@ -174,6 +213,10 @@ class Ahm7Gateway:
         # httpx client is created lazily so we don't bind to the event loop
         # at import time (which breaks Railway's fork-based startup).
         self._client: httpx.AsyncClient | None = None
+        # A second client pinned to TLS 1.2 — created lazily and only used
+        # when the primary client's TLS 1.3 handshake gets rejected by the
+        # CDN with a ``tlsv1 alert internal error`` alert.
+        self._fallback_client: httpx.AsyncClient | None = None
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -194,16 +237,53 @@ class Ahm7Gateway:
                 "timeout": self._request_timeout,
                 "follow_redirects": True,
                 "headers": headers,
+                # Broader cipher set than OpenSSL's restrictive default —
+                # some CDN TLS terminators reject ClientHellos that offer
+                # only modern cipher suites.
+                "verify": _build_ssl_context(),
             }
             if self._proxy_url:
                 kwargs["proxy"] = self._proxy_url
             self._client = httpx.AsyncClient(**kwargs)
         return self._client
 
+    async def _ensure_fallback_client(self) -> httpx.AsyncClient:
+        """TLS-1.2-bounded fallback client.
+
+        Created lazily and only used when the primary client's TLS 1.3
+        handshake gets rejected by the CDN with a ``tlsv1 alert internal
+        error`` alert. Pinning to TLS 1.2 sidesteps the TLS 1.3
+        negotiation quirk entirely while remaining universally
+        supported by modern CDNs.
+        """
+        if self._fallback_client is None or self._fallback_client.is_closed:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0 Safari/537.36"
+                ),
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+            kwargs: dict[str, Any] = {
+                "timeout": self._request_timeout,
+                "follow_redirects": True,
+                "headers": headers,
+                "verify": _build_ssl_context(bound_tls12=True),
+            }
+            if self._proxy_url:
+                kwargs["proxy"] = self._proxy_url
+            self._fallback_client = httpx.AsyncClient(**kwargs)
+        return self._fallback_client
+
     async def close(self) -> None:
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
         self._client = None
+        if self._fallback_client is not None and not self._fallback_client.is_closed:
+            await self._fallback_client.aclose()
+        self._fallback_client = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -391,8 +471,26 @@ class Ahm7Gateway:
         try:
             response = await client.get(self._api_url, params={"url": url})
         except httpx.HTTPError as exc:
-            logger.warning("AHM7 HTTP error for %s: %s", url, exc)
-            return None
+            if not _is_tls_error(exc):
+                logger.warning("AHM7 HTTP error for %s: %s", url, exc)
+                return None
+            # CDN rejected the TLS 1.3 ClientHello with a
+            # ``tlsv1 alert internal error`` — retry on the TLS 1.2
+            # bounded fallback client, which sidesteps the quirk.
+            logger.info(
+                "AHM7 TLS error on primary client for %s: %s — "
+                "retrying with TLS 1.2 fallback",
+                url, exc,
+            )
+            try:
+                fallback = await self._ensure_fallback_client()
+                response = await fallback.get(self._api_url, params={"url": url})
+            except httpx.HTTPError as exc2:
+                logger.warning(
+                    "AHM7 HTTP error for %s (TLS 1.2 fallback also failed): %s",
+                    url, exc2,
+                )
+                return None
         if response.status_code != 200:
             logger.info("AHM7 non-200 for %s: %d", url, response.status_code)
             return None
@@ -496,8 +594,38 @@ class Ahm7Gateway:
         destination: Path,
         progress_callback: ProgressCallback | None,
     ) -> None:
-        """Stream a URL to disk, reporting bytes via ``progress_callback``."""
+        """Stream a URL to disk, reporting bytes via ``progress_callback``.
+
+        Retries once on a TLS handshake error using the TLS-1.2-bounded
+        fallback client — some CDNs reject OpenSSL's default TLS 1.3
+        ClientHello with a ``tlsv1 alert internal error`` alert.
+        """
         client = await self._ensure_client()
+        try:
+            await self._stream_to_disk(client, url, destination, progress_callback)
+        except httpx.HTTPError as exc:
+            if not _is_tls_error(exc):
+                raise
+            logger.info(
+                "AHM7 TLS error streaming %s on primary client: %s — "
+                "retrying with TLS 1.2 fallback",
+                url, exc,
+            )
+            fallback = await self._ensure_fallback_client()
+            # ``destination.open("wb")`` inside the fallback truncates any
+            # partial bytes the primary may have written before failing.
+            await self._stream_to_disk(fallback, url, destination, progress_callback)
+        if destination.stat().st_size == 0:
+            raise InvalidDownload("downloaded file is empty")
+
+    async def _stream_to_disk(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        destination: Path,
+        progress_callback: ProgressCallback | None,
+    ) -> None:
+        """Stream ``url`` to ``destination`` using ``client`` (no retry)."""
         async with client.stream("GET", url) as response:
             if response.status_code >= 400:
                 raise InvalidDownload(f"HTTP {response.status_code} from CDN")
@@ -525,8 +653,6 @@ class Ahm7Gateway:
                             await progress_callback(bytes_written, total or bytes_written)
                         except Exception:  # pragma: no cover
                             logger.exception("progress_callback failed")
-        if destination.stat().st_size == 0:
-            raise InvalidDownload("downloaded file is empty")
 
     async def _extract_audio_ffmpeg(
         self,
@@ -564,11 +690,22 @@ class Ahm7Gateway:
     ) -> DownloadedMedia | None:
         suffix = _suffix_for_url(thumbnail_url, default=".jpg")
         path = attempt_directory / f"thumb{suffix}"
-        client = await self._ensure_client()
+        primary = await self._ensure_client()
         try:
-            response = await client.get(thumbnail_url)
-        except httpx.HTTPError:
-            return None
+            response = await primary.get(thumbnail_url)
+        except httpx.HTTPError as exc:
+            if not _is_tls_error(exc):
+                return None
+            logger.info(
+                "AHM7 TLS error fetching thumbnail %s on primary: %s — "
+                "retrying with TLS 1.2 fallback",
+                thumbnail_url, exc,
+            )
+            try:
+                fallback = await self._ensure_fallback_client()
+                response = await fallback.get(thumbnail_url)
+            except httpx.HTTPError:
+                return None
         if response.status_code != 200 or not response.content:
             return None
         path.write_bytes(response.content)
