@@ -1,0 +1,48 @@
+# ── Secrets & runtime data (NEVER commit these) ─────────────────────────
+.env
+.env.local
+.env.*.local
+
+# Telegram user-account cookies (contain live session tokens)
+cookies.txt
+cookiesins.txt
+
+# Telethon session files (contain string-session tokens)
+*.session
+*.session-journal
+mz_downloader_session_*
+
+# Local SQLite store & downloads
+mz_data.db
+mz_data.db-*
+downloads/
+tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+bot.log
+bot.log.*
+
+# Pixeldrain upload cache
+.pixeldrain_cache/
