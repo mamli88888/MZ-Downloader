@@ -4181,7 +4181,9 @@ async def services_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "🌐 از اینجاها دانلود می‌کنم",
         "📸 Instagram  •  ▶️ YouTube  •  🎵 TikTok\n"
         "𝕏 Twitter/X  •  📘 Facebook  •  🔵 VK\n"
-        "🟢 Spotify  •  ☁️ SoundCloud  •  📌 Pinterest\n\n"
+        "🟢 Spotify  •  ☁️ SoundCloud  •  📌 Pinterest\n"
+        "🟠 Reddit • 👻 Snapchat • 🎬 CapCut\n"
+        "🍫 SnackVideo • 🎵 Douyin • 🔗 +۱۸ سایت دیگر\n\n"
         "فقط کافیه لینک رو بفرستی تا بهترین خروجی ممکن رو آماده کنم.",
         "لینک خصوصی، حذف‌شده یا محدودشده ممکنه قابل دریافت نباشه.",
     )
