@@ -1,165 +1,492 @@
-# MZ Downloader
+<div align="center">
 
-ربات دانلود چنداکانتی تلگرام با مسیریابی اختصاصی، جست‌وجوی YouTube، انتخاب کیفیت، thumbnail، کپشن Instagram، آلبوم ZIP Spotify، نوار پیشرفت، عضویت اجباری و پشتیبانی Railway.
+# MZ Downloader 2
 
-راهنمای کامل انتشار: [RAILWAY_DEPLOY_FA.md](RAILWAY_DEPLOY_FA.md)
-راهنمای ارتقای ۱۴۰۴ (پلتفرم‌های جدید Apify، هشدار توکن، بوکمارک، زمان‌بندی، AI و …): [README_NEW_FEATURES.md](README_NEW_FEATURES.md)
+**ربات چندمنظورهٔ دانلود محتوای تلگرام با معماری چندلایه، هوش مصنوعی و پشتیبانی از ۱۵+ پلتفرم**
 
-## مسیریابی
+[![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://python.org)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](Dockerfile)
+[![Railway](https://img.shields.io/badge/Deploy-Railway-7B3FE4.svg)](railway.json)
 
-- YouTube: مسیر اصلی **VoidDL** (`https://voiddl.app`) است. هر API Key اجازه‌ی ۲۰ دانلود در دقیقه و ۱۰ گیگابایت دانلود در روز دارد؛ چند کلید را در `VOIDDL_API_KEYS` بگذارید تا لحظه‌ای که یکی محدود شد، بلافاصله کلید بعدی استفاده شود. اگر VoidDL شکست بخورد مسیر بعدی **Yoinku**، سپس **Apify** و در نهایت بات‌های تلگرامی (`allsaverbot`، `instadowbot`، `download_it_bot` و `AllSavesBot`) اجرا می‌شوند.
-- Instagram: اگر `APIFY_TOKENS` تنظیم باشد، ابتدا منوی دکمه‌ای کیفیت یا فقط‌صدا از Apify نمایش داده می‌شود؛ Instagram با `apify/instagram-scraper` اجرا می‌شود. اگر Apify خطا دهد یا تنظیم نشده باشد، همان مسیرهای قبلی اجرا می‌شوند.
-- TikTok: `download_it_bot` و سپس `AllSavesBot`
-- Twitter/X / Facebook / VK: فقط `download_it_bot`
-- Spotify track: فقط `spotifysavesbot`
-- Spotify album: دریافت ترتیبی ترک‌ها از `spotisaver.net` و ساخت ZIP
-- SoundCloud: فقط `scload_bot`
-- دامنه‌های دیگر پیش از ارسال به واسط رد می‌شوند.
-- اگر مسیر اختصاصی شکست بخورد، تمام واسط‌های یکتا یک‌بار به‌عنوان fallback اضطراری امتحان می‌شوند.
+[راهنمای استقرار Railway](RAILWAY_DEPLOY_FA.md) · [راهنمای Apify](APIFY_SETUP_FA.md) · [ویژگی‌های جدید](README_NEW_FEATURES.md)
 
-### کارت کیفیت یوتیوب
+</div>
 
-وقتی کاربر لینک یوتیوب می‌فرستد، ربات بهترین کیفیت تامبنیل (maxresdefault) را دانلود و به‌صورت عکس می‌فرستد؛ پیام منبع (مثلاً `youtu.be`)، عنوان و مدت ویدیو، جدول حجم تقریبی هر کیفیت و مهلت انتخاب (پیش‌فرض ۱۰ دقیقه) به‌صورت کپشن زیر همان عکس نمایش داده می‌شود و دکمه‌های کیفیت فقط عدد کیفیت را نشان می‌دهند (مثلاً `480` یا `720` یا `MP3`). حجم‌های نمایش‌داده‌شده از خود VoidDL گرفته می‌شوند.
+---
 
-### لایه سرعت VoidDL (دانلود موازی + پری‌فچ)
+## فهرست مطالب
 
-اندازه‌گیری زنده روی API نشان داد: سرور voiddl هر درخواست دانلود را از نو آماده می‌کند (۱۵–۷۶ ثانیه بسته به حجم فایل و بار سرور؛ کش نمی‌شود)، اما آماده‌سازی درخواست‌های هم‌زمان موازی انجام می‌شود، درخواست‌های Range (HTTP 206) پشتیبانی می‌شوند و پهنای باند هر کلید حدود ۱۲–۱۵MB/s سقف دارد. بر همین اساس:
+- [نگاه کلی](#-نگاه-کلی)
+- [ویژگی‌های کلیدی](#-ویژگیهای-کلیدی)
+- [پلتفرم‌های پشتیبانی‌شده](#-پلتفرمهای-پشتیبانیشده)
+- [معماری سیستم](#-معماری-سیستم)
+- [ساختار پروژه](#-ساختار-پروژه)
+- [لایه‌های دانلود و مسیریابی](#-لایههای-دانلود-و-مسیریابی)
+- [ویژگی‌های پیشرفته](#-ویژگیهای-پیشرفته)
+- [فرمان‌های ربات](#-فرمانهای-ربات)
+- [پیش‌نیازها](#-پیشنیازها)
+- [نصب و اجرای محلی](#-نصب-و-اجرای-محلی)
+- [استقرار روی Railway](#-استقرار-روی-railway)
+- [متغیرهای محیطی](#-متغیرهای-محیطی)
+- [امنیت](#-امنیت)
+- [تکنولوژی‌ها](#-تکنولوژیها)
 
-1. **دانلود چندلایه:** فایل‌های بزرگ (≥۱۶MB) با چند درخواست Range هم‌زمان دانلود می‌شوند (پیش‌فرض تا ۸ لاین با `VOIDDL_PARALLEL_LANES`)؛ لاین‌ها به‌طور خودکار روی کلیدهای موجود پخش می‌شوند و aggregate سرعت تقریباً برابر تعداد کلیدها × ۱۲–۱۵MB/s می‌شود. فایل‌های کوچک تک‌استریم می‌مانند تا توکن محدودیت ۲۰/دقیقه هدر نرود.
-2. **پری‌فچ پس‌زمینه:** به‌محض نمایش کارت کیفیت (حتی قبل از دانلود تامبنیل)، دانلود دو کیفیت محتمل‌تر (اولویت 1080p سپس 720p) به‌همراه MP3 در پس‌زمینه شروع می‌شود (`VOIDDL_PREFETCH_COUNT` و `VOIDDL_PREFETCH_LANES`). اگر کاربر همان کیفیت را انتخاب کند، ربات به دانلود در جریان وصل می‌شود و نتیجه فوری یا با کمترین انتظار می‌رسد.
-3. **صرفه‌جویی:** به‌محض انتخاب کیفیت (یا منقضی شدن سشن)، پری‌فچ‌های بلااستفاده لغو می‌شوند تا پهنای باند روزانه (۱۰ گیگ به ازای هر کلید) نسوزد؛ اگر باقی‌مانده پهنای باند از `VOIDDL_PREFETCH_MIN_REMAINING_MB` (پیش‌فرض ۲ گیگ) کمتر باشد پری‌فچ اصلاً شروع نمی‌شود و فایل‌های بزرگ‌تر از `VOIDDL_PREFETCH_MAX_MB` (پیش‌فرض ۵۱۲ مگ) پری‌فچ نمی‌شوند.
+---
 
-نکته عملی: برای فایل‌های ۲۰۰–۳۰۰ مگی، افزودن ۳–۴ کلید به `VOIDDL_API_KEYS` بیشترین اثر را دارد چون هر کلید یک لوله مستقل سرعت و سهمیه است.
+## 👁 نگاه کلی
 
-## کپشن و عضویت
+MZ Downloader 2 یک ربات تلگرام پیشرفته برای دانلود محتوا از پلتفرم‌های مختلف است. این ربات با **معماری چندلایهٔ مسیریابی**، **دانلود موازی**، **پری‌فچ پس‌زمینه** و **هوش مصنوعی** ساخته شده و از بیش از ۱۵ پلتفرم محتوایی پشتیبانی می‌کند. سورس کد شامل بیش از **۲۰,۰۰۰ خط پایتون** در ۲۶ ماژول است.
 
-- فرمان `/caption لینک` کپشن پست، Reel یا IGTV عمومی Instagram را از فرم `instaspeeder.com` دریافت می‌کند.
-- استفاده از ربات به عضویت در `@MZBOTS_Monitor` و `@ImagePromptLab` نیاز دارد.
-- ربات اصلی باید در هر دو کانال Administrator باشد تا Telegram اجازه‌ی بررسی عضویت کاربران را بدهد.
+---
 
-## جست‌وجوی YouTube
+## ✨ ویژگی‌های کلیدی
 
-- در چت خصوصی کافی است عبارت جست‌وجو را به‌صورت متن عادی بفرستید؛ فرمان `/search عبارت` و میان‌بر `/yt عبارت` نیز در خصوصی و گروه قابل استفاده‌اند.
-- ربات حداکثر ۳۰ نتیجهٔ مرتبط را در پنج صفحه نمایش می‌دهد. هر صفحه یک تصویر شامل شش thumbnail شماره‌دار و سه ردیف دکمهٔ دوتایی دارد.
-- فقط ویدیوهای معمولی و Shorts نگه داشته می‌شوند؛ Live، پخش آینده/ضبط‌شدهٔ زنده، آهنگ و خروجی‌های صوتی از نتایج حذف می‌شوند.
-- دکمه‌های صفحهٔ قبل و بعد همان نتیجه‌های دریافت‌شده را ورق می‌زنند و جست‌وجوی تازه‌ای انجام نمی‌دهند.
-- انتخاب «محتوا» URL استاندارد همان ویدیو را وارد مسیر دانلود فعلی می‌کند؛ منوی کیفیت، فقط صدا و روند ارسال فایل تغییری نمی‌کنند.
-- جست‌وجو به API پولی یا کلید API نیاز ندارد. برای هماهنگی با تغییرات YouTube، نسخهٔ `yt-dlp` را هنگام نگهداری دوره‌ای پروژه به‌روز نگه دارید.
+| ویژگی | توضیح |
+|--------|--------|
+| 🎯 **انتخاب کیفیت** | منوی دکمه‌ای کیفیت (۱۴۴p تا 4K) + فقط صدا (MP3) با نمایش حجم تقریبی |
+| ⚡ **دانلود موازی** | تقسیم فایل‌های بزرگ به چند لاین همزمان با VoidDL (تا ۸ لاین موازی) |
+| 🔮 **پری‌فچ پس‌زمینه** | شروع دانلود احتمالی‌ترین کیفیت‌ها قبل از انتخاب کاربر |
+| 🔀 **چرخش کلید API** | مدیریت هوشمند سهمیه و نرخ چندین کلید API به‌صورت خودکار |
+| 🤖 **هوش مصنوعی** | خلاصه‌سازی فارسی، پیشنهاد هشتگ، سیستم پرسش‌وپاسخ و FAQ هوشمند |
+| 🔍 **جست‌وجوی YouTube** | جست‌وجوی ویدیو با کالاج ۶ تایی thumbnail و حجم تقریبی هر کیفیت |
+| 🎵 **جست‌وجوی آهنگ (Shazam)** | جست‌وجوی آهنگ با ShazamIO + iTunes، تبدیل خودکار به لینک YouTube |
+| 📖 **زیرنویس YouTube** | دریافت زیرنویس فارسی و انگلیسی از طریق downsub.com |
+| 📸 **پروفایل و استوری اینستاگرام** | نمایش اطلاعات پروفایل، نرخ رشد و دانلود استوری‌ها |
+| 🎵 **آلبوم/پلی‌لیست Spotify** | دانلود ترتیبی آلبوم و پلی‌لیست با ساخت فایل ZIP |
+| 🔖 **بوکمارک** | ذخیرهٔ لینک‌های دانلود‌شده برای دسترسی سریع |
+| 📤 **اشتراک‌گذاری خودکار** | ارسال خودکار محتوای دانلود‌شده به کانال/گروه مشخص |
+| 📊 **آمار شخصی** | گزارش ۳۰ روزهٔ دانلودها، حجم، پلتفرم‌ها و نمودار روزانه |
+| ⏰ **زمان‌بندی دانلود** | دانلود خودکار دوره‌ای لینک‌ها (از ۹۰ دقیقه تا ۲ هفته) |
+| 🛡️ **حذف تکراری** | جلوگیری از دانلود مجدد فایل‌های یکسان |
+| 🚨 **هشدار توکن** | اطلاع‌رسانی خودکار ادمین در خرابی توکن‌های Apify |
+| 📏 **حجم دقیق** | محاسبه و نمایش حجم واقعی فایل‌ها با حسابرسی |
+| 🔌 **Circuit Breaker** | قطع‌کنندهٔ مدار برای جلوگیری از فشردن سرویس‌های خراب |
+| 📊 **لاگ‌سازی ساختاریافته** | خروجی JSON لاگ‌ها برای تحلیل آسان |
+| ☁️ **آپلود ابری** | آپلود خودکار فایل‌های بزرگ روی Pixeldrain / Gofile + Cloudflare Worker |
 
-## اجرای محلی
+---
 
-```powershell
-.\venv\Scripts\python.exe -m pip install -r requirements.txt
-.\venv\Scripts\python.exe -m unittest discover -s tests -v
-.\venv\Scripts\python.exe bot.py
+## 🌐 پلتفرم‌های پشتیبانی‌شده
+
+| پلتفرم | نوع محتوا | مسیر اصلی | مسیر پشتیبان |
+|---------|-----------|------------|---------------|
+| **YouTube** | ویدیو، Shorts، صدا | VoidDL → Yoinku | Apify → ربات‌های تلگرامی |
+| **Instagram** | پست، ریلز، IGTV، استوری، کروسل تصویری | AHM7 / Apify | yt-dlp → ربات‌های تلگرامی |
+| **TikTok** | ویدیو (بدون واترمارک) | AHM7 / tikwm.com | ربات‌های تلگرامی |
+| **Twitter / X** | ویدیو، تصویر، متن | Apify / AHM7 | yt-dlp → ربات‌های تلگرامی |
+| **Facebook** | ویدیو | Apify / AHM7 | yt-dlp → ربات‌های تلگرامی |
+| **Spotify** | تراک (MP3)، آلبوم (ZIP)، پلی‌لیست (ZIP) | spotisaver.net / Apify | ربات‌های تلگرامی |
+| **SoundCloud** | تراک (MP3) | yt-dlp / Apify | ربات تلگرامی |
+| **Pinterest** | تصویر (کیفیت اصلی)، ویدیو | yt-dlp / Apify | — |
+| **VK** | ویدیو | ربات تلگرامی | — |
+| **Reddit** | ویدیو، تصویر | AHM7 | Apify / yt-dlp |
+| **Snapchat** | ویدیو | AHM7 | — |
+| **CapCut** | ویدیو | AHM7 | — |
+| **SnackVideo** | ویدیو | AHM7 | — |
+| **Douyin** | ویدیو | AHM7 | — |
+| **یوتیوب جنریک** | Vimeo, Dailymotion, Twitch, Kick, Bilibili و... | yt-dlp | — |
+
+> **توجه:** هر لینک HTTPS ناشناخته‌ای به‌صورت خودکار از طریق yt-dlp امتحان می‌شود.
+
+---
+
+## 🏗 معماری سیستم
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         پیام کاربر                               │
+│                    (لینک / فرمان / متن جستجو)                    │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                        bot.py (۵,۷۴۴ خط)                         │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐   │
+│  │ تشخیص پلتفرم │  │ اعتبارسنجی   │  │ مدیریت نشست کاربر      │   │
+│  │ (routing.py) │  │ عضویت اجباری│  │ (Quality Card/Session) │   │
+│  └──────┬──────┘  └──────────────┘  └────────────────────────┘   │
+└─────────┼────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                   لایهٔ مسیریابی (Routing)                       │
+│                                                                  │
+│  YouTube ──► VoidDL ──► Yoinku ──► Apify ──► ربات‌های تلگرامی    │
+│  Instagram ► AHM7 ──► Apify ──► yt-dlp ──► ربات‌های تلگرامی      │
+│  TikTok ───► AHM7 ──► tikwm ──► ربات‌های تلگرامی                │
+│  Spotify ──► spotisaver / Apify ──► ربات‌های تلگرامی            │
+│  سایر ────► AHM7 / yt-dlp / Apify ──► ربات‌های تلگرامی          │
+└──────────────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    لایهٔ ارسال به کاربر                          │
+│  ┌────────────┐ ┌─────────────┐ ┌──────────────┐ ┌───────────┐   │
+│  │ ارسال مستقیم│ │ بخش‌بندی    │ │ آپلود ابری  │ │ نوار پیشرفت│   │
+│  │ (<50MB)    │ │ (Telegram)  │ │ (Pixeldrain) │ │           │   │
+│  └────────────┘ └─────────────┘ └──────────────┘ └───────────┘   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-## انتشار روی Railway
+---
 
-1. توکن فعلی را در BotFather تعویض کنید؛ نسخه‌ی قدیمی قبلاً در سورس و لاگ محلی بوده است.
-2. روی سیستم محلی sessionهای فعلی را به StringSession تبدیل کنید:
+## 📁 ساختار پروژه
 
-```powershell
-.\venv\Scripts\python.exe export_sessions.py
+```
+MZ-Downloader2/
+├── bot.py                    # نقطهٔ ورود اصلی — ۵,۷۴۴ خط (مدیریت ربات، فرمان‌ها، رویدادها)
+├── config.py                 # پیکربندی از متغیرهای محیطی (dataclass Settings)
+├── routing.py                # تشخیص پلتفرم از URL + تعریف enum Platform
+├── downloader.py             # هستهٔ دانلود — AccountPool, Worker, GatewayResult
+│
+├── voiddl_gateway.py         # دروازهٔ VoidDL (YouTube) — ۱,۶۸۸ خط — دانلود موازی + پری‌فچ
+├── yoinku_gateway.py         # دروازهٔ Yoinku (YouTube) — ۷۴۴ خط
+├── ahm7_gateway.py           # دروازهٔ AHM7 (چندپلتفرمی) — ۷۱۸ خط
+├── apify_gateway.py          # دروازهٔ Apify Actors — ۱,۱۰۴ خط
+├── apify_platforms.py        # تعریف Actorهای Apify برای ۵ پلتفرم جدید
+├── social_gateway.py         # دروازهٔ yt-dlp — ۱,۳۱۲ خط (TikTok/SC/IG/Pinterest/Twitter/FB)
+│
+├── youtube_search.py         # جست‌وجوی YouTube + کالاج thumbnail — ۷۳۳ خط
+├── youtube_subtitle.py       # دریافت زیرنویس YouTube (downsub.com + AES)
+├── mz_shazam_search.py       # جست‌وجوی آهنگ (ShazamIO + iTunes) + کالاج کاور
+├── instagram_profile.py      # پروفایل، استوری و آخرین پست اینستاگرام
+├── instagram_caption.py      # استخراج کپشن پست اینستاگرام (instaspeeder.com)
+├── spotisaver.py             # دانلود آلبوم/پلی‌لیست Spotify (ZIP)
+│
+├── ai_service.py             # سرویس AI — خلاصه، هشتگ، FAQ (HuggingFace/Cohere/Mistral)
+├── user_features.py          # بوکمارک، اشتراک، آمار، زمان‌بندی، حذف تکراری
+├── feature_flags.py          # Feature flags برای ارتقای ۱۴۰۴
+├── token_alerts.py           # سیستم هشدار توکن Apify به ادمین
+├── users_db.py               # مدیریت لیست کاربران (JSON + env)
+├── store.py                  # لایهٔ ذخیره‌سازی SQLite — ۱,۱۲۱ خط
+├── media_size.py             # محاسبه و حسابرسی حجم فایل‌ها
+├── perf.py                   # TTL Cache, Circuit Breaker, Connection Pool, Rate Limiter
+├── pixeldrain_upload.py      # آپلود فایل‌های بزرگ روی Pixeldrain
+├── structured_logging.py     # فرمت‌دهندهٔ JSON لاگ‌ها
+│
+├── migrations/               # فایل‌های SQL مهاجرت
+│   └── 0001_new_features.sql
+├── Dockerfile                # تصویر داکر (Python 3.12-slim + ffmpeg)
+├── railway.json              # تنظیمات استقرار Railway
+├── Procfile                  # فرمان شروع Railway/Heroku
+├── requirements.txt          # وابستگی‌های پایتون
+│
+├── README.md                 # این فایل
+├── INSTALL.md                # راهنمای نصب
+├── RAILWAY_DEPLOY_FA.md      # راهنمای استقرار فارسی Railway
+├── APIFY_SETUP_FA.md         # راهنمای تنظیم Apify فارسی
+├── README_NEW_FEATURES.md    # مستندات ویژگی‌های جدید ۱۴۰۴
+└── replit.md                 # راهنمای Replit
 ```
 
-3. خروجی `TELEGRAM_ACCOUNTS=...` را فقط در Railway Variables قرار دهید.
-4. متغیرهای زیر را در Railway تنظیم کنید:
+---
 
-```text
-BOT_TOKEN=...
-TELEGRAM_ACCOUNTS=[...]
-APIFY_ENABLED=true
-APIFY_TOKENS=token-اول,token-دوم
-APIFY_RUN_TIMEOUT_SECONDS=360
-APIFY_POLL_INTERVAL_SECONDS=3
-APIFY_TOKEN_COOLDOWN_SECONDS=600
-VOIDDL_ENABLED=true
-VOIDDL_API_KEYS=vd_کلید-اول,vd_کلید-دوم,vd_کلید-سوم
-VOIDDL_DAILY_BANDWIDTH_MB=10240
-VOIDDL_PER_MINUTE_LIMIT=20
-# لایه سرعت: دانلود موازی + پری‌فچ پس‌زمینه (پیش‌فرض‌ها مناسب است)
-VOIDDL_PARALLEL_LANES=8
-VOIDDL_PREFETCH=true
-VOIDDL_PREFETCH_COUNT=2
-VOIDDL_PREFETCH_LANES=4
-VOIDDL_PREFETCH_MAX_MB=512
-VOIDDL_PREFETCH_MIN_REMAINING_MB=2048
-VOIDDL_PREFETCH_TTL=720
-USE_PROXY=false
-DOWNLOAD_DIR=/tmp/mz-downloader
-MAX_FILE_SIZE_MB=30
-MAX_DOWNLOAD_SIZE_MB=0
-PRIMARY_DOWNLOADER_BOT=download_it_bot
-SECONDARY_DOWNLOADER_BOT=AllSavesBot
-SPOTIFY_DOWNLOADER_BOT=spotifysavesbot
-SOUNDCLOUD_DOWNLOADER_BOT=scload_bot
-INSTAGRAM_YOUTUBE_BOTS=ziyotech_instagram_downloaderbot,allsaverbot,instadowbot,download_it_bot,AllSavesBot
-TIKTOK_DOWNLOADER_BOTS=download_it_bot,AllSavesBot
+## 🛣 لایه‌های دانلود و مسیریابی
+
+### VoidDL (YouTube — اصلی)
+
+**محدودیت هر کلید:** ۲۰ دانلود/دقیقه + ۱۰ گیگابایت پهنای باند/روز
+
+- **دانلود چندلاینه:** فایل‌های ≥۱۶ مگابایت با چند درخواست Range همزمان دانلود می‌شوند (تا ۸ لاین). سرعت تجمعی ≈ تعداد کلید × ۱۲–۱۵ مگابایت بر ثانیه
+- **پری‌فچ پس‌زمینه:** به‌محض نمایش کارت کیفیت، دانلود ۱۰۸۰p، ۷۲۰p و MP3 شروع می‌شود
+- **مدیریت سهمیه:** چرخش خودکار کلیدها در صورت محدودیت نرخ یا اتمام پهنای باند روزانه
+
+### Yoinku (YouTube — پشتیبان اول)
+
+**محدودیت هر کلید:** ۳۰ درخواست/روز + ۵ درخواست/دقیقه (پنجرهٔ لغزان)
+
+### Apify Actors (چندپلتفرمی — پشتیبان)
+
+از Actorهای ابری Apify برای دانلود استفاده می‌کند:
+
+| پلتفرم | Actor |
+|---------|-------|
+| Instagram | `apify/instagram-scraper` |
+| YouTube | Actor اختصاصی کیفیت |
+| Spotify | `maximedupre/spotify-downloader` |
+| SoundCloud | `easyapi/soundcloud-mp3-downloader` |
+| Twitter/X | `apidojo/tweet-scraper` |
+| Facebook | `apple_yang/facebook-video-audio-downloader` |
+| Pinterest (ویدیو) | `easyapi/pinterest-video-downloader` |
+| Pinterest (تصویر) | `fatihtahta/pinterest-scraper-search` |
+
+### AHM7 (چندپلتفرمی — اصلی برای TikTok/IG/FB/X/Reddit و...)
+
+از API `ahm7xmakki.com/api/alldl` استفاده می‌کند. پشتیبانی از: TikTok، Instagram، Facebook، X/Twitter، Reddit، Snapchat، SoundCloud، CapCut، SnackVideo، Douyin.
+
+### Social Gateway / yt-dlp
+
+استفاده مستقیم از yt-dlp با قابلیت impersonate مرورگر (curl_cffi) برای: TikTok (tikwm.com)، SoundCloud، Instagram، Pinterest، Twitter/X، Facebook و هر URL جنریک.
+
+### ربات‌های واسط تلگرامی
+
+لایهٔ نهایی: ارسال لینک به ربات‌های تلگرامی واسط و دریافت فایل از طریق Telethon.
+
+---
+
+## 🚀 ویژگی‌های پیشرفته
+
+### کارت کیفیت YouTube
+
+وقتی کاربر لینک YouTube می‌فرستد:
+
+1. تامبنیل با بالاترین کیفیت (maxresdefault) دانلود و به‌صورت عکس ارسال می‌شود
+2. عنوان، مدت و منبع ویدیو به‌عنوان کپشن نمایش داده می‌شود
+3. جدول حجم تقریبی هر کیفیت نمایش داده می‌شود
+4. دکمه‌های شمارهٔ کیفیت نمایش داده می‌شوند (مثلاً `480` یا `720` یا `MP3`)
+5. پری‌فچ پس‌زمینه بلافاصله شروع می‌شود
+
+### هوش مصنوعی
+
+- **خلاصه‌سازی فارسی:** دکمهٔ «خلاصه کن» زیر کپشن اینستاگرام و توییت
+- **پیشنهاد هشتگ:** تولید هشتگ‌های فارسی و انگلیسی مرتبط
+- **پاسخ به سوالات:** دستور `/ask` با FAQ محلی + پاسخ AI
+- **پشتیبانی:** HuggingFace Inference Providers، Cohere v2، Mistral
+
+### مدیریت توکن Apify
+
+- ردیابی وضعیت هر توکن (فعال / مشکوک / خراب) در SQLite
+- هشدار PV خودکار به ادمین در خرابی توکن با جزئیات کامل
+- چرخهٔ یادآوری: ۵ بار هر ۱۵ دقیقه تا خوانده شدن
+- داشبورد ادمین با دستور `/tokens`
+
+### Feature Flags
+
+هر ویژگی جدید از ارتقای ۱۴۰۴ قابل فعال/غیرفعال‌سازی مستقل:
+
+| پرچم | متغیر محیطی | پیش‌فرض |
+|-------|-------------|----------|
+| پلتفرم‌های جدید Apify | `APIFY_NEW_PLATFORMS_ENABLED` | فعال |
+| هشدار توکن | `TOKEN_ALERTS_ENABLED` | فعال |
+| بوکمارک | `BOOKMARKS_ENABLED` | فعال |
+| اشتراک‌گذاری خودکار | `AUTOSHARE_ENABLED` | فعال |
+| آمار شخصی | `USER_STATS_ENABLED` | فعال |
+| حذف تکراری | `DEDUPE_ENABLED` | فعال |
+| زمان‌بندی | `SCHEDULER_ENABLED` | فعال |
+| خلاصه AI | `AI_SUMMARY_ENABLED` | فعال |
+| حجم دقیق | `EXACT_SIZES_ENABLED` | فعال |
+| کش عملکرد | `PERF_CACHE_ENABLED` | فعال |
+| Circuit Breaker | `CIRCUIT_BREAKER_ENABLED` | فعال |
+
+---
+
+## 📋 فرمان‌های ربات
+
+| فرمان | توضیح |
+|-------|--------|
+| `/start` | شروع ربات + معرفی |
+| `/help` | راهنمای کامل |
+| `/dl <لینک>` | دانلود لینک (در گروه‌ها) |
+| `/search <عبارت>` یا `/yt <عبارت>` | جست‌وجوی YouTube |
+| `/song <عبارت>` | جست‌وجوی آهنگ (Shazam/iTunes) |
+| `/caption <لینک>` | دریافت کپشن پست اینستاگرام |
+| `/profile <یوزرنیم>` | اطلاعات پروفایل + استوری اینستاگرام |
+| `/bookmarks` | لیست بوکمارک‌ها |
+| `/mystats` | آمار شخصی ۳۰ روزه |
+| `/ask <سوال>` | پرسش از AI |
+| `/schedule <لینک> <بازه>` | دانلود زمان‌بندی‌شده |
+| `/autoshare add/del/list` | مدیریت اشتراک‌گذاری خودکار |
+| `/cancel` | لغو دانلود در حال انجام |
+| `/tokens` | داشبورد وضعیت توکن‌ها (ادمین) |
+| `/adduser <id>` | افزودن کاربر (ادمین) |
+| `/health` | بررسی سلامت (HTTP) |
+
+---
+
+## 📦 پیش‌نیازها
+
+- **Python 3.12+**
+- **ffmpeg** (برای تبدیل صدا توسط yt-dlp)
+- **Telegram Bot Token** — از [@BotFather](https://t.me/botfather) دریافت کنید
+- **اکانت‌های Telethon** — ۱ یا چند اکانت تلگرام با StringSession
+- **Cloudflare Workers** (اختیاری) — برای پروکسی دانلود فایل‌های بزرگ
+
+---
+
+## 🛠 نصب و اجرای محلی
+
+### ۱. کلون و نصب وابستگی‌ها
+
+```bash
+git clone https://github.com/mamli88888/MZ-Downloader2.git
+cd MZ-Downloader2
+python -m venv venv
+source venv/bin/activate   # Linux/macOS
+# venv\Scripts\activate  # Windows
+pip install -r requirements.txt
 ```
 
-5. پروژه را از GitHub به Railway متصل کنید. `Dockerfile` و `railway.json` به‌طور خودکار استفاده می‌شوند. اگر همین پوشه ریشه‌ی repository است Root Directory را خالی بگذارید؛ در monorepo مقدار آن را روی `/MZ Downloader` قرار دهید.
-6. تعداد replica را همیشه روی `1` نگه دارید؛ polling و sessionهای تلگرام نباید هم‌زمان در چند کانتینر اجرا شوند.
+### ۲. تنظیم متغیرهای محیطی
 
-Railway متغیر `PORT` را خودش می‌سازد. مسیر `/health` پس از اتصال حداقل یک اکانت، پاسخ 200 می‌دهد.
+فایل `.env` در مسیر ریشهٔ پروژه بسازید:
 
-`MAX_DOWNLOAD_SIZE_MB=0` فقط سقف داخلی برنامه را غیرفعال می‌کند. فایل بزرگ‌تر از `MAX_FILE_SIZE_MB` روی Gofile آپلود می‌شود و کاربر لینک Cloudflare Worker را می‌گیرد؛ اگر تنظیمات Gofile/Worker ناقص باشد یا آپلود شکست بخورد، فایل طبق رفتار قبلی بخش‌بندی می‌شود.
-
-راهنمای کامل ساخت Token و تنظیم Actorهای Apify در [APIFY_SETUP_FA.md](APIFY_SETUP_FA.md) قرار دارد. Token را فقط در Variables سرویس نگه دارید و هرگز commit نکنید.
-
-## راه‌اندازی Gofile با Cloudflare Worker
-
-در این روش Gofile همچنان فایل را نگه می‌دارد، اما کاربر هیچ لینک Gofile دریافت نمی‌کند. Worker از مسیر Cloudflare به Gofile وصل می‌شود، لینک مستقیم را می‌گیرد و فایل را به‌صورت streaming به کاربر برمی‌گرداند. حذف خودکار فایل از Gofile توسط خود ربات و پس از `GOFILE_DELETE_DELAY_SECONDS` انجام می‌شود.
-
-### ۱) ساخت Worker
-
-1. در Cloudflare یک حساب بسازید یا وارد شوید.
-2. از بخش **Workers & Pages → Create application → Create Worker** یک Worker بسازید.
-3. فایل `cloudflare_worker/src/index.js` همین repository را به‌عنوان کد Worker قرار دهید.
-4. در بخش **Settings → Variables and Secrets** این دو Secret را بسازید:
-
-```text
-GOFILE_API_TOKEN=توکن API حساب Gofile
-WORKER_ACCESS_KEY=یک کلید تصادفی طولانی
+```env
+BOT_TOKEN=توکن-ربات-شما
+TELEGRAM_ACCOUNTS=[]
 ```
 
-برای ساخت کلید تصادفی می‌توانید از `openssl rand -hex 32` استفاده کنید. مقدار Secret را در GitHub یا چت قرار ندهید.
+حداقل یک اکانت Telethon نیاز است. برای راهنمای تبدیل Session به StringSession:
 
-5. Worker را Deploy کنید و URL آن را کپی کنید؛ معمولاً شبیه این است:
-   `https://mz-gofile-proxy.<account>.workers.dev`
-
-### ۲) تنظیم ربات
-
-در Railway یا Replit این متغیرها را تنظیم کنید:
-
-```text
-GOFILE_TOKENS=توکن-اول,توکن-دوم
-GOFILE_DELETE_DELAY_SECONDS=3600
-CLOUDFLARE_WORKER_URL=https://mz-gofile-proxy.example.workers.dev
-CLOUDFLARE_WORKER_ACCESS_KEY=همان-WORKER_ACCESS_KEY
+```bash
+python export_sessions.py
 ```
 
-`CLOUDFLARE_WORKER_ACCESS_KEY` باید دقیقاً با `WORKER_ACCESS_KEY` داخل Cloudflare یکی باشد. `CLOUDFLARE_WORKER_URL` را بدون `/` پایانی وارد کنید.
+### ۳. اجرا
 
-### ۳) تنظیم حساب Gofile
+```bash
+python bot.py
+```
 
-از حساب Gofile به صفحه Profile/API بروید و API token بسازید. API token را فقط در Secretهای Worker و متغیر `GOFILE_TOKENS` سرویس ربات قرار دهید. اگر چند token دارید، با کاما جدا کنید تا ربات بین آن‌ها چرخش کند.
+ربات شروع می‌شود و لاگ‌ها در ترمینال نمایش داده می‌شود. در محیط غیرRailway، لاگ‌ها در `bot.log` هم ذخیره می‌شوند.
 
-### رفتار حذف و خطا
+---
 
-- ربات فایل را روی Gofile آپلود می‌کند.
-- لینک ارسالی به کاربر فقط `CLOUDFLARE_WORKER_URL/download/<folderId>/<fileId>` است.
-- Worker با token امن خودش لینک مستقیم Gofile را می‌گیرد و پاسخ را stream می‌کند؛ فایل روی Worker ذخیره نمی‌شود.
-- پس از زمان `GOFILE_DELETE_DELAY_SECONDS`، ربات فایل Gofile را حذف می‌کند و لینک دیگر کار نمی‌کند.
-- اگر Worker یا Gofile تنظیم نشده باشد، ربات به‌صورت خودکار به ارسال پارت‌های Telegram برمی‌گردد.
-- Worker برای هر درخواست کلید مشترک را بررسی می‌کند و از دسترسی تصادفی به شناسه فایل جلوگیری می‌شود.
+## 🚂 استقرار روی Railway
 
-### تست نهایی
+### مراحل سریع
 
-یک فایل بزرگ‌تر از ۳۰ مگابایت بفرستید. باید پیام لینک دانلود با دامنه `workers.dev` دریافت کنید. لینک را بدون VPN/فیلترشکن در مرورگر باز کنید. سپس بعد از زمان تعیین‌شده، حذف فایل را با باز کردن دوباره لینک بررسی کنید.
+1. **توکن جدید** از BotFather بگیرید و در `BOT_TOKEN` قرار دهید
+2. **Sessionها** را تبدیل و در `TELEGRAM_ACCOUNTS` قرار دهید
+3. **متغیرها** را در Railway Variables تنظیم کنید (بخش [متغیرهای محیطی](#-متغیرهای-محیطی))
+4. **اتصال GitHub** — پروژه را از GitHub به Railway متصل کنید
+5. `Dockerfile` و `railway.json` به‌طور خودکار شناسایی می‌شوند
 
-## امنیت
+### نکات مهم
 
-- `.env`، StringSession، توکن و فایل‌های `*.session` را commit نکنید.
-- دانلودها موقتی هستند و پس از ارسال پاک می‌شوند.
-- لینک‌ها برای پردازش به بات واسط مربوط به همان پلتفرم فرستاده می‌شوند.
+- **تعداد replica** همیشه روی `1` نگه دارید (session تلگرام نباید هم‌زمان اجرا شود)
+- **Root Directory** را خالی بگذارید (اگر ریشهٔ ریپو است) یا `/MZ Downloader` (اگر monorepo)
+- مسیر `/health` پس از اتصال حداقل یک اکانت، پاسخ `200` می‌دهد
+- `PORT` توسط Railway خودش ساخته می‌شود
+
+راهنمای کامل: [RAILWAY_DEPLOY_FA.md](RAILWAY_DEPLOY_FA.md)
+
+---
+
+## ⚙️ متغیرهای محیطی
+
+### متغیرهای ضروری
+
+| متغیر | توضیح | پیش‌فرض |
+|-------|--------|--------|
+| `BOT_TOKEN` | توکن ربات تلگرام | (اجباری) |
+| `TELEGRAM_ACCOUNTS` | لیست JSON اکانت‌ها (api_id, api_hash, string_session) | `[]` |
+
+### VoidDL — دانلودر اصلی YouTube
+
+| متغیر | توضیح | پیش‌فرض |
+|-------|--------|--------|
+| `VOIDDL_ENABLED` | فعال‌سازی دروازه | `true` |
+| `VOIDDL_API_KEYS` | کلیدهای API (کاما‌جدا) | ۱ کلید مرجع |
+| `VOIDDL_DAILY_BANDWIDTH_MB` | سهمیهٔ پهنای باند روزانه هر کلید | `10240` (۱۰ گیگ) |
+| `VOIDDL_PER_MINUTE_LIMIT` | محدودیت نرخ هر کلید | `20` |
+| `VOIDDL_PARALLEL_LANES` | تعداد لاین‌های موازی | `8` |
+| `VOIDDL_PREFETCH` | پری‌فچ پس‌زمینه | `true` |
+| `VOIDDL_PREFETCH_COUNT` | تعداد کیفیت‌های پری‌فچ | `2` |
+| `VOIDDL_PREFETCH_LANES` | لاین‌های هر پری‌فچ | `4` |
+| `VOIDDL_PREFETCH_MAX_MB` | حداکثر حجم فایل برای پری‌فچ | `512` |
+| `VOIDDL_PREFETCH_MIN_REMAINING_MB` | حداقل پهنای باند باقیمانده | `2048` |
+| `VOIDDL_PREFETCH_TTL` | عمر سشن پری‌فچ (ثانیه) | `720` |
+
+### Yoinku — پشتیبان YouTube
+
+| متغیر | توضیح | پیش‌فرض |
+|-------|--------|--------|
+| `YOINKU_ENABLED` | فعال‌سازی | `true` |
+| `YOINKU_API_KEYS` | کلیدهای API | (خالی) |
+| `YOINKU_DAILY_LIMIT` | محدودیت روزانه هر کلید | `30` |
+| `YOINKU_PER_MINUTE_LIMIT` | محدودیت دقیقه‌ای هر کلید | `5` |
+
+### AHM7 — دانلودر چندپلتفرمی
+
+| متغیر | توضیح | پیش‌فرض |
+|-------|--------|--------|
+| `AHM7_ENABLED` | فعال‌سازی | `true` |
+| `AHM7_API_URL` | آدرس API | `https://ahm7xmakki.com/api/alldl` |
+
+### Apify
+
+| متغیر | توضیح | پیش‌فرض |
+|-------|--------|--------|
+| `APIFY_ENABLED` | فعال‌سازی دروازه | `true` |
+| `APIFY_TOKENS` | توکن‌ها (کاما‌جدا) | (خالی) |
+| `APIFY_RUN_TIMEOUT_SECONDS` | حداکثر مدت اجرای Actor | `360` |
+| `APIFY_POLL_INTERVAL_SECONDS` | فاصلهٔ بررسی نتیجه | `3` |
+| `APIFY_TOKEN_COOLDOWN_SECONDS` | زمان cooling توکن خراب | `600` |
+
+### ربات‌های واسط تلگرامی
+
+| متغیر | توضیح | پیش‌فرض |
+|-------|--------|--------|
+| `PRIMARY_DOWNLOADER_BOT` | ربات اصلی | `download_it_bot` |
+| `SECONDARY_DOWNLOADER_BOT` | ربات پشتیبان | `AllSavesBot` |
+| `SPOTIFY_DOWNLOADER_BOT` | ربات اسپاتیفای | `spotifysavesbot` |
+| `SOUNDCLOUD_DOWNLOADER_BOT` | ربات ساوندکلاد | `scload_bot` |
+
+### هوش مصنوعی
+
+| متغیر | توضیح | پیش‌فرض |
+|-------|--------|--------|
+| `AI_API_KEY` | کلید API ارائه‌دهنده | (خالی = خاموش) |
+| `AI_PROVIDER` | `huggingface` / `cohere` / `mistral` / `auto` | `auto` |
+| `AI_MODEL` | نام مدل | مدل پیش‌فرض هر ارائه‌دهنده |
+
+### آپلود ابری
+
+| متغیر | توضیح | پیش‌فرض |
+|-------|--------|--------|
+| `PIXELDRAIN_API_KEY` | کلید API Pixeldrain | (خالی) |
+| `CLOUDFLARE_WORKER_URL` | URL Worker کلادفلر | (خالی) |
+| `CLOUDFLARE_WORKER_ACCESS_KEY` | کلید دسترسی Worker | (خالی) |
+
+### متغیرهای عمومی
+
+| متغیر | توضیح | پیش‌فرض |
+|-------|--------|--------|
+| `DOWNLOAD_DIR` | مسیر دانلود موقت | `/tmp/mz-downloader` |
+| `MAX_FILE_SIZE_MB` | سقف ارسال مستقیم تلگرام | `30` |
+| `MAX_DOWNLOAD_SIZE_MB` | سقف داخلی برنامه (`0` = بدون محدودیت) | `0` |
+| `USE_PROXY` | استفاده از پروکسی | `false` |
+| `PROXY_TYPE` | نوع پروکسی (`socks5` / `http`) | `socks5` |
+| `PROXY_HOST` | آدرس پروکسی | `127.0.0.1` |
+| `PROXY_PORT` | پورت پروکسی | `10808` |
+| `BOT_ADMIN_CHAT_ID` | شناسه عددی ادمین (برای هشدارها) | `0` |
+| `KNOWN_USERS` | لیست ID کاربران مجاز (کاما‌جدا) | (خالی) |
+| `LOG_FORMAT` | فرمت لاگ (`json` / سایر) | (ساده) |
+
+---
+
+## 🔒 امنیت
+
+- **هرگز** فایل‌های `.env`، `*.session` و StringSession را commit نکنید
+- **هرگز** توکن‌ها و کلیدهای API را در کد یا لاگ قرار ندهید
+- فایل‌های دانلود‌شده پس از ارسال پاک می‌شوند
+- لینک‌ها فقط به سرویس‌های مربوط به همان پلتفرم ارسال می‌شوند
+- Cloudflare Worker از کلید دسترسی مشترک برای جلوگیری از دسترسی تصادفی استفاده می‌کند
+- فایل‌های ابری پس از زمان تعیین‌شده به‌صورت خودکار حذف می‌شوند
+
+---
+
+## 🔧 تکنولوژی‌ها
+
+| تکنولوژی | نقش |
+|-----------|--------|
+| **Python 3.12** | زبان اصلی |
+| **python-telegram-bot** | فریمورک ربات تلگرام (asyncio) |
+| **Telethon** | کلاینت تلگرام برای ربات‌های واسط |
+| **httpx** | HTTP client ناهمگام (HTTP/2 + SOCKS5) |
+| **yt-dlp** | دانلودر جنریک (SoundCloud, Pinterest, Twitter, ...) |
+| **curl_cffi** | Impersonate مرورگر Chrome (دور زدن bot detection) |
+| **Pillow** | پردازش تصویر و ساخت کالاج |
+| **ShazamIO** | جست‌وجوی آهنگ |
+| **pycryptodome** | رمزگشایی AES زیرنویس YouTube |
+| **SQLite** | ذخیره‌سازی داده‌های کاربر و ویژگی‌ها |
+| **ffmpeg** | تبدیل فرمت صدا/تصویر |
+| **Docker** | بسته‌بندی و استقرار |
+| **Railway** | پلتفرم استقرار ابری |
+
+---
+
+## 📄 مجوز
+
+این پروژه تحت مجوز MIT منتشر شده است.
