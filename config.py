@@ -90,6 +90,19 @@ class Settings:
     voiddl_api_keys: tuple[str, ...]
     voiddl_daily_bandwidth_mb: int
     voiddl_per_minute_limit: int
+    # VoidDL speed layer: parallel ranged lanes + background prefetch.
+    # The server prepares every request fresh (15-35 s, NOT cached) but
+    # preparations for concurrent requests run in parallel, so firing N
+    # lanes at once yields ~N x per-connection throughput. The prefetch
+    # starts the most likely qualities while the user is still looking
+    # at the quality card, hiding the preparation wait.
+    voiddl_parallel_lanes: int
+    voiddl_prefetch_enabled: bool
+    voiddl_prefetch_count: int
+    voiddl_prefetch_lanes: int
+    voiddl_prefetch_max_mb: int
+    voiddl_prefetch_min_remaining_mb: int
+    voiddl_prefetch_ttl: int
     # Apify Actors for public YouTube and Instagram downloads. Tokens rotate
     # when a token-side error, quota problem, or billing limit is reported.
     apify_enabled: bool
@@ -268,6 +281,14 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         ),
         voiddl_daily_bandwidth_mb=_as_int(env, "VOIDDL_DAILY_BANDWIDTH_MB", 10240, minimum=1),
         voiddl_per_minute_limit=_as_int(env, "VOIDDL_PER_MINUTE_LIMIT", 20, minimum=1),
+        # Speed layer — see the dataclass comment above for the rationale.
+        voiddl_parallel_lanes=_as_int(env, "VOIDDL_PARALLEL_LANES", 8, minimum=1),
+        voiddl_prefetch_enabled=_as_bool(env.get("VOIDDL_PREFETCH"), True),
+        voiddl_prefetch_count=_as_int(env, "VOIDDL_PREFETCH_COUNT", 2, minimum=0),
+        voiddl_prefetch_lanes=_as_int(env, "VOIDDL_PREFETCH_LANES", 4, minimum=1),
+        voiddl_prefetch_max_mb=_as_int(env, "VOIDDL_PREFETCH_MAX_MB", 512, minimum=1),
+        voiddl_prefetch_min_remaining_mb=_as_int(env, "VOIDDL_PREFETCH_MIN_REMAINING_MB", 2048, minimum=0),
+        voiddl_prefetch_ttl=_as_int(env, "VOIDDL_PREFETCH_TTL", 720, minimum=60),
         apify_enabled=_as_bool(env.get("APIFY_ENABLED"), True),
         # APIFY_TOKEN remains accepted for backward compatibility. Prefer the
         # comma-separated APIFY_TOKENS variable for rotation and failover.

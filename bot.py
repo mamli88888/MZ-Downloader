@@ -238,6 +238,15 @@ if SETTINGS.voiddl_enabled and SETTINGS.voiddl_api_keys:
             else None
         ),
         max_download_size=SETTINGS.max_download_size,
+        # Speed layer: parallel ranged lanes + background prefetch of the
+        # most likely qualities while the user is still choosing.
+        parallel_lanes=SETTINGS.voiddl_parallel_lanes,
+        prefetch_enabled=SETTINGS.voiddl_prefetch_enabled,
+        prefetch_count=SETTINGS.voiddl_prefetch_count,
+        prefetch_lanes=SETTINGS.voiddl_prefetch_lanes,
+        prefetch_max_bytes=SETTINGS.voiddl_prefetch_max_mb * 1024 * 1024,
+        prefetch_min_remaining=SETTINGS.voiddl_prefetch_min_remaining_mb * 1024 * 1024,
+        prefetch_ttl=SETTINGS.voiddl_prefetch_ttl,
     )
 logger.info(
     "voiddl gateway %s (keys=%d, per_minute=%d)",
@@ -1956,6 +1965,14 @@ def release_pending_selection(session: PendingSelection) -> None:
         PENDING_SELECTIONS.pop(session.token, None)
     if session.caption_task is not None and not session.caption_task.done():
         session.caption_task.cancel()
+    # Stop any background VoidDL prefetch for this URL so it stops
+    # burning daily bandwidth — must run BEFORE the directory cleanup
+    # below deletes the files the prefetch is still writing.
+    if session.use_voiddl and VOIDDL_GATEWAY is not None:
+        try:
+            VOIDDL_GATEWAY.cancel_prefetch(session.source_url)
+        except Exception:  # pragma: no cover — cleanup must never raise
+            logger.exception("VoidDL prefetch cancel failed")
     # YouTube-sites sessions don't hold a Telegram worker lease — skip the
     # pool release in that case.
     if session.lease is not None:

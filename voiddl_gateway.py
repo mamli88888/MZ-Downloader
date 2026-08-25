@@ -23,9 +23,34 @@ via ``VOIDDL_API_KEYS``:
 
 The thumbnail shown on the quality card is downloaded with the same
 URL scheme used by the YouTube-Thumbnail-Downloader web app
-(https://github.com/harsh98trivedi/YouTube-Thumbnail-Downloader):
+(https://github.com/har98trivedi/YouTube-Thumbnail-Downloader):
 ``https://i.ytimg.com/vi/{id}/maxresdefault.jpg`` with fallbacks to
 ``sddefault`` → ``hqdefault`` → ``mqdefault``.
+
+Speed layer — parallel lanes + prefetch
+--------------------------------------
+Live measurements against the API showed:
+
+* Every ``GET /api/v1/download`` request pays a fresh server-side
+  preparation pass (~15-35 s) that is NOT cached between requests.
+* Preparations for CONCURRENT requests run in parallel.
+* The endpoint honours ``Range`` requests (206 + ``Content-Range``),
+  and each ranged request costs ONE rate-limit token while bandwidth
+  is charged only for the bytes actually served.
+
+The gateway therefore:
+
+1. Splits large downloads into N simultaneous ranged "lanes" —
+   aggregate throughput ≈ N × per-connection speed. All lanes are
+   fired at the same instant (a late lane would restart a fresh
+   preparation window for its slice). Small files (<16 MB) stay on a
+   single stream to conserve rate-limit tokens.
+2. Prefetches the most likely qualities (1080p, 720p, MP3) in the
+   background the moment the quality card is sent — the preparation
+   window then overlaps with the user's decision time. ``select()``
+   attaches to the in-flight/finished prefetch for instant results.
+3. Cancels unclaimed prefetches as soon as the user picks a quality
+   (or the session expires) so they stop burning daily bandwidth.
 
 API contract with the bot
 -------------------------
@@ -166,6 +191,22 @@ def _decode_fingerprint(fingerprint: str) -> dict[str, Any] | None:
         return json.loads(fingerprint[len("voiddl:"):])
     except json.JSONDecodeError:
         return None
+
+
+def _final_path_from_payload(payload: dict[str, Any], attempt_directory: Path) -> Path:
+    """Deterministic output path for a fingerprint payload.
+
+    Used by BOTH the background prefetch and ``select()`` so a
+    prefetched file lands exactly where the later selection expects
+    to find it.
+    """
+    expected_kind = MediaKind.AUDIO if payload.get("kind") == "audio" else MediaKind.VIDEO
+    ext = "." + str(payload.get("ext") or ("m4a" if expected_kind == MediaKind.AUDIO else "mp4")).lstrip(".")
+    title = str(payload.get("title") or "video")
+    height = payload.get("height")
+    quality_tag = "audio" if expected_kind == MediaKind.AUDIO else f"{height or ''}p"
+    stem = _safe_filename(f"{title} [{quality_tag}]".strip())
+    return attempt_directory / f"{stem}{ext}"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -347,6 +388,63 @@ class VoidDLKeyPool:
                 })
             return snapshot
 
+    async def best_remaining(self) -> int:
+        """Largest remaining daily bandwidth across all keys (bytes)."""
+        async with self._lock:
+            today = self._today_utc()
+            best = 0
+            for state in self._keys:
+                self._rollover_daily(state, today)
+                best = max(best, self._daily_bandwidth - state.daily_bytes)
+            return best
+
+
+# ─────────────────────────────────────────────────────────────
+# Parallel-download helpers
+# ─────────────────────────────────────────────────────────────
+
+
+class _RangeUnsupported(Exception):
+    """The server ignored our Range header (plain 200) — the caller
+    falls back to a single stream."""
+
+
+class _LaneFailure(Exception):
+    """A parallel lane could not complete even after its retry."""
+
+    def __init__(self, message: str, *, code: str = "network") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class _PrefetchEntry:
+    """One background download started when the quality card was sent."""
+
+    __slots__ = ("fingerprint", "url", "task", "destination", "hub",
+                 "expected_size", "result", "created_at")
+
+    def __init__(
+        self,
+        *,
+        fingerprint: str,
+        url: str,
+        task: asyncio.Task,
+        destination: Path,
+        expected_size: int,
+    ) -> None:
+        self.fingerprint = fingerprint
+        self.url = url
+        self.task = task
+        self.destination = destination
+        self.expected_size = expected_size
+        self.result: GatewayResult | None = None
+        self.created_at = time.monotonic()
+        self.hub: dict[str, Any] = {
+            "downloaded": 0,
+            "total": expected_size,
+            "started": time.monotonic(),
+        }
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Gateway
@@ -367,6 +465,13 @@ class VoidDLGateway:
         max_download_size: int = 0,
         request_timeout: float = 60.0,
         download_read_timeout: float = 600.0,
+        parallel_lanes: int = 8,
+        prefetch_enabled: bool = True,
+        prefetch_count: int = 2,
+        prefetch_lanes: int = 4,
+        prefetch_max_bytes: int = 512 * 1024 * 1024,
+        prefetch_min_remaining: int = 2 * 1024 * 1024 * 1024,
+        prefetch_ttl: float = 720.0,
     ) -> None:
         if not api_keys:
             raise ValueError("VoidDLGateway requires at least one API key (VOIDDL_API_KEYS)")
@@ -381,6 +486,25 @@ class VoidDLGateway:
         self._request_timeout = request_timeout
         self._download_read_timeout = download_read_timeout
         self._client: httpx.AsyncClient | None = None
+        # ── Speed layer ──────────────────────────────────────────────
+        # Every /api/v1/download request triggers a fresh server-side
+        # preparation pass (~15-35 s, NOT cached), but preparations for
+        # concurrent requests run in PARALLEL. Two consequences:
+        #   1. Downloads are split into N simultaneous ranged requests
+        #      ("lanes") — aggregate throughput ≈ N × per-connection.
+        #   2. The most likely qualities are prefetched in the background
+        #      the moment the quality card is shown, so the preparation
+        #      window overlaps with the user's decision time.
+        # Each lane request costs one rate-limit token (20/min per key)
+        # but bandwidth is only charged for the bytes actually served.
+        self._parallel_lanes = max(1, int(parallel_lanes))
+        self._prefetch_enabled = bool(prefetch_enabled)
+        self._prefetch_count = max(0, int(prefetch_count))
+        self._prefetch_lanes = max(1, int(prefetch_lanes))
+        self._prefetch_max_bytes = int(prefetch_max_bytes)
+        self._prefetch_min_remaining = int(prefetch_min_remaining)
+        self._prefetch_ttl = float(prefetch_ttl)
+        self._prefetch: dict[str, _PrefetchEntry] = {}
 
     @property
     def pool(self) -> VoidDLKeyPool:
@@ -403,6 +527,11 @@ class VoidDLGateway:
         return self._client
 
     async def close(self) -> None:
+        # Stop any background prefetch before tearing down the client.
+        for entry in list(self._prefetch.values()):
+            if not entry.task.done():
+                entry.task.cancel()
+        self._prefetch.clear()
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
         self._client = None
@@ -442,8 +571,21 @@ class VoidDLGateway:
                 bot_username=VOIDDL_PROVIDER,
                 reason="voiddl_extract_failed",
             )
+        # Build the menu first (pure CPU) so the prefetch can start BEFORE
+        # we spend 1-3 s downloading the thumbnail — every second of lead
+        # time hides more of the server-side preparation window.
+        menu = self._build_menu(url, data, None)
+        if menu.status == "needs_selection" and self._prefetch_enabled:
+            # Speed layer: start downloading the most likely picks in the
+            # background while the user is still choosing a quality.
+            try:
+                await self._start_prefetches(normalized, menu.options, attempt_directory)
+            except Exception:  # noqa: BLE001 — prefetch must never break the menu
+                logger.exception("VoidDL prefetch bootstrap failed")
         preview = await self._download_thumbnail(normalized, attempt_directory)
-        return self._build_menu(url, data, preview)
+        if preview is not None:
+            menu = self._build_menu(url, data, preview)
+        return menu
 
     async def select(
         self,
@@ -455,7 +597,15 @@ class VoidDLGateway:
         progress_callback: ProgressCallback | None = None,
         processing_callback: Callable[..., Awaitable[None]] | None = None,
     ) -> GatewayResult:
-        """Call ``GET /api/v1/download`` for the chosen format and stream it."""
+        """Return the chosen format — via prefetch when available.
+
+        When the quality card was sent, ``request()`` started background
+        downloads for the most likely qualities. If the user picked one
+        of those we simply attach to the in-flight (or already finished)
+        download — the server-side preparation window happened while the
+        user was still deciding, so the perceived wait collapses to the
+        remaining preparation + a fast multi-lane transfer.
+        """
         payload = _decode_fingerprint(option.fingerprint)
         if payload is None or not payload.get("format_id"):
             return GatewayResult(
@@ -465,17 +615,48 @@ class VoidDLGateway:
             )
         format_id = str(payload["format_id"])
         expected_kind = MediaKind.AUDIO if payload.get("kind") == "audio" else MediaKind.VIDEO
-        ext = "." + str(payload.get("ext") or ("m4a" if expected_kind == MediaKind.AUDIO else "mp4")).lstrip(".")
-        title = str(payload.get("title") or "video")
-        height = payload.get("height")
+        try:
+            expected_size = int(payload.get("filesize") or 0)
+        except (TypeError, ValueError):
+            expected_size = 0
         normalized = normalize_youtube_url(url)
+        final_path = _final_path_from_payload(payload, attempt_directory)
 
-        quality_tag = "audio" if expected_kind == MediaKind.AUDIO else f"{height or ''}p"
-        stem = _safe_filename(f"{title} [{quality_tag}]".strip())
-        final_path = attempt_directory / f"{stem}{ext}"
+        # ── Fast path: a prefetch for THIS quality exists ─────────────
+        entry = self._prefetch.get(option.fingerprint)
+        if entry is not None and entry.destination == final_path:
+            # Stop the sibling prefetches — the user made their choice
+            # and the unclaimed ones should stop burning bandwidth.
+            self._cancel_sibling_prefetches(normalized, keep=option.fingerprint)
+            await self._await_entry(entry, progress_callback, processing_callback)
+            self._prefetch.pop(option.fingerprint, None)
+            result = entry.result
+            if (
+                result is not None
+                and result.status == "ready"
+                and entry.destination.exists()
+            ):
+                logger.info("VoidDL prefetch hit for format %s", format_id)
+                return result
+            # Prefetch failed (or its file vanished) — download fresh.
+            logger.info(
+                "VoidDL prefetch for format %s unusable — downloading fresh",
+                format_id,
+            )
+        else:
+            # User picked a quality we did NOT prefetch — stop every
+            # background download for this URL before starting a new one.
+            self.cancel_prefetch(normalized)
 
         result = await self._download_with_rotation(
-            normalized, format_id, expected_kind, final_path, progress_callback
+            normalized,
+            format_id,
+            expected_kind,
+            final_path,
+            progress_callback,
+            hub={"downloaded": 0, "total": expected_size, "started": time.monotonic()},
+            expected_size=expected_size,
+            processing_callback=processing_callback,
         )
         if result is not None:
             return result
@@ -550,6 +731,383 @@ class VoidDLGateway:
         expected_kind: MediaKind,
         destination: Path,
         progress_callback: ProgressCallback | None,
+        *,
+        hub: dict[str, Any] | None = None,
+        expected_size: int = 0,
+        processing_callback: Callable[..., Awaitable[None]] | None = None,
+        lanes: int | None = None,
+    ) -> GatewayResult | None:
+        """Download ``format_id`` — parallel ranged lanes when possible.
+
+        Dispatches to the multi-lane downloader for files large enough to
+        be worth several rate-limit tokens, and falls back to the classic
+        single-stream rotation when the server ignores Range headers or
+        the size is unknown/too small.
+        """
+        if hub is None:
+            hub = {"downloaded": 0, "total": expected_size, "started": time.monotonic()}
+        lane_count = self._parallel_lanes if lanes is None else lanes
+        if lane_count > 1 and expected_size >= 16 * 1024 * 1024:
+            # Scale the lane count with the file size so small downloads
+            # do not burn rate-limit tokens they cannot benefit from:
+            # 16-32 MB → 2 lanes, … , ≥128 MB → full width.
+            lane_count = min(lane_count, max(2, expected_size // (16 * 1024 * 1024)))
+            try:
+                return await self._download_parallel(
+                    url,
+                    format_id,
+                    expected_kind,
+                    destination,
+                    progress_callback,
+                    hub=hub,
+                    expected_size=expected_size,
+                    processing_callback=processing_callback,
+                    lane_count=lane_count,
+                )
+            except _RangeUnsupported:
+                logger.info("VoidDL ignored Range for %s — single stream", format_id)
+            except DownloadTooLarge:
+                return GatewayResult(
+                    status="error",
+                    bot_username=VOIDDL_PROVIDER,
+                    reason="too_large",
+                )
+        return await self._download_single(
+            url,
+            format_id,
+            expected_kind,
+            destination,
+            progress_callback,
+            hub=hub,
+            processing_callback=processing_callback,
+        )
+
+    # ------------------------------------------------------------------
+    # Parallel ranged download
+    # ------------------------------------------------------------------
+
+    async def _download_parallel(
+        self,
+        url: str,
+        format_id: str,
+        expected_kind: MediaKind,
+        destination: Path,
+        progress_callback: ProgressCallback | None,
+        *,
+        hub: dict[str, Any],
+        expected_size: int,
+        processing_callback: Callable[..., Awaitable[None]] | None,
+        lane_count: int,
+    ) -> GatewayResult:
+        """Fetch one file through N simultaneous ranged requests.
+
+        The server prepares every request independently (there is no
+        cross-request cache) but preparations run concurrently, so all
+        lanes must be fired AT THE SAME INSTANT — adding a lane later
+        would restart a fresh 15-35 s preparation for its slice. The
+        last lane is open-ended (``bytes=N-``) so a size mismatch with
+        the extract metadata self-heals: the authoritative total from
+        its ``Content-Range`` header drives a final truncate.
+        """
+        if self._max_download_size and expected_size > self._max_download_size:
+            raise DownloadTooLarge(f"file exceeds max download size ({expected_size} bytes)")
+        client = await self._ensure_client()
+
+        # Acquire a key per lane up front — a key may serve several lanes
+        # while it still has per-minute tokens.
+        lane_keys: list[str] = []
+        for _ in range(lane_count):
+            key = await self._pool.acquire()
+            if key is None:
+                break
+            lane_keys.append(key)
+        if not lane_keys:
+            logger.info("VoidDL: all keys exhausted before download could start")
+            return GatewayResult(
+                status="error",
+                bot_username=VOIDDL_PROVIDER,
+                reason="voiddl_all_keys_exhausted",
+            )
+        if len(lane_keys) < lane_count:
+            logger.info(
+                "VoidDL: only %d/%d lanes have rate-limit tokens", len(lane_keys), lane_count,
+            )
+
+        hub["total"] = expected_size
+        chunk = expected_size // len(lane_keys)
+        ranges: list[tuple[int, int | None, str]] = []
+        offset = 0
+        for index, key in enumerate(lane_keys):
+            if index == len(lane_keys) - 1:
+                ranges.append((offset, None, key))
+            else:
+                ranges.append((offset, offset + chunk - 1, key))
+                offset += chunk
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # Preallocate so every lane can seek to its own offset.
+        with destination.open("wb") as handle:
+            handle.truncate(expected_size)
+
+        monitor = asyncio.create_task(
+            self._monitor_hub(hub, progress_callback, processing_callback)
+        )
+        started = time.monotonic()
+        range_unsupported = False
+        error_result: GatewayResult | None = None
+        try:
+            async with asyncio.TaskGroup() as group:
+                for lo, hi, key in ranges:
+                    group.create_task(
+                        self._lane_worker(
+                            client, url, format_id, destination, lo, hi, key,
+                            hub, progress_callback,
+                        )
+                    )
+        except* _RangeUnsupported:
+            destination.unlink(missing_ok=True)
+            range_unsupported = True
+        except* DownloadTooLarge:
+            destination.unlink(missing_ok=True)
+            error_result = GatewayResult(
+                status="error",
+                bot_username=VOIDDL_PROVIDER,
+                reason="too_large",
+            )
+        except* _LaneFailure as group_error:
+            destination.unlink(missing_ok=True)
+            codes = {exc.code for exc in group_error.exceptions}
+            reason = "voiddl_all_keys_exhausted" if codes == {"rate"} else "voiddl_stream_error"
+            logger.warning(
+                "VoidDL parallel download failed for %s (lanes=%d): %s",
+                format_id, len(ranges), group_error.exceptions,
+            )
+            error_result = GatewayResult(
+                status="error",
+                bot_username=VOIDDL_PROVIDER,
+                reason=reason,
+            )
+        except* httpx.HTTPError as group_error:
+            destination.unlink(missing_ok=True)
+            logger.warning("VoidDL parallel download crashed: %s", group_error.exceptions)
+            error_result = GatewayResult(
+                status="error",
+                bot_username=VOIDDL_PROVIDER,
+                reason="voiddl_stream_error",
+            )
+        finally:
+            monitor.cancel()
+
+        # NOTE: raised OUTSIDE the except* clause — a bare `raise` inside
+        # except* would propagate an ExceptionGroup instead, which the
+        # plain `except _RangeUnsupported` in _download_with_rotation
+        # would not catch.
+        if range_unsupported:
+            raise _RangeUnsupported("server ignored Range headers")
+        if error_result is not None:
+            return error_result
+
+        # Reconcile the file length with the authoritative total from the
+        # open-ended tail lane (fixes both over- and under-estimates).
+        true_total = hub.get("true_total")
+        if isinstance(true_total, int) and true_total > 0:
+            with destination.open("r+b") as handle:
+                handle.truncate(true_total)
+        final_size = destination.stat().st_size
+        if final_size == 0:
+            destination.unlink(missing_ok=True)
+            raise InvalidDownload("downloaded file is empty")
+        elapsed = time.monotonic() - started
+        logger.info(
+            "VoidDL parallel download: %s in %.1fs (%.1f MB/s, %d lanes)",
+            _fmt_size(final_size), elapsed, final_size / max(elapsed, 0.001) / 1024 / 1024,
+            len(ranges),
+        )
+        media = DownloadedMedia(
+            path=destination,
+            kind=expected_kind,
+            source_message_id=0,
+            mime_type=_mime_for(destination.suffix, kind=expected_kind),
+            size=final_size,
+        )
+        return GatewayResult(
+            status="ready",
+            bot_username=VOIDDL_PROVIDER,
+            media=(media,),
+        )
+
+    async def _lane_worker(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        format_id: str,
+        destination: Path,
+        lo: int,
+        hi: int | None,
+        key: str,
+        hub: dict[str, Any],
+        progress_callback: ProgressCallback | None,
+    ) -> int:
+        """Stream one byte-range slice to ``destination`` at offset ``lo``.
+
+        Retries once — with a FRESH key and only the remaining sub-range —
+        on pre-stream rejections or mid-stream network errors. Returns the
+        number of bytes this worker wrote.
+        """
+        written = 0
+        attempt_key = key
+        try:
+            for attempt in range(2):
+                before_attempt = written
+                headers = {"Authorization": f"Bearer {attempt_key}"}
+                if hi is None:
+                    headers["Range"] = f"bytes={lo + written}-"
+                else:
+                    headers["Range"] = f"bytes={lo + written}-{hi}"
+                try:
+                    async with client.stream(
+                        "GET",
+                        f"{self._api_base}/api/v1/download",
+                        headers=headers,
+                        params={"url": url, "format_id": format_id},
+                    ) as response:
+                        if response.status_code == 429:
+                            await self._pool.mark_minute_exhausted(attempt_key)
+                            replacement = await self._pool.acquire()
+                            if replacement is not None and attempt == 0:
+                                attempt_key = replacement
+                                continue
+                            raise _LaneFailure("rate limited", code="rate")
+                        if response.status_code in {402, 403}:
+                            await self._pool.mark_daily_exhausted(attempt_key)
+                            replacement = await self._pool.acquire()
+                            if replacement is not None and attempt == 0:
+                                attempt_key = replacement
+                                continue
+                            raise _LaneFailure(f"HTTP {response.status_code}", code="rate")
+                        if response.status_code == 416:
+                            # This lane's range starts beyond EOF — happens
+                            # when the extract's filesize over-estimates the
+                            # real size. Nothing to fetch for this slice.
+                            return written
+                        if response.status_code >= 400:
+                            # Server-side error for THIS video — no point
+                            # burning more keys; fail the whole download.
+                            await response.aread()
+                            raise _LaneFailure(f"HTTP {response.status_code}", code="http")
+                        content_type = (response.headers.get("content-type") or "").lower()
+                        if "application/json" in content_type:
+                            body = (await response.aread()).decode("utf-8", errors="replace")[:300]
+                            logger.info("VoidDL lane returned JSON: %s", body)
+                            replacement = await self._pool.acquire()
+                            if replacement is not None and attempt == 0:
+                                attempt_key = replacement
+                                continue
+                            raise _LaneFailure("json body", code="json")
+                        if response.status_code == 200:
+                            # The server ignored the Range header — this
+                            # body is the WHOLE file. Signal the caller to
+                            # fall back to a single stream.
+                            raise _RangeUnsupported()
+                        # 206 Partial Content — parse the authoritative
+                        # total from "bytes lo-hi/TOTAL".
+                        content_range = response.headers.get("content-range") or ""
+                        match = re.search(r"/(\d+)$", content_range)
+                        if match:
+                            hub["true_total"] = int(match.group(1))
+                            if (
+                                self._max_download_size
+                                and hub["true_total"] > self._max_download_size
+                            ):
+                                raise DownloadTooLarge(
+                                    f"file exceeds max download size ({hub['true_total']} bytes)"
+                                )
+                        await self._pool.sync_from_headers(attempt_key, response.headers)
+                        with destination.open("r+b") as handle:
+                            handle.seek(lo + written)
+                            async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                                if not chunk:
+                                    continue
+                                handle.write(chunk)
+                                written += len(chunk)
+                                hub["downloaded"] = hub.get("downloaded", 0) + len(chunk)
+                                if progress_callback is not None:
+                                    try:
+                                        await progress_callback(
+                                            hub["downloaded"],
+                                            hub.get("true_total") or hub.get("total") or 0,
+                                        )
+                                    except Exception:  # pragma: no cover
+                                        logger.exception("progress_callback failed")
+                    await self._pool.record_bytes(attempt_key, written - before_attempt)
+                    return written
+                except asyncio.CancelledError:
+                    raise
+                except httpx.HTTPError as exc:
+                    logger.warning("VoidDL lane %s-%s failed: %s", lo, hi or "EOF", exc)
+                    await self._pool.record_bytes(attempt_key, written - before_attempt)
+                    replacement = await self._pool.acquire()
+                    if replacement is not None and attempt == 0:
+                        attempt_key = replacement
+                        continue
+                    raise _LaneFailure(str(exc), code="network") from exc
+            raise _LaneFailure("unreachable", code="network")
+        except asyncio.CancelledError:
+            raise
+
+    async def _monitor_hub(
+        self,
+        hub: dict[str, Any],
+        progress_callback: ProgressCallback | None,
+        processing_callback: Callable[..., Awaitable[None]] | None,
+    ) -> None:
+        """Drive the UI while a download works: a 'processing' bar during
+        the server-side preparation phase (no bytes yet), byte progress
+        once the lanes start delivering."""
+        if progress_callback is None and processing_callback is None:
+            return
+        try:
+            while True:
+                await asyncio.sleep(0.8)
+                downloaded = int(hub.get("downloaded") or 0)
+                if downloaded > 0:
+                    if progress_callback is None:
+                        continue
+                    total = int(hub.get("true_total") or hub.get("total") or 0)
+                    try:
+                        await progress_callback(downloaded, total or downloaded)
+                    except Exception:  # pragma: no cover
+                        logger.exception("progress_callback failed")
+                else:
+                    if processing_callback is None:
+                        continue
+                    elapsed = time.monotonic() - float(hub.get("started") or time.monotonic())
+                    percent = min(38, 14 + int(elapsed))
+                    try:
+                        await processing_callback(
+                            percent,
+                            "▶️ دارم خروجی رو آماده می‌کنم…",
+                            f"آماده‌سازی روی سرور… ~{int(elapsed)} ثانیه",
+                        )
+                    except Exception:  # pragma: no cover
+                        logger.exception("processing_callback failed")
+        except asyncio.CancelledError:
+            return
+
+    # ------------------------------------------------------------------
+    # Single-stream download (classic rotation)
+    # ------------------------------------------------------------------
+
+    async def _download_single(
+        self,
+        url: str,
+        format_id: str,
+        expected_kind: MediaKind,
+        destination: Path,
+        progress_callback: ProgressCallback | None,
+        *,
+        hub: dict[str, Any] | None = None,
+        processing_callback: Callable[..., Awaitable[None]] | None = None,
     ) -> GatewayResult | None:
         """Stream ``GET /api/v1/download`` rotating keys on pre-stream errors.
 
@@ -558,97 +1116,247 @@ class VoidDLGateway:
         (Yoinku → Apify → Telegram bots) can take over.
         """
         client = await self._ensure_client()
-        attempted_keys: set[str] = set()
-        for _ in range(self._pool.total):
-            key = await self._pool.acquire()
-            if key is None:
-                logger.info("VoidDL: all keys exhausted before download could start")
-                return GatewayResult(
-                    status="error",
-                    bot_username=VOIDDL_PROVIDER,
-                    reason="voiddl_all_keys_exhausted",
-                )
-            if key in attempted_keys:
-                return GatewayResult(
-                    status="error",
-                    bot_username=VOIDDL_PROVIDER,
-                    reason="voiddl_all_keys_exhausted",
-                )
-            attempted_keys.add(key)
-            try:
-                async with client.stream(
-                    "GET",
-                    f"{self._api_base}/api/v1/download",
-                    headers={"Authorization": f"Bearer {key}"},
-                    params={"url": url, "format_id": format_id},
-                ) as response:
-                    if response.status_code == 429:
-                        await self._pool.mark_minute_exhausted(key)
-                        logger.info("VoidDL key %s… hit the per-minute limit (download)", key[:8])
-                        continue
-                    if response.status_code in {402, 403}:
-                        await self._pool.mark_daily_exhausted(key)
-                        logger.info("VoidDL key %s… rejected on download (HTTP %s)", key[:8], response.status_code)
-                        continue
-                    if response.status_code >= 400:
-                        # Server-side extraction error for THIS video — no
-                        # point burning another key; bubble the failure up.
-                        logger.warning(
-                            "VoidDL download failed with HTTP %s for format %s",
-                            response.status_code, format_id,
-                        )
-                        await response.aread()
-                        return GatewayResult(
-                            status="error",
-                            bot_username=VOIDDL_PROVIDER,
-                            reason="voiddl_http_error",
-                        )
-                    content_type = (response.headers.get("content-type") or "").lower()
-                    if "application/json" in content_type:
-                        # A JSON error disguised as a 200 — read it and fall
-                        # through to the next key (it may be key-specific).
-                        body = (await response.aread()).decode("utf-8", errors="replace")[:500]
-                        logger.info("VoidDL returned JSON instead of media: %s", body)
-                        continue
-                    # Success — account for the server-side counters first.
-                    await self._pool.sync_from_headers(key, response.headers)
-                    try:
-                        byte_count = await self._write_stream(
-                            response, destination, progress_callback
-                        )
-                    except DownloadTooLarge:
-                        return GatewayResult(
-                            status="error",
-                            bot_username=VOIDDL_PROVIDER,
-                            reason="too_large",
-                        )
-                    await self._pool.record_bytes(key, byte_count)
-                    media = DownloadedMedia(
-                        path=destination,
-                        kind=expected_kind,
-                        source_message_id=0,
-                        mime_type=_mime_for(destination.suffix, kind=expected_kind),
-                        size=destination.stat().st_size,
-                    )
-                    return GatewayResult(
-                        status="ready",
-                        bot_username=VOIDDL_PROVIDER,
-                        media=(media,),
-                    )
-            except asyncio.CancelledError:
-                raise
-            except httpx.HTTPError as exc:
-                logger.warning("VoidDL download stream failed: %s", exc)
-                return GatewayResult(
-                    status="error",
-                    bot_username=VOIDDL_PROVIDER,
-                    reason="voiddl_stream_error",
-                )
-        return GatewayResult(
-            status="error",
-            bot_username=VOIDDL_PROVIDER,
-            reason="voiddl_all_keys_exhausted",
+        monitor = asyncio.create_task(
+            self._monitor_hub(hub or {}, progress_callback, processing_callback)
         )
+        try:
+            attempted_keys: set[str] = set()
+            for _ in range(self._pool.total):
+                key = await self._pool.acquire()
+                if key is None:
+                    logger.info("VoidDL: all keys exhausted before download could start")
+                    return GatewayResult(
+                        status="error",
+                        bot_username=VOIDDL_PROVIDER,
+                        reason="voiddl_all_keys_exhausted",
+                    )
+                if key in attempted_keys:
+                    return GatewayResult(
+                        status="error",
+                        bot_username=VOIDDL_PROVIDER,
+                        reason="voiddl_all_keys_exhausted",
+                    )
+                attempted_keys.add(key)
+                try:
+                    async with client.stream(
+                        "GET",
+                        f"{self._api_base}/api/v1/download",
+                        headers={"Authorization": f"Bearer {key}"},
+                        params={"url": url, "format_id": format_id},
+                    ) as response:
+                        if response.status_code == 429:
+                            await self._pool.mark_minute_exhausted(key)
+                            logger.info("VoidDL key %s… hit the per-minute limit (download)", key[:8])
+                            continue
+                        if response.status_code in {402, 403}:
+                            await self._pool.mark_daily_exhausted(key)
+                            logger.info("VoidDL key %s… rejected on download (HTTP %s)", key[:8], response.status_code)
+                            continue
+                        if response.status_code >= 400:
+                            # Server-side extraction error for THIS video — no
+                            # point burning another key; bubble the failure up.
+                            logger.warning(
+                                "VoidDL download failed with HTTP %s for format %s",
+                                response.status_code, format_id,
+                            )
+                            await response.aread()
+                            return GatewayResult(
+                                status="error",
+                                bot_username=VOIDDL_PROVIDER,
+                                reason="voiddl_http_error",
+                            )
+                        content_type = (response.headers.get("content-type") or "").lower()
+                        if "application/json" in content_type:
+                            # A JSON error disguised as a 200 — read it and fall
+                            # through to the next key (it may be key-specific).
+                            body = (await response.aread()).decode("utf-8", errors="replace")[:500]
+                            logger.info("VoidDL returned JSON instead of media: %s", body)
+                            continue
+                        # Success — account for the server-side counters first.
+                        await self._pool.sync_from_headers(key, response.headers)
+                        try:
+                            byte_count = await self._write_stream(
+                                response, destination, progress_callback, hub=hub
+                            )
+                        except DownloadTooLarge:
+                            return GatewayResult(
+                                status="error",
+                                bot_username=VOIDDL_PROVIDER,
+                                reason="too_large",
+                            )
+                        await self._pool.record_bytes(key, byte_count)
+                        media = DownloadedMedia(
+                            path=destination,
+                            kind=expected_kind,
+                            source_message_id=0,
+                            mime_type=_mime_for(destination.suffix, kind=expected_kind),
+                            size=destination.stat().st_size,
+                        )
+                        return GatewayResult(
+                            status="ready",
+                            bot_username=VOIDDL_PROVIDER,
+                            media=(media,),
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except httpx.HTTPError as exc:
+                    logger.warning("VoidDL download stream failed: %s", exc)
+                    return GatewayResult(
+                        status="error",
+                        bot_username=VOIDDL_PROVIDER,
+                        reason="voiddl_stream_error",
+                    )
+            return GatewayResult(
+                status="error",
+                bot_username=VOIDDL_PROVIDER,
+                reason="voiddl_all_keys_exhausted",
+            )
+        finally:
+            monitor.cancel()
+
+    # ------------------------------------------------------------------
+    # Background prefetch
+    # ------------------------------------------------------------------
+
+    def _prefetch_preference(self, option: QualityOption) -> tuple[int, int]:
+        """Sort key: 1080p first, then 720p, then anything larger."""
+        height = int(option.expected_height or 0)
+        if height == 1080:
+            return (0, -height)
+        if height == 720:
+            return (1, -height)
+        return (2, -height)
+
+    async def _start_prefetches(
+        self,
+        url: str,
+        options: tuple[QualityOption, ...],
+        attempt_directory: Path,
+    ) -> None:
+        """Kick off background downloads for the most likely picks."""
+        self._prune_prefetch()
+        self.cancel_prefetch(url)
+        if self._prefetch_count <= 0:
+            return
+        if await self._pool.best_remaining() < self._prefetch_min_remaining:
+            logger.info("VoidDL prefetch skipped — bandwidth reserve low")
+            return
+
+        video_options = [o for o in options if o.expected_kind == MediaKind.VIDEO]
+        audio_options = [o for o in options if o.expected_kind == MediaKind.AUDIO]
+        chosen = sorted(video_options, key=self._prefetch_preference)[: self._prefetch_count]
+        chosen += audio_options[:1]  # MP3 is tiny — always cheap to warm
+
+        for option in chosen:
+            payload = _decode_fingerprint(option.fingerprint)
+            if not payload or not payload.get("format_id"):
+                continue
+            try:
+                size = int(payload.get("filesize") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size <= 0 or size > self._prefetch_max_bytes:
+                continue
+            destination = _final_path_from_payload(payload, attempt_directory)
+            if destination.exists():
+                continue
+            entry = _PrefetchEntry(
+                fingerprint=option.fingerprint,
+                url=url,
+                task=None,  # type: ignore[arg-type]
+                destination=destination,
+                expected_size=size,
+            )
+            entry.task = asyncio.create_task(
+                self._prefetch_worker(entry, url, payload, destination, size),
+                name=f"voiddl-prefetch-{payload.get('format_id')}",
+            )
+            self._prefetch[option.fingerprint] = entry
+            logger.info(
+                "VoidDL prefetch started: format %s (%s, %d lanes)",
+                payload.get("format_id"), _fmt_size(size), self._prefetch_lanes,
+            )
+
+    async def _prefetch_worker(
+        self,
+        entry: _PrefetchEntry,
+        url: str,
+        payload: dict[str, Any],
+        destination: Path,
+        expected_size: int,
+    ) -> None:
+        format_id = str(payload.get("format_id"))
+        kind = MediaKind.AUDIO if payload.get("kind") == "audio" else MediaKind.VIDEO
+        try:
+            result = await asyncio.wait_for(
+                self._download_with_rotation(
+                    url,
+                    format_id,
+                    kind,
+                    destination,
+                    None,
+                    hub=entry.hub,
+                    expected_size=expected_size,
+                    lanes=self._prefetch_lanes,
+                ),
+                timeout=self._prefetch_ttl,
+            )
+            entry.result = result
+            if result is None or result.status != "ready":
+                destination.unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            destination.unlink(missing_ok=True)
+            raise
+        except asyncio.TimeoutError:
+            logger.info("VoidDL prefetch for %s timed out", format_id)
+            destination.unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001 — prefetch must never crash the bot
+            logger.warning("VoidDL prefetch for %s crashed: %s", format_id, exc)
+            destination.unlink(missing_ok=True)
+
+    async def _await_entry(
+        self,
+        entry: _PrefetchEntry,
+        progress_callback: ProgressCallback | None,
+        processing_callback: Callable[..., Awaitable[None]] | None,
+    ) -> None:
+        """Wait for a prefetch to finish while mirroring its progress."""
+        monitor = asyncio.create_task(
+            self._monitor_hub(entry.hub, progress_callback, processing_callback)
+        )
+        try:
+            # asyncio.wait() never re-raises the task's own exception, so a
+            # cancelled / failed prefetch simply looks "done" to us and the
+            # caller falls back to a fresh download.
+            while not entry.task.done():
+                await asyncio.wait({entry.task}, timeout=1.0)
+        finally:
+            monitor.cancel()
+
+    def cancel_prefetch(self, url: str) -> None:
+        """Cancel every background prefetch for ``url`` (sync-safe)."""
+        normalized = normalize_youtube_url(url)
+        for fingerprint, entry in list(self._prefetch.items()):
+            if entry.url in {normalized, url}:
+                if not entry.task.done():
+                    entry.task.cancel()
+                self._prefetch.pop(fingerprint, None)
+
+    def _cancel_sibling_prefetches(self, url: str, keep: str) -> None:
+        normalized = normalize_youtube_url(url)
+        for fingerprint, entry in list(self._prefetch.items()):
+            if fingerprint == keep:
+                continue
+            if entry.url in {normalized, url}:
+                if not entry.task.done():
+                    entry.task.cancel()
+                self._prefetch.pop(fingerprint, None)
+
+    def _prune_prefetch(self) -> None:
+        now = time.monotonic()
+        for fingerprint, entry in list(self._prefetch.items()):
+            if entry.task.done() and now - entry.created_at > 1800:
+                self._prefetch.pop(fingerprint, None)
 
     # ------------------------------------------------------------------
     # HTTP calls
@@ -834,9 +1542,13 @@ class VoidDLGateway:
         response: httpx.Response,
         destination: Path,
         progress_callback: ProgressCallback | None,
+        *,
+        hub: dict[str, Any] | None = None,
     ) -> int:
         content_length = response.headers.get("content-length")
         total = int(content_length) if content_length and content_length.isdigit() else 0
+        if hub is not None and total:
+            hub["total"] = total
         if self._max_download_size and total and total > self._max_download_size:
             raise DownloadTooLarge(f"file exceeds max download size ({total} bytes)")
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -847,6 +1559,8 @@ class VoidDLGateway:
                     continue
                 handle.write(chunk)
                 bytes_written += len(chunk)
+                if hub is not None:
+                    hub["downloaded"] = hub.get("downloaded", 0) + len(chunk)
                 if self._max_download_size and bytes_written > self._max_download_size:
                     raise DownloadTooLarge("streamed size exceeds max download size")
                 if progress_callback is not None:
