@@ -7,7 +7,8 @@
 
 ## مسیریابی
 
-- Instagram / YouTube: اگر `APIFY_TOKENS` تنظیم باشد، ابتدا منوی دکمه‌ای کیفیت یا فقط‌صدا از Apify نمایش داده می‌شود؛ YouTube با `streamers/youtube-video-downloader` و Instagram با `apify/instagram-scraper` اجرا می‌شوند. توکن‌ها چرخشی‌اند و در خطا سریع به توکن بعدی می‌روند. اگر Apify خطا دهد یا تنظیم نشده باشد، همان مسیرهای قبلیِ `allsaverbot`، `instadowbot`، `download_it_bot` و `AllSavesBot` به‌عنوان fallback اجرا می‌شوند.
+- YouTube: مسیر اصلی **VoidDL** (`https://voiddl.app`) است. هر API Key اجازه‌ی ۲۰ دانلود در دقیقه و ۱۰ گیگابایت دانلود در روز دارد؛ چند کلید را در `VOIDDL_API_KEYS` بگذارید تا لحظه‌ای که یکی محدود شد، بلافاصله کلید بعدی استفاده شود. اگر VoidDL شکست بخورد مسیر بعدی **Yoinku**، سپس **Apify** و در نهایت بات‌های تلگرامی (`allsaverbot`، `instadowbot`، `download_it_bot` و `AllSavesBot`) اجرا می‌شوند.
+- Instagram: اگر `APIFY_TOKENS` تنظیم باشد، ابتدا منوی دکمه‌ای کیفیت یا فقط‌صدا از Apify نمایش داده می‌شود؛ Instagram با `apify/instagram-scraper` اجرا می‌شود. اگر Apify خطا دهد یا تنظیم نشده باشد، همان مسیرهای قبلی اجرا می‌شوند.
 - TikTok: `download_it_bot` و سپس `AllSavesBot`
 - Twitter/X / Facebook / VK: فقط `download_it_bot`
 - Spotify track: فقط `spotifysavesbot`
@@ -15,6 +16,10 @@
 - SoundCloud: فقط `scload_bot`
 - دامنه‌های دیگر پیش از ارسال به واسط رد می‌شوند.
 - اگر مسیر اختصاصی شکست بخورد، تمام واسط‌های یکتا یک‌بار به‌عنوان fallback اضطراری امتحان می‌شوند.
+
+### کارت کیفیت یوتیوب
+
+وقتی کاربر لینک یوتیوب می‌فرستد، ربات بهترین کیفیت تامبنیل (maxresdefault) را دانلود و به‌صورت عکس می‌فرستد؛ پیام منبع (مثلاً `youtu.be`)، عنوان و مدت ویدیو، جدول حجم تقریبی هر کیفیت و مهلت انتخاب (پیش‌فرض ۱۰ دقیقه) به‌صورت کپشن زیر همان عکس نمایش داده می‌شود و دکمه‌های کیفیت فقط عدد کیفیت را نشان می‌دهند (مثلاً `480` یا `720` یا `MP3`). حجم‌های نمایش‌داده‌شده از خود VoidDL گرفته می‌شوند.
 
 ## کپشن و عضویت
 
@@ -59,6 +64,10 @@ APIFY_TOKENS=token-اول,token-دوم
 APIFY_RUN_TIMEOUT_SECONDS=360
 APIFY_POLL_INTERVAL_SECONDS=3
 APIFY_TOKEN_COOLDOWN_SECONDS=600
+VOIDDL_ENABLED=true
+VOIDDL_API_KEYS=vd_کلید-اول,vd_کلید-دوم
+VOIDDL_DAILY_BANDWIDTH_MB=10240
+VOIDDL_PER_MINUTE_LIMIT=20
 USE_PROXY=false
 DOWNLOAD_DIR=/tmp/mz-downloader
 MAX_FILE_SIZE_MB=30

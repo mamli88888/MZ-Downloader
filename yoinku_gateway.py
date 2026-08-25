@@ -553,31 +553,49 @@ class YoinkuGateway:
         used_key: str,
     ) -> GatewayResult:
         title = (data.get("title") or "").strip()
-        thumbnail = (data.get("thumbnailUrl") or "").strip()
         formats = data.get("formats") or []
         video_formats = [f for f in formats if f.get("kind") == "video"]
         audio_formats = [f for f in formats if f.get("kind") == "audio"]
-        # Sort videos by height desc (best first).
+        # mp4 first (best Telegram compatibility), then height desc, then
+        # size desc (best first).
         video_formats.sort(
-            key=lambda f: (f.get("height") or 0, f.get("filesizeBytes") or 0),
+            key=lambda f: (
+                1 if str(f.get("container") or "").lower() == "mp4" else 0,
+                f.get("height") or 0,
+                f.get("filesizeBytes") or 0,
+            ),
             reverse=True,
         )
 
         options: list[QualityOption] = []
+        size_lines: list[str] = []
+        # One button per height — when both an mp4 and a webm variant
+        # exist for the same quality, keep the mp4 (best Telegram
+        # compatibility). Quality buttons carry ONLY the quality number;
+        # sizes live in the card caption (text below).
+        seen_heights: set[int] = set()
         for fmt in video_formats:
             fmt_id = fmt.get("id") or ""
             if not fmt_id:
                 continue
             height = fmt.get("height") or 0
-            quality = fmt.get("quality") or (f"{height}p" if height else "video")
+            try:
+                height = int(height)
+            except (TypeError, ValueError):
+                height = 0
+            if height and height in seen_heights:
+                continue
+            if height:
+                seen_heights.add(height)
             container = fmt.get("container") or "mp4"
             size = fmt.get("filesizeBytes") or 0
-            label = f"{quality} ({container})"
-            if size:
-                label += f" — {self._fmt_size(size)}"
+            try:
+                size = int(size)
+            except (TypeError, ValueError):
+                size = 0
             options.append(
                 QualityOption(
-                    label=label,
+                    label=str(height) if height else (fmt.get("quality") or "video"),
                     row=0,
                     column=0,
                     fingerprint=_fingerprint({
@@ -589,32 +607,56 @@ class YoinkuGateway:
                     expected_height=height or None,
                 )
             )
+            size_text = fmt.get("filesizeHuman") or (self._fmt_size(size) if size else "")
+            size_lines.append(
+                f"• {height if height else (fmt.get('quality') or 'video')}"
+                + (f" — {size_text}" if size_text else "")
+            )
 
-        # Audio options — usually a single m4a entry.
+        # Audio option — usually a single m4a entry. Button says MP3;
+        # the size belongs to the caption.
+        best_audio: dict[str, Any] | None = None
         for fmt in audio_formats:
-            fmt_id = fmt.get("id") or ""
-            if not fmt_id:
+            if not fmt.get("id"):
                 continue
-            quality = fmt.get("quality") or "audio"
-            container = fmt.get("container") or "m4a"
-            size = fmt.get("filesizeBytes") or 0
-            bitrate = fmt.get("audioBitrateKbps") or 0
-            label = f"MP3 {quality}"
-            if size:
-                label += f" — {self._fmt_size(size)}"
+            if best_audio is None:
+                best_audio = fmt
+                continue
+            prev_ext = str(best_audio.get("container") or "").lower()
+            curr_ext = str(fmt.get("container") or "").lower()
+            prev_size = best_audio.get("filesizeBytes") or 0
+            curr_size = fmt.get("filesizeBytes") or 0
+            if (curr_ext in {"m4a", "mp4"}) != (prev_ext in {"m4a", "mp4"}):
+                if curr_ext in {"m4a", "mp4"}:
+                    best_audio = fmt
+            elif (curr_size or 0) > (prev_size or 0):
+                best_audio = fmt
+        if best_audio is not None:
+            bitrate = best_audio.get("audioBitrateKbps") or 0
+            audio_size = best_audio.get("filesizeBytes") or 0
+            try:
+                audio_size = int(audio_size)
+            except (TypeError, ValueError):
+                audio_size = 0
             options.append(
                 QualityOption(
-                    label=label,
+                    label="MP3",
                     row=0,
                     column=0,
                     fingerprint=_fingerprint({
                         "url": url,
-                        "format_id": fmt_id,
+                        "format_id": best_audio.get("id"),
                         "kind": "audio",
                     }),
                     expected_kind=MediaKind.AUDIO,
                     expected_bitrate_kbps=bitrate or None,
                 )
+            )
+            audio_size_text = best_audio.get("filesizeHuman") or (
+                self._fmt_size(audio_size) if audio_size else ""
+            )
+            size_lines.append(
+                "• MP3" + (f" — {audio_size_text}" if audio_size_text else "")
             )
 
         if not options:
@@ -624,17 +666,17 @@ class YoinkuGateway:
                 reason="yoinku_no_formats",
             )
 
-        caption_parts = ["<b>▶️ یوتیوب</b>"]
+        caption_parts: list[str] = []
         if title:
             safe_title = title.replace("<", "&lt;").replace(">", "&gt;")[:300]
             caption_parts.append(safe_title)
-        if used_key:
-            caption_parts.append(f"<code>{used_key[:8]}…</code>")
+        if size_lines:
+            caption_parts.append("📦 حجم هر کیفیت:\n" + "\n".join(size_lines))
         return GatewayResult(
             status="needs_selection",
             bot_username=YOINKU_PROVIDER,
             options=tuple(options),
-            text="\n".join(caption_parts),
+            text="\n\n".join(caption_parts),
         )
 
     # ------------------------------------------------------------------

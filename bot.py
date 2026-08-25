@@ -107,6 +107,12 @@ from yoinku_gateway import (
     YoinkuGateway,
     yoinku_health_check,
 )
+from voiddl_gateway import (
+    VOIDDL_PROVIDER,
+    VoidDLGateway,
+    download_youtube_thumbnail,
+    voiddl_health_check,
+)
 from youtube_search import (
     MAX_RESULTS as YOUTUBE_SEARCH_MAX_RESULTS,
     RESULTS_PER_PAGE as YOUTUBE_RESULTS_PER_PAGE,
@@ -213,11 +219,38 @@ if SETTINGS.ahm7_enabled:
     )
 logger.info("ahm7 gateway %s", ahm7_health_check(AHM7_GATEWAY))
 
-# ── Yoinku gateway (primary downloader for YouTube via
+# ── VoidDL gateway (PRIMARY downloader for YouTube via
+# https://voiddl.app). Per-key caps: 20 downloads/minute AND 10 GB of
+# daily bandwidth. Multiple keys rotate instantly the moment one key
+# hits either cap (429 → next key; bandwidth spent → next key until
+# UTC midnight). Fallback chain: VoidDL → Yoinku → Apify → Telegram
+# bots → error.
+VOIDDL_GATEWAY: VoidDLGateway | None = None
+if SETTINGS.voiddl_enabled and SETTINGS.voiddl_api_keys:
+    VOIDDL_GATEWAY = VoidDLGateway(
+        api_base=SETTINGS.voiddl_api_base,
+        api_keys=SETTINGS.voiddl_api_keys,
+        daily_bandwidth=SETTINGS.voiddl_daily_bandwidth_mb * 1024 * 1024,
+        per_minute_limit=SETTINGS.voiddl_per_minute_limit,
+        proxy_url=(
+            f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+            if SETTINGS.use_proxy
+            else None
+        ),
+        max_download_size=SETTINGS.max_download_size,
+    )
+logger.info(
+    "voiddl gateway %s (keys=%d, per_minute=%d)",
+    voiddl_health_check(VOIDDL_GATEWAY),
+    len(SETTINGS.voiddl_api_keys),
+    SETTINGS.voiddl_per_minute_limit,
+)
+
+# ── Yoinku gateway (fallback #1 for YouTube via
 # https://yoinku.com/api/v1). Per-key caps: 30 requests/day AND 5
 # requests/minute. Multiple keys rotate so the 31st daily request and the
 # 6th per-minute request both automatically use the next key. Fallback
-# chain: Yoinku → Apify → Telegram bots → error.
+# chain: VoidDL → Yoinku → Apify → Telegram bots → error.
 YOINKU_GATEWAY: YoinkuGateway | None = None
 if SETTINGS.yoinku_enabled and SETTINGS.yoinku_api_keys:
     YOINKU_GATEWAY = YoinkuGateway(
@@ -326,8 +359,11 @@ class PendingSelection:
     # (TikTok / Instagram / Facebook / X / Reddit / Snapchat /
     # SoundCloud / CapCut / SnackVideo / Douyin) instead of GATEWAY.
     use_ahm7: bool = False
+    # True when this session should be fulfilled by VOIDDL_GATEWAY
+    # (YouTube primary path via voiddl.app) instead of GATEWAY.
+    use_voiddl: bool = False
     # True when this session should be fulfilled by YOINKU_GATEWAY
-    # (YouTube) instead of GATEWAY.
+    # (YouTube fallback #1) instead of GATEWAY.
     use_yoinku: bool = False
     # True when the selected quality is fulfilled by APIFY_GATEWAY, which
     # starts the Actor only after the user chooses a button.
@@ -469,6 +505,26 @@ def _option_prefix(option) -> str:
     if option.expected_kind == MediaKind.PHOTO:
         return "📷"
     return "🎬"
+
+
+def _youtube_button_label(option) -> str:
+    """Pure-quality label for a YouTube menu button (480 / 720 / MP3).
+
+    YouTube quality buttons carry ONLY the quality number — no emoji,
+    no size, no container. Sizes and other details belong in the caption
+    under the thumbnail photo. Falls back to the raw label only when no
+    quality can be derived at all.
+    """
+    if option.expected_kind == MediaKind.AUDIO:
+        return "MP3"
+    height = getattr(option, "expected_height", None)
+    if height:
+        return str(int(height))
+    label = str(getattr(option, "label", "") or "").strip()
+    match = re.match(r"^\D*(\d{3,4})\s*p?\b", label, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return label
 
 
 STATS = RuntimeStats()
@@ -1065,6 +1121,48 @@ async def send_status(
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+
+
+async def send_youtube_quality_card(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    reply_to: int | None,
+    *,
+    status_message: Any,
+    menu_text: str,
+    rows: list[list[InlineKeyboardButton]],
+    preview: DownloadedMedia | None,
+    request_id: str,
+) -> Any:
+    """Send the YouTube quality menu as a photo card.
+
+    The quality buttons are attached to the THUMBNAIL message itself
+    (as its caption / inline keyboard) — exactly the UX requested for
+    YouTube links: the best-quality thumbnail is sent as a photo and
+    the quality buttons live under it. When no thumbnail could be
+    downloaded the menu falls back to editing the plain status message.
+    Returns the message object that now carries the menu (used as the
+    session's status_message so later edits target the photo caption).
+    """
+    keyboard = InlineKeyboardMarkup(rows)
+    if preview is not None:
+        try:
+            with preview.path.open("rb") as preview_handle:
+                card_message = await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=preview_handle,
+                    caption=menu_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                    reply_to_message_id=reply_to,
+                )
+            with contextlib.suppress(TelegramError):
+                await status_message.delete()
+            return card_message
+        except TelegramError as exc:
+            logger.warning("YouTube thumbnail card send failed for %s: %s", request_id, exc)
+    await edit_status(status_message, menu_text, keyboard)
+    return status_message
 
 
 async def _ensure_sticker_ids(
@@ -1915,6 +2013,7 @@ async def _process_url(
     reply_to: int | None,
     *,
     skip_apify: bool = False,
+    skip_voiddl: bool = False,
     skip_yoinku: bool = False,
     skip_ahm7: bool = False,
 ) -> None:
@@ -1957,10 +2056,20 @@ async def _process_url(
         platform in {Platform.YOUTUBE, Platform.INSTAGRAM}
         or (FLAGS.apify_new_platforms and platform in NEW_APIFY_PLATFORMS)
     )
-    # Yoinku is the PRIMARY downloader for YouTube. When YOINKU_GATEWAY
-    # is configured, YouTube links hit Yoinku first; the fallback chain
-    # (Apify → Telegram bots) only kicks in when Yoinku fails or returns
-    # no menu.
+    # VoidDL is the PRIMARY downloader for YouTube (https://voiddl.app).
+    # When VOIDDL_GATEWAY is configured, YouTube links hit VoidDL first;
+    # the fallback chain (Yoinku → Apify → Telegram bots) only kicks in
+    # when VoidDL fails or returns no menu.
+    use_voiddl = (
+        not skip_voiddl
+        and VOIDDL_GATEWAY is not None
+        and platform == Platform.YOUTUBE
+        and not is_spotify_collection
+    )
+    # Yoinku is fallback #1 for YouTube. When YOINKU_GATEWAY
+    # is configured, YouTube links hit Yoinku after VoidDL; the fallback
+    # chain (Apify → Telegram bots) only kicks in when Yoinku fails or
+    # returns no menu.
     use_yoinku = (
         not skip_yoinku
         and YOINKU_GATEWAY is not None
@@ -1985,15 +2094,15 @@ async def _process_url(
         and not is_spotify_collection
         and not is_instagram_image_post(url)
     )
-    if not providers and not is_spotify_collection and not _social_only and not use_apify and not use_yoinku and not use_ahm7:
+    if not providers and not is_spotify_collection and not _social_only and not use_apify and not use_voiddl and not use_yoinku and not use_ahm7:
         STATS.failed += 1
         return
     info = platform_info(platform)
     # Platforms that don't need a Telegram worker (handled entirely by
-    # YOINKU / AHM7 / Apify / SOCIAL_GATEWAY) skip the queue / pool
-    # availability checks so users can download even when no Telegram
-    # account is configured.
-    _workerless = is_spotify_collection or _social_only or use_apify or use_yoinku or use_ahm7
+    # VOIDDL / YOINKU / AHM7 / Apify / SOCIAL_GATEWAY) skip the queue /
+    # pool availability checks so users can download even when no
+    # Telegram account is configured.
+    _workerless = is_spotify_collection or _social_only or use_apify or use_voiddl or use_yoinku or use_ahm7
     if not _workerless and ACCOUNT_POOL.queue_length >= SETTINGS.max_queue_size:
         STATS.failed += 1
         await send_status(
@@ -2043,11 +2152,119 @@ async def _process_url(
     hold_lease = False
     reasons: list[str] = []
     try:
-        # ── Yoinku: PRIMARY downloader for YouTube ───────────────────────
+        # ── VoidDL: PRIMARY downloader for YouTube ──────────────────────
+        # https://voiddl.app — multi-key rotation (20 downloads/minute AND
+        # 10 GB/day bandwidth per key; a limited key is skipped instantly
+        # in favour of the next one). When VOIDDL_GATEWAY is configured,
+        # YouTube links hit VoidDL FIRST; on failure the request falls
+        # through to Yoinku → Apify → Telegram bots, preserving the
+        # fallback chain.
+        if use_voiddl and VOIDDL_GATEWAY is not None:
+            await progress.update(
+                15,
+                "▶️ در حال آماده‌سازی ویدیو…",
+                f"{info.icon} {info.label} • مسیر اصلی",
+                force=True,
+            )
+            voiddl_attempt_dir = create_attempt_directory(
+                SETTINGS.download_root, request_id, "voiddl",
+            )
+            try:
+                voiddl_result = await VOIDDL_GATEWAY.request(
+                    url=url,
+                    platform=platform,
+                    attempt_directory=voiddl_attempt_dir,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("VoidDL gateway crashed for %s: %s", request_id, exc)
+                voiddl_result = GatewayResult(
+                    status="error",
+                    bot_username=VOIDDL_PROVIDER,
+                    reason="voiddl_error",
+                )
+
+            if voiddl_result.status == "needs_selection":
+                displayed_options = voiddl_result.options[:24]
+                token = uuid.uuid4().hex[:12]
+                # Quality buttons carry ONLY the quality (e.g. 480 / 720 /
+                # MP3) — sizes and every other detail live in the caption
+                # under the thumbnail photo.
+                rows: list[list[InlineKeyboardButton]] = []
+                row: list[InlineKeyboardButton] = []
+                for option_index, option in enumerate(displayed_options):
+                    row.append(InlineKeyboardButton(
+                        option.label,
+                        callback_data=f"sel:{token}:{option_index}",
+                    ))
+                    if len(row) == 3:
+                        rows.append(row)
+                        row = []
+                if row:
+                    rows.append(row)
+                rows.append([InlineKeyboardButton("لغو درخواست", callback_data=f"cancel:{token}")])
+                card_intro = (voiddl_result.text or "").strip()
+                if len(card_intro) > 700:
+                    card_intro = card_intro[:697].rstrip() + "…"
+                menu_text = status_card(
+                    "🎚 کدوم کیفیت رو می‌خوای؟",
+                    f"منبع: <code>{html_escape(host)}</code>\n" + card_intro,
+                    f"تا {int(SETTINGS.selection_ttl // 60)} دقیقه برای انتخاب کیفیت وقت داری",
+                )
+                status_message = await send_youtube_quality_card(
+                    context,
+                    chat_id,
+                    reply_to,
+                    status_message=status_message,
+                    menu_text=menu_text,
+                    rows=rows,
+                    preview=voiddl_result.preview,
+                    request_id=request_id,
+                )
+                session = PendingSelection(
+                    token=token,
+                    created_at=time.monotonic(),
+                    chat_id=chat_id,
+                    user_id=update.effective_user.id,
+                    status_message_id=status_message.message_id,
+                    reply_to=reply_to,
+                    request_id=request_id,
+                    source_host=host,
+                    source_url=url,
+                    platform=platform,
+                    bot_username=VOIDDL_PROVIDER,
+                    request_message_id=0,
+                    menu_message_id=0,
+                    options=displayed_options,
+                    lease=None,
+                    attempt_directory=voiddl_attempt_dir,
+                    use_voiddl=True,
+                    fallback_text=voiddl_result.text,
+                )
+                PENDING_SELECTIONS[token] = session
+                hold_lease = True
+                return
+
+            # voiddl_result.status == "error" — fall through to Yoinku → Apify → Telegram bots
+            logger.info(
+                "VoidDL gateway failed for %s (reason=%s); falling back to Yoinku / Apify / Telegram bots",
+                request_id, voiddl_result.reason,
+            )
+            cleanup_request_directory(voiddl_attempt_dir, SETTINGS.download_root)
+            reasons.append(voiddl_result.reason or "voiddl_error")
+            await progress.update(
+                20,
+                "🔄 مسیر اصلی جواب نداد، امتحان می‌کنم با مسیرهای بعدی…",
+                f"{info.icon} {info.label} • مسیر جایگزین",
+                force=True,
+            )
+
+        # ── Yoinku: fallback #1 for YouTube ─────────────────────────────
         # https://yoinku.com/api/v1 — multi-key rotation (30 requests/day
-        # AND 5 requests/minute per key). When YOINKU_GATEWAY is configured,
-        # YouTube links hit Yoinku FIRST; on failure the request falls
-        # through to Apify → Telegram bots, preserving the fallback chain.
+        # AND 5 requests/minute per key). YouTube links reach Yoinku after
+        # VoidDL failed; on failure the request falls through to Apify →
+        # Telegram bots, preserving the fallback chain.
         if use_yoinku and YOINKU_GATEWAY is not None:
             await progress.update(
                 15,
@@ -2091,67 +2308,47 @@ async def _process_url(
             if yoinku_result.status == "needs_selection":
                 displayed_options = yoinku_result.options[:24]
                 token = uuid.uuid4().hex[:12]
+                # Quality buttons carry ONLY the quality (e.g. 480 / 720 /
+                # MP3) — sizes and every other detail live in the caption
+                # under the thumbnail photo.
                 rows: list[list[InlineKeyboardButton]] = []
-                video_choices = [
-                    (i, o) for i, o in enumerate(displayed_options)
-                    if o.action == "media" and o.expected_kind == MediaKind.VIDEO
-                ]
-                audio_choices = [
-                    (i, o) for i, o in enumerate(displayed_options)
-                    if o.action == "media" and o.expected_kind == MediaKind.AUDIO
-                ]
-                quick_row: list[InlineKeyboardButton] = []
-                if video_choices:
-                    best_index, best_option = max(
-                        video_choices,
-                        key=lambda item: item[1].expected_height or 0,
-                    )
-                    quick_row.append(InlineKeyboardButton(
-                        _truncate_button_label(f"⭐ بهترین کیفیت — {best_option.label}"),
-                        callback_data=f"sel:{token}:{best_index}",
-                    ))
-                if audio_choices:
-                    audio_index, audio_option = max(
-                        audio_choices,
-                        key=lambda item: item[1].expected_bitrate_kbps or 0,
-                    )
-                    quick_row.append(InlineKeyboardButton(
-                        _truncate_button_label(f"🎵 فقط صدا — {audio_option.label}"),
-                        callback_data=f"sel:{token}:{audio_index}",
-                    ))
-                if quick_row:
-                    rows.append(quick_row)
                 row: list[InlineKeyboardButton] = []
                 for option_index, option in enumerate(displayed_options):
-                    prefix = _option_prefix(option)
                     row.append(InlineKeyboardButton(
-                        _truncate_button_label(f"{prefix} {option.label}"),
+                        option.label,
                         callback_data=f"sel:{token}:{option_index}",
                     ))
-                    if len(row) == 2:
+                    if len(row) == 3:
                         rows.append(row)
                         row = []
                 if row:
                     rows.append(row)
                 rows.append([InlineKeyboardButton("لغو درخواست", callback_data=f"cancel:{token}")])
+                card_intro = (yoinku_result.text or "").strip()
+                if len(card_intro) > 700:
+                    card_intro = card_intro[:697].rstrip() + "…"
                 menu_text = status_card(
-                    "🎚 کدوم خروجی رو می‌خوای؟",
-                    f"منبع: <code>{html_escape(host)}</code>\nکیفیت یا صدا رو انتخاب کن.",
-                    f"تا {int(SETTINGS.selection_ttl // 60)} دقیقه وقت داری",
+                    "🎚 کدوم کیفیت رو می‌خوای؟",
+                    f"منبع: <code>{html_escape(host)}</code>\n" + card_intro,
+                    f"تا {int(SETTINGS.selection_ttl // 60)} دقیقه برای انتخاب کیفیت وقت داری",
                 )
-                if yoinku_result.preview is not None:
-                    try:
-                        with yoinku_result.preview.path.open("rb") as preview_handle:
-                            await context.bot.send_photo(
-                                chat_id=chat_id, photo=preview_handle,
-                                caption=f"🖼 پیش‌نمایش ویدیو • {host}",
-                                reply_to_message_id=reply_to,
-                            )
-                        with contextlib.suppress(TelegramError):
-                            await status_message.delete()
-                        status_message = await send_status(context, chat_id, menu_text, None)
-                    except TelegramError as exc:
-                        logger.warning("Yoinku thumbnail send failed for %s: %s", request_id, exc)
+                # Best-quality YouTube thumbnail for the card (Yoinku
+                # itself does not provide one).
+                yoinku_preview = yoinku_result.preview
+                if yoinku_preview is None:
+                    yoinku_preview = await download_youtube_thumbnail(
+                        url, yoinku_attempt_dir, proxy_url=_caption_proxy_url(),
+                    )
+                status_message = await send_youtube_quality_card(
+                    context,
+                    chat_id,
+                    reply_to,
+                    status_message=status_message,
+                    menu_text=menu_text,
+                    rows=rows,
+                    preview=yoinku_preview,
+                    request_id=request_id,
+                )
                 session = PendingSelection(
                     token=token,
                     created_at=time.monotonic(),
@@ -2173,7 +2370,6 @@ async def _process_url(
                     fallback_text=yoinku_result.text,
                 )
                 PENDING_SELECTIONS[token] = session
-                await edit_status(status_message, menu_text, InlineKeyboardMarkup(rows))
                 hold_lease = True
                 return
 
@@ -2383,6 +2579,76 @@ async def _process_url(
                 displayed_options = apify_result.options[:24]
                 token = uuid.uuid4().hex[:12]
                 rows: list[list[InlineKeyboardButton]] = []
+                if platform == Platform.YOUTUBE:
+                    # YouTube: quality buttons carry ONLY the quality
+                    # (480 / 720 / MP3) — size hints and other details live
+                    # in the caption under the thumbnail photo.
+                    size_lines: list[str] = []
+                    row: list[InlineKeyboardButton] = []
+                    for option_index, option in enumerate(displayed_options):
+                        display_label = _youtube_button_label(option)
+                        row.append(InlineKeyboardButton(
+                            display_label,
+                            callback_data=f"sel:{token}:{option_index}",
+                        ))
+                        if len(row) == 3:
+                            rows.append(row)
+                            row = []
+                        size_lines.append(f"• {display_label} — {option_size_hint(option)}")
+                    if row:
+                        rows.append(row)
+                    rows.append([InlineKeyboardButton("لغو درخواست", callback_data=f"cancel:{token}")])
+                    card_intro = (apify_result.text or "").strip()
+                    if len(card_intro) > 400:
+                        card_intro = card_intro[:397].rstrip() + "…"
+                    size_block = "📦 حجم تقریبی هر کیفیت (در هر دقیقه):\n" + "\n".join(size_lines)
+                    menu_text = status_card(
+                        "🎚 کدوم کیفیت رو می‌خوای؟",
+                        f"منبع: <code>{html_escape(host)}</code>\n"
+                        + (card_intro + "\n\n" if card_intro else "")
+                        + size_block,
+                        f"تا {int(SETTINGS.selection_ttl // 60)} دقیقه برای انتخاب کیفیت وقت داری",
+                    )
+                    # Best-quality YouTube thumbnail for the card.
+                    apify_preview = apify_result.preview
+                    if apify_preview is None:
+                        apify_preview = await download_youtube_thumbnail(
+                            url, apify_attempt_dir, proxy_url=_caption_proxy_url(),
+                        )
+                    status_message = await send_youtube_quality_card(
+                        context,
+                        chat_id,
+                        reply_to,
+                        status_message=status_message,
+                        menu_text=menu_text,
+                        rows=rows,
+                        preview=apify_preview,
+                        request_id=request_id,
+                    )
+                    session = PendingSelection(
+                        token=token,
+                        created_at=time.monotonic(),
+                        chat_id=chat_id,
+                        user_id=update.effective_user.id,
+                        status_message_id=status_message.message_id,
+                        reply_to=reply_to,
+                        request_id=request_id,
+                        source_host=host,
+                        source_url=url,
+                        platform=platform,
+                        bot_username=APIFY_PROVIDER,
+                        request_message_id=0,
+                        menu_message_id=0,
+                        options=displayed_options,
+                        lease=None,
+                        attempt_directory=apify_attempt_dir,
+                        use_apify=True,
+                        caption_task=caption_task,
+                    )
+                    caption_task = None
+                    PENDING_SELECTIONS[token] = session
+                    hold_lease = True
+                    return
                 video_choices = [
                     (index, option)
                     for index, option in enumerate(displayed_options)
@@ -2393,17 +2659,6 @@ async def _process_url(
                     for index, option in enumerate(displayed_options)
                     if option.action == "media" and option.expected_kind == MediaKind.AUDIO
                 ]
-                # A practical mobile default gives users a one-tap option
-                # between the tiny low resolutions and costly 4K downloads.
-                if platform == Platform.YOUTUBE and video_choices:
-                    smart_index, smart_option = min(
-                        video_choices,
-                        key=lambda item: abs((item[1].expected_height or 720) - 720),
-                    )
-                    rows.append([InlineKeyboardButton(
-                        _truncate_button_label(f"⚡ پیشنهادی: {smart_option.label} • {option_size_hint(smart_option)}"),
-                        callback_data=f"sel:{token}:{smart_index}",
-                    )])
                 quick_row: list[InlineKeyboardButton] = []
                 if video_choices:
                     best_index, best_option = max(
@@ -2893,6 +3148,79 @@ async def _process_url(
                 appended_size_note = False
                 token = uuid.uuid4().hex[:12]
                 rows: list[list[InlineKeyboardButton]] = []
+                if platform == Platform.YOUTUBE:
+                    # YouTube: quality buttons carry ONLY the quality
+                    # (480 / 720 / MP3) — estimated sizes and other details
+                    # live in the caption under the thumbnail photo.
+                    size_lines: list[str] = []
+                    row: list[InlineKeyboardButton] = []
+                    for option_index, option in enumerate(displayed_options):
+                        display_label = _youtube_button_label(option)
+                        row.append(InlineKeyboardButton(
+                            display_label,
+                            callback_data=f"sel:{token}:{option_index}",
+                        ))
+                        if len(row) == 3:
+                            rows.append(row)
+                            row = []
+                        option_size = estimate_youtube_size(
+                            youtube_formats,
+                            is_audio=option.expected_kind == MediaKind.AUDIO,
+                            target_height=option.expected_height,
+                            target_bitrate_kbps=option.expected_bitrate_kbps,
+                        )
+                        size_text = f"≈{fmt_size(option_size)}" if option_size else "تقریبی"
+                        size_lines.append(f"• {display_label} — {size_text}")
+                    if row:
+                        rows.append(row)
+                    rows.append([InlineKeyboardButton("لغو درخواست", callback_data=f"cancel:{token}")])
+                    size_block = "📦 حجم تقریبی هر کیفیت:\n" + "\n".join(size_lines)
+                    menu_text = status_card(
+                        "🎚 کدوم کیفیت رو می‌خوای؟",
+                        f"منبع: <code>{html_escape(host)}</code>\n" + size_block,
+                        f"تا {int(SETTINGS.selection_ttl // 60)} دقیقه برای انتخاب کیفیت وقت داری",
+                    )
+                    # Best-quality YouTube thumbnail for the card (the
+                    # downloader bot's own preview is used when available).
+                    telegram_preview = result.preview
+                    if telegram_preview is None:
+                        telegram_preview = await download_youtube_thumbnail(
+                            url, attempt_directory, proxy_url=_caption_proxy_url(),
+                        )
+                    status_message = await send_youtube_quality_card(
+                        context,
+                        chat_id,
+                        reply_to,
+                        status_message=status_message,
+                        menu_text=menu_text,
+                        rows=rows,
+                        preview=telegram_preview,
+                        request_id=request_id,
+                    )
+                    session = PendingSelection(
+                        token=token,
+                        created_at=time.monotonic(),
+                        chat_id=chat_id,
+                        user_id=update.effective_user.id,
+                        status_message_id=status_message.message_id,
+                        reply_to=reply_to,
+                        request_id=request_id,
+                        source_host=host,
+                        source_url=url,
+                        platform=platform,
+                        bot_username=bot_username,
+                        request_message_id=int(result.request_message_id or 0),
+                        menu_message_id=int(result.menu_message_id or 0),
+                        options=displayed_options,
+                        lease=lease,
+                        attempt_directory=attempt_directory,
+                        fallback_text=result.text if platform != Platform.INSTAGRAM else "",
+                        caption_task=caption_task,
+                    )
+                    caption_task = None
+                    PENDING_SELECTIONS[token] = session
+                    hold_lease = True
+                    return
                 video_choices = [
                     (option_index, option)
                     for option_index, option in enumerate(displayed_options)
@@ -4429,7 +4757,22 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         selection_progress = ProgressReporter(query.message, session.request_id)
         await selection_progress.update(10, selection_title, selection_label, force=True)
-        if session.use_yoinku and YOINKU_GATEWAY is not None:
+        if session.use_voiddl and VOIDDL_GATEWAY is not None:
+            await selection_progress.processing(
+                12,
+                "▶️ دارم خروجی رو آماده می‌کنم…",
+                "ارتباط با سرور…",
+                force=True,
+            )
+            result = await VOIDDL_GATEWAY.select(
+                url=session.source_url,
+                platform=session.platform,
+                option=option,
+                attempt_directory=session.attempt_directory,
+                progress_callback=selection_progress.download,
+                processing_callback=selection_progress.processing,
+            )
+        elif session.use_yoinku and YOINKU_GATEWAY is not None:
             await selection_progress.processing(
                 12,
                 "▶️ دارم خروجی رو آماده می‌کنم…",
@@ -4534,6 +4877,25 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
         if result.status != "ready":
+            if session.use_voiddl:
+                await edit_status(
+                    query.message,
+                    status_card(
+                        "🔄 مسیر اصلی جواب نداد",
+                        "دارم مسیرهای جایگزین ربات رو امتحان می‌کنم…",
+                    ),
+                )
+                # Re-enter the flow without VoidDL so a VoidDL-side failure
+                # (all keys exhausted, service down, etc.) cannot remove
+                # the established Yoinku / Apify / Telegram-bot fallbacks.
+                await _process_url(
+                    update,
+                    context,
+                    session.source_url,
+                    session.reply_to,
+                    skip_voiddl=True,
+                )
+                return
             if session.use_yoinku:
                 await edit_status(
                     query.message,
@@ -4999,6 +5361,14 @@ async def build_health_report() -> str:
     breakers = all_breakers()
     open_breakers = [name for name, info in breakers.items() if info["state"] != "closed"] or "—"
     ai = await ai_service.ai_health()
+    voiddl_line = f"▶️ کلیدهای VoidDL (مسیر اصلی یوتیوب): <b>{len(SETTINGS.voiddl_api_keys)}</b>"
+    if VOIDDL_GATEWAY is not None:
+        voiddl_status = await VOIDDL_GATEWAY.pool.status()
+        voiddl_used_gb = sum(entry["daily_bytes_used"] for entry in voiddl_status) / (1024 ** 3)
+        voiddl_line += (
+            f" — مصرف روزه: <b>{voiddl_used_gb:.2f}</b> از"
+            f" <b>{SETTINGS.voiddl_daily_bandwidth_mb // 1024}</b> گیگابایت"
+        )
     lines = [
         "🩺 <b>گزارش سلامت ربات</b>",
         f"🕒 زمان راه‌اندازی: {time.strftime('%Y-%m-%d %H:%M:%S')} (پایدار: {uptime_minutes} دقیقه)",
@@ -5006,6 +5376,7 @@ async def build_health_report() -> str:
         f"👤 اکانت‌های دانلود متصل: <b>{ACCOUNT_POOL.total}</b> (شلوغ: {ACCOUNT_POOL.busy_count} • صف: {ACCOUNT_POOL.queue_length})",
         f"☁️ توکن‌های سرویس ابری: <b>{len(SETTINGS.apify_tokens)}</b>"
         + (f" (پلتفرم‌های جدید: {'فعال' if FLAGS.apify_new_platforms else 'غیرفعال'})" if SETTINGS.apify_tokens else ""),
+        voiddl_line,
     ]
     # Store self-check (probe query — safe on an empty DB too)
     try:

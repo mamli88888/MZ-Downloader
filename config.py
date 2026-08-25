@@ -73,14 +73,23 @@ class Settings:
     # Douyin via https://ahm7xmakki.com/api/alldl).
     ahm7_enabled: bool
     ahm7_api_url: str
-    # Yoinku gateway (primary downloader for YouTube via
-    # https://yoinku.com/api/v1). Multi-key rotation with per-key
-    # daily + per-minute rate limits.
+    # Yoinku gateway (fallback #1 for YouTube via https://yoinku.com/api/v1).
+    # Multi-key rotation with per-key daily + per-minute rate limits.
     yoinku_enabled: bool
     yoinku_api_base: str
     yoinku_api_keys: tuple[str, ...]
     yoinku_daily_limit: int
     yoinku_per_minute_limit: int
+    # VoidDL gateway (PRIMARY downloader for YouTube via
+    # https://voiddl.app). Per key: 20 downloads/minute and 10 GB of
+    # daily bandwidth — multiple keys rotate instantly when one hits
+    # either cap. Fallback chain: VoidDL → Yoinku → Apify → Telegram
+    # bots.
+    voiddl_enabled: bool
+    voiddl_api_base: str
+    voiddl_api_keys: tuple[str, ...]
+    voiddl_daily_bandwidth_mb: int
+    voiddl_per_minute_limit: int
     # Apify Actors for public YouTube and Instagram downloads. Tokens rotate
     # when a token-side error, quota problem, or billing limit is reported.
     apify_enabled: bool
@@ -242,6 +251,23 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         ),
         yoinku_daily_limit=_as_int(env, "YOINKU_DAILY_LIMIT", 30, minimum=1),
         yoinku_per_minute_limit=_as_int(env, "YOINKU_PER_MINUTE_LIMIT", 5, minimum=1),
+        voiddl_enabled=_as_bool(env.get("VOIDDL_ENABLED"), True),
+        voiddl_api_base=env.get("VOIDDL_API_BASE", "https://voiddl.app").strip(),
+        # Comma-separated VoidDL API keys. When empty, the primary key
+        # shipped with the reference voiddl.py CLI is used so the bot
+        # works out of the box; set VOIDDL_API_KEYS to override/extend.
+        voiddl_api_keys=tuple(
+            dict.fromkeys(
+                k.strip()
+                for k in (
+                    env.get("VOIDDL_API_KEYS")
+                    or "vd_3RwouwKvrvuVfDo4_iakuaHaN-FuerC4"
+                ).split(",")
+                if k.strip()
+            )
+        ),
+        voiddl_daily_bandwidth_mb=_as_int(env, "VOIDDL_DAILY_BANDWIDTH_MB", 10240, minimum=1),
+        voiddl_per_minute_limit=_as_int(env, "VOIDDL_PER_MINUTE_LIMIT", 20, minimum=1),
         apify_enabled=_as_bool(env.get("APIFY_ENABLED"), True),
         # APIFY_TOKEN remains accepted for backward compatibility. Prefer the
         # comma-separated APIFY_TOKENS variable for rotation and failover.

@@ -163,6 +163,10 @@ SELECTION_TTL_SECONDS=600
 ALBUM_COLLECT_WINDOW_SECONDS=2.5
 PREVIEW_GRACE_SECONDS=3
 LATE_RESPONSE_COOLDOWN_SECONDS=180
+VOIDDL_ENABLED=true
+VOIDDL_API_KEYS=vd_کلید-اول,vd_کلید-دوم
+VOIDDL_DAILY_BANDWIDTH_MB=10240
+VOIDDL_PER_MINUTE_LIMIT=20
 ```
 
 نکات مهم:
@@ -172,6 +176,7 @@ LATE_RESPONSE_COOLDOWN_SECONDS=180
 - `MAX_DOWNLOAD_SIZE_MB=0` سقف داخلی برنامه را حذف می‌کند.
 - `MAX_FILE_SIZE_MB=30` سقف هر قطعه‌ی ارسالی است، نه سقف کل دانلود.
 - اگر پروکسی لازم است، `USE_PROXY=true` و `PROXY_TYPE`, `PROXY_HOST`, `PROXY_PORT` را تنظیم کنید.
+- `VOIDDL_API_KEYS` کلیدهای سایت `voiddl.app` (مسیر اصلی دانلود یوتیوب) است؛ با کاما جدا کنید. هر کلید ۲۰ دانلود در دقیقه و ۱۰ گیگابایت در روز دارد و ربات به‌محض محدود شدن یک کلید، بلافاصله کلید بعدی را به کار می‌گیرد. اگر خالی بگذارید، کلید پیش‌فرض همراه سورس استفاده می‌شود.
 
 ## 10. حجم‌های بسیار بزرگ و Railway Volume
 
