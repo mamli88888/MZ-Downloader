@@ -3938,7 +3938,8 @@ async def on_shazam_search_callback(update: Update, context: ContextTypes.DEFAUL
                 )
             return
         try:
-            accepted = await process_urls(update, context, (youtube_url,), session.reply_to)
+            # Silent MP3 delivery: no quality menu, no subtitle offer.
+            accepted = await deliver_song_audio(update, context, youtube_url, session.reply_to)
         except BaseException:
             session.selected = False
             raise
@@ -5357,6 +5358,412 @@ async def redownload_reel_video(
     return GatewayResult(status="error", bot_username="reel-music", reason="all_gateways_failed")
 
 
+def _pick_audio_option(options: tuple[QualityOption, ...]) -> QualityOption | None:
+    """Pick the best audio (MP3) option of a YouTube quality menu.
+
+    Prefers explicit ``expected_kind == AUDIO`` options, falls back to any
+    media option whose label mentions "mp3", and among the candidates
+    returns the one with the highest bitrate.
+    """
+    audio_options = [
+        option
+        for option in options
+        if option.action == "media" and option.expected_kind == MediaKind.AUDIO
+    ]
+    if not audio_options:
+        audio_options = [
+            option
+            for option in options
+            if option.action == "media" and "mp3" in option.label.lower()
+        ]
+    if not audio_options:
+        return None
+    return max(audio_options, key=lambda option: option.expected_bitrate_kbps or 0)
+
+
+async def deliver_song_audio(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    youtube_url: str,
+    reply_to: int | None,
+) -> bool:
+    """Silently download a song's MP3 and send it — the /song pipeline.
+
+    Used by the /song search results and the reel-music «🎧 دانلود فایل
+    آهنگ» button. Instead of showing the YouTube quality menu (and the
+    subtitle follow-up), it reuses the platform's normal download chain —
+    VoidDL → Yoinku → Apify → Telegram downloader bots — always picks the
+    audio (MP3) option automatically, delivers the file through the same
+    ``send_result_to_user`` path the quality-menu flow uses, and never
+    sends the subtitle offer.
+
+    Returns ``True`` when the request was consumed (delivered, or failed
+    after a real attempt) and ``False`` when it was rejected upfront by
+    the per-user limits so the caller can keep its selection alive.
+    """
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user is not None else None
+    request_id = uuid.uuid4().hex[:10]
+    key = request_owner_key(update)
+    current_task = asyncio.current_task()
+    if current_task is None:
+        return False
+    active = ACTIVE_REQUESTS.setdefault(key, set())
+    if len(active) >= MAX_ACTIVE_TASKS_PER_USER:
+        if update.effective_message is not None:
+            await update.effective_message.reply_text(
+                status_card(
+                    "⏳ درخواست‌های قبلی هنوز فعال‌اند",
+                    "صبر کن یا با /cancel درخواست‌های قبلی را متوقف کن.",
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        return False
+    if not allow_requests(key, 1):
+        if update.effective_message is not None:
+            await update.effective_message.reply_text(
+                status_card(
+                    "⏱ کمی آهسته‌تر",
+                    f"حداکثر {SETTINGS.rate_limit_requests} لینک در {int(SETTINGS.rate_limit_window)} ثانیه قابل پردازش است.",
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        return False
+    active.add(current_task)
+    STATS.requests += 1
+    status_message = await send_status(
+        context,
+        chat_id,
+        status_card(
+            "🎧 دارم فایل آهنگ رو آماده می‌کنم…",
+            "نسخهٔ MP3 بدون منوی کیفیت دانلود می‌شه و مستقیم برات می‌فرستمش.",
+        ),
+        reply_to,
+    )
+    progress = ProgressReporter(status_message, request_id)
+    platform = detect_platform(youtube_url)
+    if platform is None:
+        STATS.failed += 1
+        await edit_status(
+            status_message,
+            status_card(
+                "😕 لینک آهنگ معتبر نیست",
+                "نتونستم نسخهٔ صوتی این آهنگ رو پیدا کنم.",
+            ),
+        )
+        return True
+
+    def _gateway_dir(name: str) -> Path:
+        return create_attempt_directory(SETTINGS.download_root, request_id, name)
+
+    result: GatewayResult | None = None
+    chosen_option: QualityOption | None = None
+    success_directory: Path | None = None
+    try:
+        # ── 1) VoidDL — the primary YouTube downloader ──────────────────
+        if result is None and VOIDDL_GATEWAY is not None:
+            voiddl_dir = _gateway_dir("song-voiddl")
+            choice: QualityOption | None = None
+            try:
+                attempt = await VOIDDL_GATEWAY.request(
+                    url=youtube_url,
+                    platform=platform,
+                    attempt_directory=voiddl_dir,
+                )
+            except asyncio.CancelledError:
+                cleanup_request_directory(voiddl_dir, SETTINGS.download_root)
+                raise
+            except Exception as exc:
+                logger.warning("Song audio VoidDL crashed for %s: %s", request_id, exc)
+                attempt = GatewayResult(
+                    status="error",
+                    bot_username=VOIDDL_PROVIDER,
+                    reason="voiddl_error",
+                )
+            if attempt.status == "needs_selection":
+                choice = _pick_audio_option(attempt.options)
+                if choice is None:
+                    attempt = GatewayResult(
+                        status="error",
+                        bot_username=VOIDDL_PROVIDER,
+                        reason="no_audio_option",
+                    )
+                else:
+                    try:
+                        attempt = await VOIDDL_GATEWAY.select(
+                            url=youtube_url,
+                            platform=platform,
+                            option=choice,
+                            attempt_directory=voiddl_dir,
+                            progress_callback=progress.download,
+                            processing_callback=progress.processing,
+                        )
+                    except asyncio.CancelledError:
+                        cleanup_request_directory(voiddl_dir, SETTINGS.download_root)
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Song audio VoidDL select failed for %s: %s", request_id, exc,
+                        )
+                        attempt = GatewayResult(
+                            status="error",
+                            bot_username=VOIDDL_PROVIDER,
+                            reason="voiddl_error",
+                        )
+            if attempt.status == "ready" and attempt.media:
+                result = attempt
+                chosen_option = choice
+                success_directory = voiddl_dir
+            else:
+                cleanup_request_directory(voiddl_dir, SETTINGS.download_root)
+
+        # ── 2) Yoinku — first fallback ──────────────────────────────────
+        if result is None and YOINKU_GATEWAY is not None:
+            yoinku_dir = _gateway_dir("song-yoinku")
+            choice = None
+            try:
+                attempt = await YOINKU_GATEWAY.request(
+                    url=youtube_url,
+                    platform=platform,
+                    attempt_directory=yoinku_dir,
+                )
+            except asyncio.CancelledError:
+                cleanup_request_directory(yoinku_dir, SETTINGS.download_root)
+                raise
+            except Exception as exc:
+                logger.warning("Song audio Yoinku crashed for %s: %s", request_id, exc)
+                attempt = GatewayResult(
+                    status="error",
+                    bot_username=YOINKU_PROVIDER,
+                    reason="yoinku_error",
+                )
+            if attempt.status == "needs_selection":
+                choice = _pick_audio_option(attempt.options)
+                if choice is None:
+                    attempt = GatewayResult(
+                        status="error",
+                        bot_username=YOINKU_PROVIDER,
+                        reason="no_audio_option",
+                    )
+                else:
+                    try:
+                        attempt = await YOINKU_GATEWAY.select(
+                            url=youtube_url,
+                            platform=platform,
+                            option=choice,
+                            attempt_directory=yoinku_dir,
+                            progress_callback=progress.download,
+                            processing_callback=progress.processing,
+                        )
+                    except asyncio.CancelledError:
+                        cleanup_request_directory(yoinku_dir, SETTINGS.download_root)
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Song audio Yoinku select failed for %s: %s", request_id, exc,
+                        )
+                        attempt = GatewayResult(
+                            status="error",
+                            bot_username=YOINKU_PROVIDER,
+                            reason="yoinku_error",
+                        )
+            if attempt.status == "ready" and attempt.media:
+                result = attempt
+                chosen_option = choice
+                success_directory = yoinku_dir
+            else:
+                cleanup_request_directory(yoinku_dir, SETTINGS.download_root)
+
+        # ── 3) Apify — second fallback ──────────────────────────────────
+        if result is None and APIFY_GATEWAY is not None:
+            apify_dir = _gateway_dir("song-apify")
+            choice = None
+            try:
+                attempt = await APIFY_GATEWAY.request(
+                    url=youtube_url,
+                    platform=platform,
+                    attempt_directory=apify_dir,
+                    progress_callback=progress.download,
+                )
+            except asyncio.CancelledError:
+                cleanup_request_directory(apify_dir, SETTINGS.download_root)
+                raise
+            except Exception as exc:
+                logger.warning("Song audio Apify crashed for %s: %s", request_id, exc)
+                attempt = GatewayResult(
+                    status="error",
+                    bot_username=APIFY_PROVIDER,
+                    reason="apify_error",
+                )
+            if attempt.status == "needs_selection":
+                choice = _pick_audio_option(attempt.options)
+                if choice is None:
+                    attempt = GatewayResult(
+                        status="error",
+                        bot_username=APIFY_PROVIDER,
+                        reason="no_audio_option",
+                    )
+                else:
+                    try:
+                        attempt = await APIFY_GATEWAY.select(
+                            url=youtube_url,
+                            platform=platform,
+                            option=choice,
+                            attempt_directory=apify_dir,
+                            progress_callback=progress.apify_download,
+                            processing_callback=progress.processing,
+                        )
+                    except asyncio.CancelledError:
+                        cleanup_request_directory(apify_dir, SETTINGS.download_root)
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Song audio Apify select failed for %s: %s", request_id, exc,
+                        )
+                        attempt = GatewayResult(
+                            status="error",
+                            bot_username=APIFY_PROVIDER,
+                            reason="apify_error",
+                        )
+            if attempt.status == "ready" and attempt.media:
+                result = attempt
+                chosen_option = choice
+                success_directory = apify_dir
+            else:
+                cleanup_request_directory(apify_dir, SETTINGS.download_root)
+
+        # ── 4) Telegram downloader bots — the classic fallback ─────────
+        if result is None:
+            bot_providers = providers_for_platform(platform, SETTINGS) or all_providers(SETTINGS)
+            if bot_providers and ACCOUNT_POOL.total > 0:
+                lease: WorkerLease | None = None
+                try:
+                    lease = await asyncio.wait_for(
+                        ACCOUNT_POOL.acquire(),
+                        timeout=SETTINGS.worker_acquire_timeout,
+                    )
+                    for index, bot_username in enumerate(bot_providers):
+                        try:
+                            bots_dir = _gateway_dir(f"song-bot-{index}")
+                        except Exception:
+                            continue
+                        choice = None
+                        try:
+                            attempt = await GATEWAY.request(
+                                client=lease.worker.client,
+                                worker_name=lease.worker.name,
+                                bot_username=bot_username,
+                                url=youtube_url,
+                                attempt_directory=bots_dir,
+                                progress_callback=progress.download,
+                            )
+                        except asyncio.CancelledError:
+                            cleanup_request_directory(bots_dir, SETTINGS.download_root)
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "Song audio bot @%s failed for %s: %s",
+                                bot_username, request_id, exc,
+                            )
+                            cleanup_request_directory(bots_dir, SETTINGS.download_root)
+                            continue
+                        if attempt.status == "needs_selection":
+                            choice = _pick_audio_option(attempt.options)
+                            if choice is None:
+                                cleanup_request_directory(bots_dir, SETTINGS.download_root)
+                                continue
+                            try:
+                                attempt = await GATEWAY.select(
+                                    client=lease.worker.client,
+                                    worker_name=lease.worker.name,
+                                    bot_username=bot_username,
+                                    request_message_id=attempt.request_message_id or 0,
+                                    menu_message_id=attempt.menu_message_id or 0,
+                                    option=choice,
+                                    attempt_directory=bots_dir,
+                                    progress_callback=progress.download,
+                                )
+                            except asyncio.CancelledError:
+                                cleanup_request_directory(bots_dir, SETTINGS.download_root)
+                                raise
+                            except Exception as exc:
+                                logger.warning(
+                                    "Song audio bot @%s select failed for %s: %s",
+                                    bot_username, request_id, exc,
+                                )
+                                attempt = GatewayResult(
+                                    status="error",
+                                    bot_username=bot_username,
+                                    reason="gateway_error",
+                                )
+                        if attempt.status == "ready" and attempt.media:
+                            result = attempt
+                            chosen_option = choice
+                            success_directory = bots_dir
+                            break
+                        cleanup_request_directory(bots_dir, SETTINGS.download_root)
+                finally:
+                    if lease is not None:
+                        ACCOUNT_POOL.release(lease)
+
+        if result is None or not result.media:
+            STATS.failed += 1
+            await edit_status(
+                status_message,
+                status_card(
+                    "😕 فایل آهنگ پیدا نشد",
+                    "هیچ مسیری نتونست نسخهٔ MP3 این آهنگ رو آماده کنه؛ چند لحظه بعد دوباره امتحان کن.",
+                ),
+            )
+            await send_feedback_sticker(context, chat_id, index=4)
+            return True
+
+        await send_result_to_user(
+            update,
+            context,
+            status_message,
+            result,
+            reply_to=reply_to,
+            request_id=request_id,
+            quality=(
+                chosen_option.label
+                if chosen_option is not None and chosen_option.action == "media"
+                else None
+            ),
+            progress=progress,
+            source_url=youtube_url,
+            platform_value=platform.value,
+            user_id=user_id,
+        )
+        return True
+    except asyncio.CancelledError:
+        with contextlib.suppress(TelegramError):
+            await edit_status(
+                status_message,
+                status_card("⏹ درخواست متوقف شد", "دانلود آهنگ لغو شد."),
+            )
+        raise
+    except Exception as exc:
+        logger.exception("Song audio delivery failed for %s: %s", request_id, exc)
+        with contextlib.suppress(TelegramError):
+            await edit_status(
+                status_message,
+                status_card(
+                    "❌ خطا در دانلود آهنگ",
+                    "هیچ فایل ناقصی ارسال نشد؛ لطفاً دوباره امتحان کن.",
+                ),
+            )
+        with contextlib.suppress(Exception):
+            await send_feedback_sticker(context, chat_id, index=4)
+        return True
+    finally:
+        active.discard(current_task)
+        if not active:
+            ACTIVE_REQUESTS.pop(key, None)
+        if success_directory is not None:
+            cleanup_request_directory(success_directory, SETTINGS.download_root)
+
+
 def prune_reel_song_downloads() -> None:
     now = time.monotonic()
     expired = [
@@ -5588,8 +5995,9 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def on_reel_song_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle 🎧 دانلود فایل آهنگ — fetch the actual audio file.
 
-    Reuses the /song pattern: look the song up on YouTube so the existing
-    download pipeline can take over and send the audio to the user.
+    Reuses the /song pattern: look the song up on YouTube, then let the
+    silent MP3 pipeline (``deliver_song_audio``) download and send the
+    audio directly — no quality menu, no subtitle follow-up.
     """
     query = update.callback_query
     data = query.data or ""
@@ -5630,7 +6038,8 @@ async def on_reel_song_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode=ParseMode.HTML,
             )
         return
-    await process_urls(update, context, (youtube_url,), query.message.message_id if query.message else None)
+    # Silent MP3 delivery: no quality menu, no subtitle offer.
+    await deliver_song_audio(update, context, youtube_url, query.message.message_id if query.message else None)
 
 
 def cleanup_stale_download_directories(max_age_seconds: float = 24 * 60 * 60) -> None:
