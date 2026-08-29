@@ -132,6 +132,12 @@ from mz_shazam_search import (
     normalize_song_query,
     youtube_url_for_song,
 )
+from mz_reel_music import (
+    ReelMusicError,
+    ReelMusicMatch,
+    ReelMusicService,
+    format_song_caption,
+)
 from youtube_subtitle import (
     LANGUAGE_ENGLISH as SUBTITLE_LANG_EN,
     LANGUAGE_PERSIAN as SUBTITLE_LANG_FA,
@@ -382,6 +388,9 @@ class PendingSelection:
     caption_task: asyncio.Task[str] | None = None
     processing: bool = False
     processing_task: asyncio.Task[Any] | None = None
+    # True when the reel-music retention scheduler owns the directory
+    # cleanup (the just-sent reel video is kept for the retention window).
+    cleanup_delayed: bool = False
 
 
 @dataclass
@@ -425,6 +434,33 @@ MEMBERSHIP_CACHE: dict[int, float] = {}
 # token → (url, created_at, chat_id, user_id)
 REEL_MUSIC_URLS: dict[str, tuple[str, float, int, int]] = {}
 REEL_MUSIC_TTL = 600  # 10 minutes
+# ── Reel music (ShazamIO) ────────────────────────────────────────────
+# When a reel video is sent to the user, its file stays on disk for a
+# short retention window. If the user asks for the song within that
+# window the recognition reuses the file WITHOUT re-downloading; once
+# the window passes (or the file is gone) the reel is re-downloaded
+# through the platform's normal gateway chain before recognition.
+REEL_VIDEO_RETENTION_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class ReelVideoRecord:
+    """A just-sent reel video kept temporarily for music recognition."""
+
+    path: Path
+    attempt_directory: Path
+    created_at: float
+    chat_id: int
+    user_id: int
+    url: str
+
+
+REEL_VIDEO_FILES: dict[str, ReelVideoRecord] = {}
+REEL_VIDEO_CLEANUP_TASKS: dict[str, asyncio.Task[None]] = {}
+REEL_MUSIC = ReelMusicService()
+# token → (artist, track, created_at, chat_id, user_id) backing the
+# "🎧 دانلود فایل آهنگ" follow-up button (reuses the YouTube pipeline).
+REEL_SONG_DOWNLOADS: dict[str, tuple[str, str, float, int, int]] = {}
 # token → (youtube_url, created_at, chat_id, user_id)
 # Used by the subtitle follow-up message so the callback handler can recover
 # the original YouTube URL when the user clicks 🇮🇷 فارسی or 🇬🇧 English.
@@ -1977,6 +2013,9 @@ def release_pending_selection(session: PendingSelection) -> None:
     # pool release in that case.
     if session.lease is not None:
         ACCOUNT_POOL.release(session.lease)
+    if session.cleanup_delayed:
+        # The reel-music retention scheduler owns the directory cleanup.
+        return
     cleanup_request_directory(session.attempt_directory, SETTINGS.download_root)
 
 
@@ -2167,6 +2206,9 @@ async def _process_url(
     lease: WorkerLease | None = None
     attempt_directory: Path | None = None
     hold_lease = False
+    # Set when the reel-music offer retained the just-sent video file: the
+    # retention scheduler then owns the directory cleanup, not the finally.
+    reel_retention_dir: Path | None = None
     reasons: list[str] = []
     try:
         # ── VoidDL: PRIMARY downloader for YouTube ──────────────────────
@@ -2447,21 +2489,20 @@ async def _process_url(
                     user_id=update.effective_user.id,
                 )
                 if platform == Platform.INSTAGRAM and is_instagram_reel(url):
-                    reel_token = uuid.uuid4().hex[:12]
-                    REEL_MUSIC_URLS[reel_token] = (url, time.monotonic(), chat_id, update.effective_user.id)
-                    with contextlib.suppress(TelegramError):
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=status_card(
-                                "🎵 موزیک این ریلز رو می‌خوای؟",
-                                "دکمه زیر رو بزن تا آهنگ برات استخراج و ارسال بشه.",
-                            ),
-                            parse_mode=ParseMode.HTML,
-                            reply_to_message_id=reply_to,
-                            reply_markup=InlineKeyboardMarkup([[
-                                InlineKeyboardButton("🎵 دریافت موزیک ریلز", callback_data=f"reel_music:{reel_token}")
-                            ]]),
-                        )
+                    # Reel music follow-up (ShazamIO). The offer keeps the
+                    # just-sent video on disk for REEL_VIDEO_RETENTION_SECONDS
+                    # so pressing the button needs no re-download; it also
+                    # owns the directory cleanup for this branch.
+                    await offer_reel_music(
+                        context,
+                        chat_id=chat_id,
+                        reply_to=reply_to,
+                        url=url,
+                        user_id=update.effective_user.id,
+                        result=ahm7_result,
+                        attempt_directory=ahm7_attempt_dir,
+                    )
+                    return
                 cleanup_request_directory(ahm7_attempt_dir, SETTINGS.download_root)
                 return
 
@@ -3128,21 +3169,19 @@ async def _process_url(
                     user_id=update.effective_user.id,
                 )
                 if platform == Platform.INSTAGRAM and is_instagram_reel(url):
-                    reel_token = uuid.uuid4().hex[:12]
-                    REEL_MUSIC_URLS[reel_token] = (url, time.monotonic(), chat_id, update.effective_user.id)
-                    with contextlib.suppress(TelegramError):
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=status_card(
-                                "🎵 موزیک این ریلز رو می‌خوای؟",
-                                "دکمه زیر رو بزن تا آهنگ برات استخراج و ارسال بشه.",
-                            ),
-                            parse_mode=ParseMode.HTML,
-                            reply_to_message_id=reply_to,
-                            reply_markup=InlineKeyboardMarkup([[
-                                InlineKeyboardButton("🎵 دریافت موزیک ریلز", callback_data=f"reel_music:{reel_token}")
-                            ]]),
-                        )
+                    # Reel music follow-up (ShazamIO). When the just-sent
+                    # video is retained, the finally block below must NOT
+                    # delete the directory — the retention scheduler owns it.
+                    if await offer_reel_music(
+                        context,
+                        chat_id=chat_id,
+                        reply_to=reply_to,
+                        url=url,
+                        user_id=update.effective_user.id,
+                        result=result,
+                        attempt_directory=attempt_directory,
+                    ):
+                        reel_retention_dir = attempt_directory
                 elif platform == Platform.YOUTUBE:
                     # Subtitle follow-up: offer Persian & English SRT download.
                     await send_subtitle_followup(
@@ -3425,7 +3464,7 @@ async def _process_url(
             with contextlib.suppress(asyncio.CancelledError):
                 await caption_task
         if not hold_lease:
-            if attempt_directory is not None:
+            if attempt_directory is not None and attempt_directory != reel_retention_dir:
                 cleanup_request_directory(attempt_directory, SETTINGS.download_root)
             if lease is not None:
                 ACCOUNT_POOL.release(lease)
@@ -4992,6 +5031,20 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             platform_value=session.platform.value,
             user_id=session.user_id,
         )
+        if session.platform == Platform.INSTAGRAM and is_instagram_reel(session.source_url):
+            # Reel music follow-up (ShazamIO): offer the song and keep the
+            # just-sent video on disk for the short retention window so the
+            # button press needs no re-download.
+            if await offer_reel_music(
+                context,
+                chat_id=session.chat_id,
+                reply_to=session.reply_to,
+                url=session.source_url,
+                user_id=session.user_id,
+                result=result,
+                attempt_directory=session.attempt_directory,
+            ):
+                session.cleanup_delayed = True
         # 1404 upgrade: enriched caption (title/artist/album) for the new
         # Apify platforms arrives as result.text on ready results.
         if result.status == "ready" and session.use_apify and result.text:
@@ -5033,9 +5086,359 @@ async def on_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         release_pending_selection(session)
 
 
+# ── Reel music (ShazamIO) ─────────────────────────────────────────────
+# The old flow forwarded the reel link to external music-finder bots.
+# The new flow recognizes the song LOCALLY: the just-sent reel video is
+# reused while it is still on disk (REEL_VIDEO_RETENTION_SECONDS), or the
+# reel is re-downloaded through the platform's normal gateway chain
+# (AHM7 → Apify → Telegram bots), and the audio is then matched with
+# ShazamIO. See mz_reel_music.py.
+
+
+def _pick_reel_media(result: GatewayResult) -> DownloadedMedia | None:
+    """The media file handed to ShazamIO: prefer the video, else first item."""
+    for item in result.media:
+        if item.kind == MediaKind.VIDEO:
+            return item
+    return result.media[0] if result.media else None
+
+
+def _reel_music_http_proxy() -> str | None:
+    """http(s) proxy only — aiohttp (ShazamIO) cannot use socks proxies."""
+    if not SETTINGS.use_proxy:
+        return None
+    candidate = f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+    return candidate if candidate.startswith(("http://", "https://")) else None
+
+
+def schedule_reel_video_cleanup(token: str, attempt_directory: Path) -> None:
+    """Keep the just-sent reel video on disk for the retention window.
+
+    The delayed task gives the user REEL_VIDEO_RETENTION_SECONDS to press
+    the music button; when they do, the task is cancelled and the callback
+    takes over both the file and the final cleanup.
+    """
+    stale = REEL_VIDEO_CLEANUP_TASKS.pop(token, None)
+    if stale is not None and not stale.done():
+        stale.cancel()
+
+    async def _cleanup_job() -> None:
+        try:
+            await asyncio.sleep(REEL_VIDEO_RETENTION_SECONDS)
+        except asyncio.CancelledError:
+            return  # ownership moved to on_reel_music_callback
+        REEL_VIDEO_FILES.pop(token, None)
+        REEL_VIDEO_CLEANUP_TASKS.pop(token, None)
+        cleanup_request_directory(attempt_directory, SETTINGS.download_root)
+
+    REEL_VIDEO_CLEANUP_TASKS[token] = asyncio.create_task(_cleanup_job())
+
+
+async def offer_reel_music(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    reply_to: int | None,
+    url: str,
+    user_id: int,
+    result: GatewayResult | None = None,
+    attempt_directory: Path | None = None,
+) -> bool:
+    """Send the «موزیک این ریلز رو می‌خوای؟» follow-up with its glass button.
+
+    When the just-sent video file is available it is retained on disk for
+    REEL_VIDEO_RETENTION_SECONDS (so pressing the button needs no re-
+    download) and ``True`` is returned — the caller must then NOT delete
+    the attempt directory itself. Without a retained file the directory is
+    cleaned up right here, matching the previous immediate behaviour.
+    """
+    reel_token = uuid.uuid4().hex[:12]
+    REEL_MUSIC_URLS[reel_token] = (url, time.monotonic(), chat_id, user_id)
+    media = _pick_reel_media(result) if result is not None else None
+    retain = media is not None and attempt_directory is not None
+    if retain and media is not None and attempt_directory is not None:
+        REEL_VIDEO_FILES[reel_token] = ReelVideoRecord(
+            path=media.path,
+            attempt_directory=attempt_directory,
+            created_at=time.monotonic(),
+            chat_id=chat_id,
+            user_id=user_id,
+            url=url,
+        )
+    with contextlib.suppress(TelegramError):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=status_card(
+                "🎵 موزیک این ریلز رو می‌خوای؟",
+                "دکمهٔ شیشه‌ای زیر رو بزن تا آهنگش رو برات پیدا کنم.",
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=reply_to,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🎵 دریافت موزیک ریلز", callback_data=f"reel_music:{reel_token}")
+            ]]),
+        )
+    if retain and attempt_directory is not None:
+        schedule_reel_video_cleanup(reel_token, attempt_directory)
+    elif attempt_directory is not None:
+        cleanup_request_directory(attempt_directory, SETTINGS.download_root)
+    return retain
+
+
+def _best_media_option(options: tuple[QualityOption, ...]) -> QualityOption | None:
+    """Pick the download target for the silent re-download (best video)."""
+    media_options = [option for option in options if option.action == "media"]
+    videos = [option for option in media_options if option.expected_kind == MediaKind.VIDEO]
+    if videos:
+        return max(videos, key=lambda option: option.expected_height or 0)
+    return media_options[0] if media_options else None
+
+
+async def redownload_reel_video(
+    url: str,
+    request_id: str,
+    progress: ProgressReporter | None = None,
+) -> GatewayResult:
+    """Re-download the reel video through the platform's normal chain.
+
+    Mirrors the primary order of _process_url for Instagram —
+    AHM7 → Apify → Telegram downloader bots — but only fetches the file,
+    without sending anything to the user. On success the caller owns the
+    file's directory (``media.path.parent``) and must clean it up; every
+    failed attempt is cleaned up right here.
+    """
+    platform = detect_platform(url)
+    if platform is None:
+        return GatewayResult(status="error", bot_username="reel-music", reason="unsupported_platform")
+    progress_callback = progress.download if progress is not None else None
+    processing_callback = progress.processing if progress is not None else None
+
+    def _gateway_dir(name: str) -> Path:
+        return create_attempt_directory(SETTINGS.download_root, request_id, name)
+
+    # 1) AHM7 — the primary Instagram downloader (no Telegram worker needed)
+    if AHM7_GATEWAY is not None:
+        try:
+            ahm7_dir: Path | None = _gateway_dir("reel-ahm7")
+        except Exception:
+            ahm7_dir = None
+        if ahm7_dir is not None:
+            try:
+                ahm7_result = await AHM7_GATEWAY.request(
+                    url=url,
+                    platform=platform,
+                    attempt_directory=ahm7_dir,
+                    progress_callback=progress_callback,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Reel music AHM7 crashed for %s: %s", request_id, exc)
+                ahm7_result = GatewayResult(status="error", bot_username=AHM7_PROVIDER, reason="ahm7_error")
+            if ahm7_result.status == "needs_selection":
+                choice = _best_media_option(ahm7_result.options)
+                if choice is not None:
+                    try:
+                        ahm7_result = await AHM7_GATEWAY.select(
+                            url=url,
+                            platform=platform,
+                            option=choice,
+                            attempt_directory=ahm7_dir,
+                            progress_callback=progress_callback,
+                            processing_callback=processing_callback,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning("Reel music AHM7 select crashed for %s: %s", request_id, exc)
+                        ahm7_result = GatewayResult(status="error", bot_username=AHM7_PROVIDER, reason="ahm7_error")
+            if ahm7_result.status == "ready" and ahm7_result.media:
+                return ahm7_result
+            cleanup_request_directory(ahm7_dir, SETTINGS.download_root)
+
+    # 2) Apify — first fallback (starts the Actor only for the choice)
+    if APIFY_GATEWAY is not None:
+        try:
+            apify_dir: Path | None = _gateway_dir("reel-apify")
+        except Exception:
+            apify_dir = None
+        if apify_dir is not None:
+            try:
+                apify_result = await APIFY_GATEWAY.request(
+                    url=url,
+                    platform=platform,
+                    attempt_directory=apify_dir,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Reel music Apify crashed for %s: %s", request_id, exc)
+                apify_result = GatewayResult(status="error", bot_username=APIFY_PROVIDER, reason="apify_error")
+            if apify_result.status == "needs_selection":
+                choice = _best_media_option(apify_result.options)
+                if choice is not None:
+                    try:
+                        apify_result = await APIFY_GATEWAY.select(
+                            url=url,
+                            platform=platform,
+                            option=choice,
+                            attempt_directory=apify_dir,
+                            progress_callback=progress_callback,
+                            processing_callback=processing_callback,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning("Reel music Apify select crashed for %s: %s", request_id, exc)
+                        apify_result = GatewayResult(status="error", bot_username=APIFY_PROVIDER, reason="apify_error")
+            if apify_result.status == "ready" and apify_result.media:
+                return apify_result
+            cleanup_request_directory(apify_dir, SETTINGS.download_root)
+
+    # 3) Telegram downloader bots — the classic fallback (needs a worker)
+    bot_providers = providers_for_platform(platform, SETTINGS) or all_providers(SETTINGS)
+    if bot_providers and ACCOUNT_POOL.total > 0:
+        lease: WorkerLease | None = None
+        try:
+            lease = await asyncio.wait_for(
+                ACCOUNT_POOL.acquire(),
+                timeout=SETTINGS.worker_acquire_timeout,
+            )
+            for index, bot_username in enumerate(bot_providers):
+                try:
+                    bots_dir = _gateway_dir(f"reel-bot-{index}")
+                except Exception:
+                    continue
+                try:
+                    result = await GATEWAY.request(
+                        client=lease.worker.client,
+                        worker_name=lease.worker.name,
+                        bot_username=bot_username,
+                        url=url,
+                        attempt_directory=bots_dir,
+                        progress_callback=progress_callback,
+                    )
+                except asyncio.CancelledError:
+                    cleanup_request_directory(bots_dir, SETTINGS.download_root)
+                    raise
+                except Exception as exc:
+                    logger.warning("Reel music bot @%s failed for %s: %s", bot_username, request_id, exc)
+                    cleanup_request_directory(bots_dir, SETTINGS.download_root)
+                    continue
+                if result.status == "needs_selection":
+                    choice = _best_media_option(result.options)
+                    if choice is not None:
+                        try:
+                            result = await GATEWAY.select(
+                                client=lease.worker.client,
+                                worker_name=lease.worker.name,
+                                bot_username=bot_username,
+                                request_message_id=result.request_message_id or 0,
+                                menu_message_id=result.menu_message_id or 0,
+                                option=choice,
+                                attempt_directory=bots_dir,
+                                progress_callback=progress_callback,
+                            )
+                        except asyncio.CancelledError:
+                            cleanup_request_directory(bots_dir, SETTINGS.download_root)
+                            raise
+                        except Exception as exc:
+                            logger.warning("Reel music bot @%s select failed for %s: %s", bot_username, request_id, exc)
+                            result = GatewayResult(status="error", bot_username=bot_username, reason="gateway_error")
+                if result.status == "ready" and result.media:
+                    ACCOUNT_POOL.release(lease)
+                    lease = None
+                    return result
+                cleanup_request_directory(bots_dir, SETTINGS.download_root)
+        finally:
+            if lease is not None:
+                ACCOUNT_POOL.release(lease)
+
+    return GatewayResult(status="error", bot_username="reel-music", reason="all_gateways_failed")
+
+
+def prune_reel_song_downloads() -> None:
+    now = time.monotonic()
+    expired = [
+        token
+        for token, entry in REEL_SONG_DOWNLOADS.items()
+        if now - entry[2] > REEL_MUSIC_TTL
+    ]
+    for token in expired:
+        REEL_SONG_DOWNLOADS.pop(token, None)
+
+
+async def send_reel_song_card(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    user_id: int,
+    reply_to: int | None,
+    match: ReelMusicMatch,
+) -> None:
+    """Send the recognized song: cover card + links + «فایل آهنگ» button."""
+    song_token = uuid.uuid4().hex[:12]
+    REEL_SONG_DOWNLOADS[song_token] = (
+        match.artist_name,
+        match.track_name,
+        time.monotonic(),
+        chat_id,
+        user_id,
+    )
+    rows: list[list[InlineKeyboardButton]] = [[
+        InlineKeyboardButton("🎧 دانلود فایل آهنگ", callback_data=f"reel_song:{song_token}")
+    ]]
+    link_row: list[InlineKeyboardButton] = []
+    if match.shazam_url:
+        link_row.append(InlineKeyboardButton("🔗 Shazam", url=match.shazam_url))
+    if match.apple_music_url:
+        link_row.append(InlineKeyboardButton("🍎 Apple Music", url=match.apple_music_url))
+    if link_row:
+        rows.append(link_row)
+    markup = InlineKeyboardMarkup(rows)
+    caption = status_card("🎧 آهنگ پیدا شد!", format_song_caption(match))
+    cover = await REEL_MUSIC.download_cover(
+        match,
+        proxy_url=(
+            f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+            if SETTINGS.use_proxy
+            else None
+        ),
+    )
+    sent = False
+    if cover is not None:
+        try:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=cover,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=reply_to,
+                reply_markup=markup,
+            )
+            sent = True
+        except TelegramError as exc:
+            logger.warning("Reel song cover send failed: %s", exc)
+    if not sent:
+        with contextlib.suppress(TelegramError):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=caption,
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=reply_to,
+                reply_markup=markup,
+            )
+
+
 @membership_required
 async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, force_url: str = None, force_request_id: str = None) -> None:
-    """Handle 🎵 موزیک ریلز button presses."""
+    """Handle 🎵 موزیک ریلز button presses — recognize the song with ShazamIO.
+
+    The reel video the bot JUST sent stays on disk for
+    REEL_VIDEO_RETENTION_SECONDS; within that window the recognition uses
+    it directly (no re-download). After the window passes the reel is re-
+    downloaded through the platform's normal gateway chain first.
+    """
     query = update.callback_query
     data = query.data or ""
     parts = data.split(":")
@@ -5045,10 +5448,10 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
     if entry is None and not force_url:
         await query.answer("این درخواست منقضی شده است.", show_alert=True)
         return
-    
+
     if force_url:
         url = force_url
-        request_id = force_request_id
+        request_id = force_request_id or uuid.uuid4().hex[:8]
     else:
         url, created_at, orig_chat_id, orig_user_id = entry
         if time.monotonic() - created_at > REEL_MUSIC_TTL:
@@ -5058,8 +5461,6 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
         if update.effective_user.id != orig_user_id or update.effective_chat.id != orig_chat_id:
             await query.answer("این درخواست متعلق به شما نیست.", show_alert=True)
             return
-        REEL_MUSIC_URLS.pop(token, None)
-        request_id = uuid.uuid4().hex[:8]
 
     REEL_MUSIC_URLS.pop(token, None)
     await query.answer("🎵 دارم آهنگ ریلز رو شناسایی می‌کنم…")
@@ -5067,94 +5468,107 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_reply_markup(reply_markup=None)
 
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
     reply_to = query.message.message_id if query.message else None
     request_id = uuid.uuid4().hex[:8]
 
-    if ACCOUNT_POOL.total == 0:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=status_card("🛠 بخش دانلود موقتاً آماده نیست", "لطفاً کمی بعد دوباره امتحان کن."),
-            parse_mode=ParseMode.HTML,
-            reply_to_message_id=reply_to,
-        )
-        return
+    # ── 1) Reuse the retained reel video while it is still on disk ─────
+    record = REEL_VIDEO_FILES.pop(token, None)
+    cleanup_task = REEL_VIDEO_CLEANUP_TASKS.pop(token, None)
+    if cleanup_task is not None and not cleanup_task.done():
+        cleanup_task.cancel()  # the file now belongs to this handler
+    media_path: Path | None = None
+    media_mime = ""
+    attempt_directory: Path | None = None
+    if (
+        record is not None
+        and time.monotonic() - record.created_at <= REEL_VIDEO_RETENTION_SECONDS
+        and record.chat_id == chat_id
+        and record.user_id == user_id
+        and record.path.is_file()
+    ):
+        media_path = record.path
+        attempt_directory = record.attempt_directory
+        logger.info("Reel music reusing retained video for %s", request_id)
+    record = None
 
-    queued = ACCOUNT_POOL.busy_count >= ACCOUNT_POOL.total
     status_message = await send_status(
         context,
         chat_id,
         status_card(
-            "⏳ لینک رفت توی صف" if queued else "🎵 دارم آهنگ ریلز رو پیدا می‌کنم…",
-            f"نوبت تقریبی: <b>{ACCOUNT_POOL.queue_length + 1}</b>" if queued
-            else f"دارم آهنگ ریلز رو تشخیص می‌دم و بعدش دانلود کنم.",
-            "برای توقف: /cancel",
+            "🎵 دارم آهنگ ریلز رو پیدا می‌کنم…",
+            "دارم آهنگ رو تشخیص می‌دم؛ چند لحظه صبر کن.",
         ),
         reply_to,
     )
     progress = ProgressReporter(status_message, request_id)
 
-    lease: WorkerLease | None = None
-    attempt_directory: Path | None = None
     try:
-        lease = await asyncio.wait_for(
-            ACCOUNT_POOL.acquire(),
-            timeout=SETTINGS.worker_acquire_timeout,
+        # ── 2) Retention window passed → re-download the reel video with
+        #      the current architecture (AHM7 → Apify → Telegram bots).
+        if media_path is None:
+            await progress.update(
+                15,
+                "⬇️ دارم ریلز رو دوباره دانلود می‌کنم…",
+                force=True,
+            )
+            result = await redownload_reel_video(url, request_id, progress=progress)
+            if result.status != "ready" or not result.media:
+                await edit_status(
+                    status_message,
+                    status_card(
+                        "❌ ریلز دوباره دریافت نشد",
+                        "برای شناسایی آهنگ باید ویدیو دوباره دانلود بشه ولی همه مسیرها جواب ندادن؛ چند لحظه بعد دوباره امتحان کن.",
+                    ),
+                )
+                return
+            media = _pick_reel_media(result)
+            media_path = media.path
+            media_mime = media.mime_type
+            # The gateway attempts live in their own sub-directories — the
+            # file's directory is the one that needs cleaning afterwards.
+            attempt_directory = media_path.parent
+
+        # ── 3) Hand the video to ShazamIO ──────────────────────────────
+        await progress.update(
+            55,
+            "🎧 دارم آهنگ رو تشخیص می‌دم…",
+            force=True,
         )
+        try:
+            match = await REEL_MUSIC.recognize(
+                media_path,
+                mime_type=media_mime,
+                proxy_url=_reel_music_http_proxy(),
+            )
+        except ReelMusicError as exc:
+            logger.info("Reel music recognition failed for %s: %s", request_id, exc)
+            await edit_status(
+                status_message,
+                status_card("❌ آهنگ پیدا نشد", "الان نمی‌تونم شناسایی رو انجام بدم؛ چند لحظه بعد دوباره امتحان کن."),
+            )
+            return
 
-        for bot_username in SETTINGS.music_finder_bots:
-            try:
-                attempt_directory = create_attempt_directory(
-                    SETTINGS.download_root,
-                    request_id,
-                    f"reel-music-{bot_username}",
-                )
-                await progress.update(
-                    10,
-                    f"🎵 دارم آهنگ رو دریافت می‌کنم…",
-                    force=True,
-                )
-
-                result = await GATEWAY.request(
-                    client=lease.worker.client,
-                    worker_name=lease.worker.name,
-                    bot_username=bot_username,
-                    url=url,
-                    attempt_directory=attempt_directory,
-                    progress_callback=progress.download,
-                    expected_kind_override=MediaKind.AUDIO,
-                )
-
-                if result.status == "ready":
-                    await send_result_to_user(
-                        update,
-                        context,
-                        status_message,
-                        result,
-                        reply_to=reply_to,
-                        request_id=request_id,
-                        progress=progress,
-                        source_url=url,
-                        platform_value=platform.value,
-                        user_id=update.effective_user.id,
-                    )
-                    return
-
-                logger.info("Reel music bot @%s returned %s for %s", bot_username, result.status, request_id)
-            except Exception as bot_exc:
-                logger.warning("Attempt with @%s failed: %s", bot_username, bot_exc)
-                continue
+        if match is None:
+            await edit_status(
+                status_message,
+                status_card(
+                    "😕 آهنگ پیدا نشد",
+                    "ریلز ممکنه موزیک نداشته باشه یا از صدای اوریجینال استفاده شده باشه.",
+                ),
+            )
+            return
 
         await edit_status(
             status_message,
-            status_card(
-                "❌ آهنگ پیدا نشد",
-                "ریلز ممکنه موزیک نداشته باشه یا از صدای اوریجینال استفاده شده باشه.",
-            ),
+            status_card("✅ آهنگ رو پیدا کردم!", "دارم مشخصاتش رو برات می‌فرستم…"),
         )
-    except (PoolUnavailable, asyncio.TimeoutError):
-        await edit_status(
-            status_message,
-            status_card("⏳ صف پر است", "لطفاً چند لحظه صبر کن و دوباره امتحان کن."),
+        await send_reel_song_card(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            reply_to=reply_to,
+            match=match,
         )
     except asyncio.CancelledError:
         raise
@@ -5168,8 +5582,55 @@ async def on_reel_music_callback(update: Update, context: ContextTypes.DEFAULT_T
     finally:
         if attempt_directory is not None:
             cleanup_request_directory(attempt_directory, SETTINGS.download_root)
-        if lease is not None:
-            ACCOUNT_POOL.release(lease)
+
+
+@membership_required
+async def on_reel_song_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 🎧 دانلود فایل آهنگ — fetch the actual audio file.
+
+    Reuses the /song pattern: look the song up on YouTube so the existing
+    download pipeline can take over and send the audio to the user.
+    """
+    query = update.callback_query
+    data = query.data or ""
+    parts = data.split(":")
+    token = parts[1] if len(parts) > 1 else ""
+    prune_reel_song_downloads()
+    entry = REEL_SONG_DOWNLOADS.get(token)
+    if entry is None:
+        await query.answer("این درخواست منقضی شده است.", show_alert=True)
+        return
+    artist, track, created_at, orig_chat_id, orig_user_id = entry
+    if time.monotonic() - created_at > REEL_MUSIC_TTL:
+        REEL_SONG_DOWNLOADS.pop(token, None)
+        await query.answer("این درخواست منقضی شده است.", show_alert=True)
+        return
+    if update.effective_user.id != orig_user_id or update.effective_chat.id != orig_chat_id:
+        await query.answer("این درخواست متعلق به شما نیست.", show_alert=True)
+        return
+    REEL_SONG_DOWNLOADS.pop(token, None)
+    with contextlib.suppress(TelegramError):
+        await query.answer("🎧 دارم فایل آهنگ رو پیدا می‌کنم…")
+    with contextlib.suppress(TelegramError):
+        await query.edit_message_reply_markup(reply_markup=None)
+    proxy_url = (
+        f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+        if SETTINGS.use_proxy
+        else None
+    )
+    youtube_url = await youtube_url_for_song(artist, track, proxy_url=proxy_url)
+    if not youtube_url:
+        with contextlib.suppress(TelegramError):
+            await context.bot.send_message(
+                chat_id=orig_chat_id,
+                text=status_card(
+                    "😕 فایل آهنگ پیدا نشد",
+                    f"برای <b>{html_escape(artist)} - {html_escape(track)}</b> نسخهٔ YouTube پیدا نشد.",
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        return
+    await process_urls(update, context, (youtube_url,), query.message.message_id if query.message else None)
 
 
 def cleanup_stale_download_directories(max_age_seconds: float = 24 * 60 * 60) -> None:
@@ -5718,6 +6179,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(token_alerts.handle_ack_callback, pattern=r"^ack:"))
     application.add_handler(CallbackQueryHandler(on_selection, pattern=r"^(?:sel|cancel|info|caption):"))
     application.add_handler(CallbackQueryHandler(on_reel_music_callback, pattern=r"^reel_music:"))
+    application.add_handler(CallbackQueryHandler(on_reel_song_callback, pattern=r"^reel_song:"))
     application.add_handler(CallbackQueryHandler(on_youtube_search_callback, pattern=r"^(?:ys|yp):"))
     application.add_handler(CallbackQueryHandler(on_shazam_search_callback, pattern=r"^(?:ss|sp):"))
     application.add_handler(CallbackQueryHandler(on_youtube_subtitle_callback, pattern=r"^yt_sub:"))
