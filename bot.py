@@ -4072,7 +4072,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     status_message = await message.reply_text(
         status_card(
             "🔍 دارم پروفایل رو می‌گیرم…",
-            f"در حال دریافت اطلاعات صفحه <b>@{html_escape(username.strip('@/'))}</b> از CreatorCrawl",
+            f"در حال دریافت اطلاعات صفحه <b>@{html_escape(username.strip('@/'))}</b>...",
         ),
         parse_mode=ParseMode.HTML,
     )
