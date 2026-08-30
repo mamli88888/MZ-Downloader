@@ -631,9 +631,12 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if not ai_service.ai_available():
         await update.effective_message.reply_text(
-            "دستیار هوشمند فعال نیست.\n"
-            "برای فعال‌سازی، در تنظیمات ربات (Variables) مقدار <code>AI_PROVIDER=auto</code> و "
-            "<code>AI_API_KEY</code> را با کلید رایگان HuggingFace/Cohere/Mistral پر کنید و یک بار ربات را ری‌استارت کنید."
+            "دستیار هوشمند غیرفعال است.\n"
+            "پیش‌فرض ربات از سرویس رایگان Gemini (prexzyapis.com) استفاده می‌کند که نیازی به کلید ندارد؛ "
+            "اگر Variableهای ربات را تغییر داده‌اید، مقدار <code>AI_PROVIDER</code> را خالی بگذارید یا "
+            "<code>prexzy</code> بگذارید (یا حذفش کنید) و یک بار ربات را ری‌استارت کنید.\n"
+            "برای سرویس‌های جایگزین می‌توانید <code>AI_PROVIDER</code> را روی huggingface/cohere/mistral بگذارید "
+            "و <code>AI_API_KEY</code> را با کلید آن سرویس پر کنید."
             ,
             parse_mode=ParseMode.HTML,
         )

@@ -427,9 +427,13 @@ python bot.py
 
 | متغیر | توضیح | پیش‌فرض |
 |-------|--------|--------|
-| `AI_API_KEY` | کلید API ارائه‌دهنده | (خالی = خاموش) |
-| `AI_PROVIDER` | `huggingface` / `cohere` / `mistral` / `auto` | `auto` |
+| `AI_PROVIDER` | `prexzy` / `huggingface` / `cohere` / `mistral` / `off` | `prexzy` |
+| `AI_API_KEY` | فقط برای huggingface/cohere/mistral لازم است | (خالی) |
 | `AI_MODEL` | نام مدل | مدل پیش‌فرض هر ارائه‌دهنده |
+
+> پیش‌فرض: سرویس رایگان **Gemini** از `https://prexzyapis.com/ai/gemini`
+> (بدون نیاز به کلید). `/ask`، دکمه‌ی «🤖 خلاصه کن» و پیشنهاد هشتگ بدون هیچ
+> تنظیمی کار می‌کنند. برای خاموش‌کردن: `AI_PROVIDER=off`.
 
 ### آپلود ابری
 

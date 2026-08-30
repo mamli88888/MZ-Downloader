@@ -115,11 +115,11 @@ LOG_FORMAT=text|json                     # لاگ ساختاریافته (پیش
 ```text
 BOT_ADMIN_CHAT_ID=123456789      # آیدی عددی مدیر اصلی (برای PV هشدار توکن‌ها) — از @userinfوبات بگیرید
 MZ_DB_PATH=mz_data.db            # مسیر دیتابیس SQLite
-AI_PROVIDER=huggingface|cohere|mistral|off   # پیش‌فرض off
-AI_API_KEY=hf_xxx                # کلید رایگان: HF settings/tokens یا Cohere trial یا Mistral free tier
+AI_PROVIDER=prexzy               # پیش‌فرض: Gemini رایگان prexzyapis (بدون کلید). گزینه‌ها: huggingface|cohere|mistral|off
+AI_API_KEY=                      # فقط برای huggingface/cohere/mistral لازم است
 AI_MODEL=                        # اختیاری؛ پیش‌فرض هر provider
-AI_RATE_PER_MINUTE=10            # محدودیت آزادانه‌ی free tier
-AI_TIMEOUT_SECONDS=20
+AI_RATE_PER_MINUTE=20
+AI_TIMEOUT_SECONDS=30
 ```
 
 ---

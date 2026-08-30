@@ -4263,6 +4263,11 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
       animation / audio / voice / document / sticker with caption "/broadcast ..."
       sticker (no caption) with reply /broadcast -> forwarded sticker
       /broadcast (as a reply to any message)     -> copies that target message
+
+    The /broadcast prefix is ALWAYS removed before sending — including the
+    reply form, where the replied-to message itself may start with
+    /broadcast (e.g. an old draft command or a media post prepared as a
+    broadcast with a "/broadcast …" caption).
     """
     if not _is_admin(update.effective_user):
         await update.effective_message.reply_text(
@@ -4287,9 +4292,12 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # Text-only broadcast path:
     #   - Admin sent "/broadcast <text>" → broadcast the stripped text.
     #   - Admin replied to a text message with "/broadcast" (no extra text)
-    #     → broadcast the replied message's text.
+    #     → broadcast the replied message's text. The /broadcast prefix is
+    #     stripped here too: if the admin replies to an old draft command
+    #     (e.g. "/broadcast hello"), users must receive "hello" — not the
+    #     raw command text.
     if not has_media and not caption_text and is_reply and target_msg.text:
-        caption_text = target_msg.text
+        caption_text = _strip_broadcast_command(target_msg.text)
 
     is_text_only = not has_media and bool(caption_text)
 
@@ -4326,6 +4334,14 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 kwargs = {"chat_id": uid, "from_chat_id": target_msg.chat_id, "message_id": target_msg.message_id}
                 if caption_text:
                     kwargs["caption"] = caption_text
+                else:
+                    # Caption inherited from the target message: if it was
+                    # prepared as a broadcast draft (starts with /broadcast),
+                    # strip the prefix so users never receive the command.
+                    raw_caption = target_msg.caption or ""
+                    inherited = _strip_broadcast_command(raw_caption)
+                    if inherited and inherited != raw_caption.strip():
+                        kwargs["caption"] = inherited
                 await context.bot.copy_message(**kwargs)
             sent += 1
         except TelegramError:

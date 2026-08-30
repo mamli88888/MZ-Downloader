@@ -1,9 +1,15 @@
-"""Free-tier AI helpers for MZ-Downloader (standalone; stdlib + httpx only).
+"""AI helpers for MZ-Downloader (standalone; stdlib + httpx only).
 
 Persian summaries (summarize_persian), Persian/English tag suggestions
 (suggest_tags) and FAQ answering (faq_answer — local keywords first, AI
-fallback). Providers: HuggingFace / Cohere / Mistral via AI_PROVIDER env;
-config is read at call time and cached in-module.
+fallback).
+
+Default provider: **prexzy** — the free Google Gemini endpoint at
+https://prexzyapis.com/ai/gemini (docs: https://docs.prexzyapis.com).
+No API key required; POSTs JSON {"prompt": …, "session_id": …} and reads
+back data["response"].  HuggingFace / Cohere / Mistral remain selectable
+via AI_PROVIDER env (they need AI_API_KEY); config is read at call time
+and cached in-module.
 
 Design rule: every public function degrades gracefully — any failure,
 timeout, rate refusal or parse error returns ``None``; nothing ever raises.
@@ -16,7 +22,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
+import uuid
 from collections import deque
 
 import httpx
@@ -24,10 +32,36 @@ import httpx
 logger = logging.getLogger("MZDownloader.ai")
 
 _DEFAULT_MODELS: dict[str, str] = {
+    "prexzy": "gemini",
     "huggingface": "Qwen/Qwen2.5-7B-Instruct",
     "cohere": "command-r-08-2024",
     "mistral": "mistral-small-latest",
 }
+
+# Free prexzyapis.com Google Gemini endpoint (no key needed).
+_PREXZY_URL = "https://prexzyapis.com/ai/gemini"
+# The endpoint 403s generic python-requests UAs; send a browser-like one.
+_PREXZY_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+}
+
+# Gemini sometimes leaks internal XML-ish scaffolding into its reply:
+#   <Section title> "Standard Greeting"> <TextBox subtext> "Salam" text>
+#   "سلام"/> </Section> <Elicitations> <Elicitation label> "…" query> "…"/>
+# Strip those artifacts (block tags, bare attr-closers, stray "/>" and '">')
+# so Telegram users never see them.
+_PREXZY_ARTIFACT_RE = re.compile(
+    r"</?(?:Section|TextBox|Elicitation|Elicitations)\b[^>]*>"
+    r"|\b(?:title|subtext|label|query|text)>\s*"
+    r"|/\>\s*"
+    r"|\"\>\s*",
+    re.IGNORECASE,
+)
 
 # Free-tier fallback models tried in order when the primary HF model 404s
 # or is not served on the Inference Providers router.
@@ -43,34 +77,26 @@ _CFG: dict | None = None
 def _detect_provider(raw: str, api_key: str) -> str:
     """Resolve the effective provider.
 
-    Fixes the "I set the token but it says token missing" confusion: the
-    previous logic required AI_PROVIDER to name a provider explicitly and
-    silently treated everything else as "off". Now:
+    ``prexzy`` (the free prexzyapis.com Google Gemini endpoint) is the
+    DEFAULT and needs no API key:
 
-      * explicit huggingface/cohere/mistral wins;
-      * "auto" (or unset/off) + a key that looks like HuggingFace (``hf_…``)
-        → huggingface;
-      * "auto" (or unset/off) + any other non-empty key → huggingface (the
-        default free option) with a warning that names the fix;
-      * "off" with no key → off.
+      * AI_PROVIDER unset / "auto" / "prexzy"  → prexzy (always available);
+      * explicit huggingface/cohere/mistral     → that provider (needs key);
+      * "off"                                   → off.
     """
     normalized = (raw or "").strip().lower()
-    if normalized in _DEFAULT_MODELS:
-        return normalized
+    if normalized == "hugging face":
+        normalized = "huggingface"
     if normalized == "off":
-        if not api_key:
-            return "off"
-        logger.warning(
-            "AI_PROVIDER is 'off' but AI_API_KEY is set — auto-enabling provider 'huggingface'. "
-            "Set AI_PROVIDER=cohere or AI_PROVIDER=mistral if that key belongs to another service."
-        )
-        return "huggingface"
-    # unset / "auto" / typo + key present → auto-detect
-    if not api_key:
         return "off"
-    if api_key.startswith("hf_"):
-        return "huggingface"
-    return "huggingface"
+    if normalized in ("", "auto", "prexzy"):
+        return "prexzy"
+    if normalized in _DEFAULT_MODELS:
+        # huggingface / cohere / mistral — honour the explicit choice.
+        return normalized
+    # Unknown value: fall back to the free default rather than dying.
+    logger.warning("Unknown AI_PROVIDER %r — falling back to 'prexzy'.", raw)
+    return "prexzy"
 
 
 def _get_cfg() -> dict:
@@ -85,16 +111,14 @@ def _get_cfg() -> dict:
 
     api_key = (os.getenv("AI_API_KEY", "") or "").strip()
     raw_provider = (os.getenv("AI_PROVIDER", "") or "").strip().lower()
-    # Normalize the legacy alias so docs stay valid.
-    if raw_provider == "hugging face":
-        raw_provider = "huggingface"
     provider = _detect_provider(raw_provider, api_key)
     fresh = {
         "provider": provider,
         "api_key": api_key,
         "model": (os.getenv("AI_MODEL", "") or "").strip() or _DEFAULT_MODELS.get(provider, ""),
-        "rate": _num("AI_RATE_PER_MINUTE", 10.0),
-        "timeout": _num("AI_TIMEOUT_SECONDS", 20.0),
+        "rate": _num("AI_RATE_PER_MINUTE", 20.0),
+        # prexzy replies in ~3s but can be slower under load; give it room.
+        "timeout": _num("AI_TIMEOUT_SECONDS", 30.0),
         "max_input": int(_num("AI_MAX_INPUT_CHARS", 6000.0)),
     }
     sig = tuple(fresh.values())
@@ -105,9 +129,18 @@ def _get_cfg() -> dict:
 
 
 def ai_available() -> bool:
-    """True when a provider is selected and an API key is configured."""
+    """True when the AI service can be used.
+
+    The default prexzy provider needs no API key, so it is always on
+    unless AI_PROVIDER=off.  The optional huggingface/cohere/mistral
+    providers still require AI_API_KEY.
+    """
     cfg = _get_cfg()
-    return cfg["provider"] != "off" and bool(cfg["api_key"])
+    if cfg["provider"] == "off":
+        return False
+    if cfg["provider"] == "prexzy":
+        return True
+    return bool(cfg["api_key"])
 
 
 # Sliding-window rate limiter + TTL result cache + health counters.
@@ -167,14 +200,34 @@ def _build_payload(provider: str, model: str, prompt: str, system: str, max_toke
     return {"model": model, "messages": _messages(prompt, system), "max_tokens": max_tokens}
 
 
+def _strip_artifacts(text: str) -> str:
+    """Remove leaked Gemini scaffolding tags and tidy the whitespace."""
+    if "<" not in text and "/>" not in text:
+        return text
+    cleaned = _PREXZY_ARTIFACT_RE.sub(" ", text)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _extract(provider: str, data: object, payload: dict) -> str | None:
     """Best-effort text extraction per provider response schema."""
     try:
+        # prexzy shape: {"status": true, "response": "…", …}
+        text: object = None
+        if provider == "prexzy" and isinstance(data, dict):
+            if data.get("status") is False:
+                return None
+            raw = data.get("response") or data.get("result") or data.get("message")
+            if isinstance(raw, str):
+                text = _strip_artifacts(raw)
+            if isinstance(text, str) and text == "Response generated successfully":
+                # sanity guard: never echo the wrapper's status message
+                text = None
         # OpenAI-compatible shape (mistral + huggingface router + cohere v2
         # all return choices[0].message.content; cohere v2 may also return
         # message.content as a list of {type: text} parts).
-        text: object = None
-        if isinstance(data, dict):
+        if text is None and isinstance(data, dict):
             choices = data.get("choices")
             if isinstance(choices, list) and choices and isinstance(choices[0], dict):
                 message = choices[0].get("message")
@@ -210,7 +263,39 @@ async def _chat(prompt: str, system: str = "", max_tokens: int = 400) -> str | N
     """Single entry point for all provider calls. Returns reply text or None."""
     cfg = _get_cfg()
     provider, key = cfg["provider"], cfg["api_key"]
-    if provider == "off" or not key:
+    if provider == "off":
+        return None
+    if provider == "prexzy":
+        # Free Google Gemini endpoint via prexzyapis.com. No key, no model
+        # chain — one POST per call. The system prompt is folded into the
+        # user prompt because the endpoint has no separate system field.
+        full_prompt = (system + "\n\n" + prompt).strip() if system else prompt
+        payload = {
+            "prompt": full_prompt,
+            # unique session per call → the server-side history never leaks
+            # one user's content into another request
+            "session_id": f"mz-{uuid.uuid4().hex}",
+        }
+        _STATS["calls_total"] += 1
+        try:
+            async with httpx.AsyncClient(
+                timeout=cfg["timeout"], headers=_PREXZY_HEADERS
+            ) as client:
+                resp = await asyncio.wait_for(
+                    client.post(_PREXZY_URL, json=payload),
+                    timeout=cfg["timeout"] * 1.2,
+                )
+        except Exception as exc:  # network / DNS / timeout / cancellation
+            return _fail(f"prexzy request failed: {exc}")
+        if resp.status_code != 200:
+            return _fail(f"prexzy http {resp.status_code}: {resp.text[:200]}")
+        try:
+            data = resp.json()
+        except Exception:
+            return _fail("prexzy returned non-json body")
+        text = _extract("prexzy", data, payload)
+        return text or _fail("prexzy response had no usable text")
+    if not key:
         return None
     if provider == "cohere":
         url = "https://api.cohere.com/v2/chat"
@@ -269,10 +354,15 @@ def _clip_sentences(text: str, limit: int) -> str:
     return text[:best].rstrip(" ،؛.") + "…"
 
 
+_PLAIN_TEXT_RULE = (
+    "Reply with plain text only. Never wrap your answer in XML-like tags "
+    "such as <Section>, <TextBox> or <Elicitation>."
+)
+
 _SUMMARY_SYSTEM = (
     "You are a helpful assistant. Summarize the following content in "
     "Persian (Farsi). Be concise, factual, use bullet points with '•'. "
-    "No preamble."
+    "No preamble. " + _PLAIN_TEXT_RULE
 )
 
 
@@ -301,7 +391,8 @@ async def summarize_persian(text: str, *, max_chars: int = 900) -> str | None:
 
 _TAGS_SYSTEM = (
     "You are a tagging assistant. Reply with ONLY a JSON array of short "
-    "hashtags (no '#' symbol), mixing Persian and English tags."
+    "hashtags (no '#' symbol), mixing Persian and English tags. "
+    + _PLAIN_TEXT_RULE
 )
 
 
@@ -500,7 +591,9 @@ async def faq_answer(question: str, bot_help_text: str = "") -> str | None:
         system = (
             "تو دستیار پشتیبانی یک ربات دانلودر تلگرام هستی. فقط بر اساس «راهنمای ربات» پایین پاسخ بده؛ "
             "اگر پاسخ در راهنما نیست، صادقانه بگو این مورد را نمی‌دانی و به /help ارجاع بده. "
-            "پاسخ را کوتاه، دقیق و کاملاً به زبان فارسی بنویس.\n\nراهنمای ربات:\n"
+            "پاسخ را کوتاه، دقیق و کاملاً به زبان فارسی بنویس. "
+            + _PLAIN_TEXT_RULE
+            + "\n\nراهنمای ربات:\n"
             + (bot_help_text or "")[:3000]
         )
         raw = await _chat(question[: cfg["max_input"]], system=system, max_tokens=300)
