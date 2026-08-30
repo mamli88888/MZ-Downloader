@@ -63,6 +63,36 @@ _PREXZY_ARTIFACT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The prexzy endpoint DOUBLE-escapes unicode in its JSON (the body contains
+# \\u200c, which resp.json() turns into the literal 6-char text "\\u200c").
+# Users then literally see "تجربه\\u200cای" instead of "تجربه‌ای". Decode every
+# literal \\uXXXX sequence into its real character (ZWNJ, «», <, >, emoji…).
+_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+# Same story for literal "\\/" and "\\n" tokens left in the prose.
+_LITERAL_ESCAPE_RE = re.compile(r"\\(?P<slash>/)|\\(?P<nl>n)")
+
+
+def _decode_escapes(text: str) -> str:
+    """Turn literal \\uXXXX, \\/ and \\n sequences into real characters.
+
+    Run BEFORE _strip_artifacts: the scaffolding tags arrive as
+    \\u003cSection…, so decoding first is what makes the artifact
+    stripping actually see (and remove) them.
+    """
+    if "\\" not in text:
+        return text
+
+    def _uni(m: re.Match[str]) -> str:
+        try:
+            return chr(int(m.group(1), 16))
+        except (ValueError, OverflowError):
+            return m.group(0)
+
+    text = _UNICODE_ESCAPE_RE.sub(_uni, text)
+    text = _LITERAL_ESCAPE_RE.sub(lambda m: "/" if m.group("slash") else "\n", text)
+    return text
+
+
 # Free-tier fallback models tried in order when the primary HF model 404s
 # or is not served on the Inference Providers router.
 _HF_MODEL_FALLBACKS: list[str] = [
@@ -220,7 +250,7 @@ def _extract(provider: str, data: object, payload: dict) -> str | None:
                 return None
             raw = data.get("response") or data.get("result") or data.get("message")
             if isinstance(raw, str):
-                text = _strip_artifacts(raw)
+                text = _strip_artifacts(_decode_escapes(raw))
             if isinstance(text, str) and text == "Response generated successfully":
                 # sanity guard: never echo the wrapper's status message
                 text = None
@@ -436,107 +466,85 @@ async def suggest_tags(text: str, *, count: int = 8) -> list[str] | None:
         return None
 
 
-# (keywords, answer, is_generic). Matching is two-tier & score-based:
-# tier 1 = specific topics (platforms/features), tier 2 = generic catch-alls
-# («دانلود/لینک/چطور»). A specific match ALWAYS wins over the generic row —
-# otherwise «چطور از پینترست دانلود کنم» would score the generic words higher.
-_FAQ: list[tuple[list[str], str, bool]] = [
+# (keywords, answer). Matching is score-based (len(keyword)+2 per hit) and
+# only trusted when the score reaches _FAQ_STRONG_SCORE — vague words like
+# «کانال» or «کیفیت» alone stay BELOW the bar so those questions reach the
+# AI assistant (which has the full guide) instead of a possibly unrelated
+# canned row. If the AI is unavailable/fails, the best-effort row is still
+# used as a last resort.
+_FAQ: list[tuple[list[str], str]] = [
     (
         ["زیرنویس", "subtitle", "زیر نویس", "sub"],
         "برای زیرنویس یوتیوب: لینک ویدیو را بفرستید و بعد از نمایش منو، دکمهٔ «🈶 زیرنویس» را بزنید تا فهرست زبان‌ها (فارسی/انگلیسی/…) نمایش داده شود و فایل زیرنویس برایتان ارسال می‌شود.",
-        False,
     ),
     (
         ["اسپاتیفای", "spotify", "spoti"],
         "لینک تراک اسپاتیفای را بفرستید تا منوی دانلود MP3 با کیفیت بالا و متادیتای کامل (نام تراک، خواننده، آلبوم و کاور) نمایش داده شود. آلبوم و پلی‌لیست هم پشتیبانی می‌شود و به‌صورت فایل ZIP ارسال می‌گردد.",
-        False,
     ),
     (
         ["پینترست", "pinterest", "پین ترست"],
         "لینک پین پینترست را بفرستید؛ ربات خودش تشخیص می‌دهد پین تصویری است یا ویدیویی و فقط گزینه‌های مرتبط را نشان می‌دهد. تصاویر با کیفیت اصلی ارسال می‌شوند.",
-        False,
     ),
     (
         ["توییتر", "twitter", "ایکس", " x ", "x.com"],
         "لینک توییت را بفرستید تا منوی گزینه‌ها نمایش داده شود: ویدیوی باکیفیت، ویدیوی کم‌حجم، همهٔ تصاویر و حتی متن کامل توییت همراه آمار (لایک/ریتوییت/ریپلای).",
-        False,
     ),
     (
         ["ساوندکلاد", "soundcloud", "ساند کلاد"],
         "لینک تراک ساوندکلاد را بفرستید تا فایل MP3 با بهترین کیفیت موجود دریافت و ارسال شود. پلی‌لیست‌ها هم از مسیر پشتیبان دانلود می‌شوند.",
-        False,
     ),
     (
         ["فیسبوک", "facebook", "فیس بوک"],
         "لینک ویدیوی عمومی فیسبوک (watch، reel یا ویدیوی پیج) را بفرستید تا منوی «ویدیو» یا «فقط صدا (MP3)» نمایش داده شود.",
-        False,
     ),
     (
         ["اینستاگرام", "instagram", "اینستا", "ریلز", "reel"],
         "لینک پست، ریلز یا IGTV عمومی اینستاگرام را بفرستید؛ منوی کیفیت، فقط صدا، کپشن پست و موزیک ریلز نمایش داده می‌شود. با /profile یوزرنیم هم می‌توانید پروفایل و استوری‌ها را ببینید.",
-        False,
     ),
     (
         ["یوتیوب", "youtube"],
         "لینک ویدیو یا شورتز یوتیوب را بفرستید تا منوی کیفیت (تا 4K) یا MP3 نمایش داده شود. برای جستجو کافی است نام ویدیو را همین‌جا بنویسید یا /search بزنید.",
-        False,
     ),
     (
         ["تیک تاک", "تیکتاک", "tiktok"],
         "لینک ویدیوی تیک‌تاک را بفرستید تا بدون واترمارک و با بهترین کیفیت دانلود و ارسال شود.",
-        False,
     ),
     (
         ["بوکمارک", "bookmark", "ذخیره"],
         "بعد از هر دانلود موفق دکمهٔ «🔖 ذخیره» زیر فایل نمایش داده می‌شود؛ با ذخیره کردن، لینک در فهرست شخصی شما می‌رود و هر وقت خواستید با /bookmarks می‌بینید و دوباره دریافت می‌کنید.",
-        False,
     ),
     (
         ["زمانبندی", "زمان بندی", "schedule", "زمان‌بندی"],
         "با دستور /schedule می‌توانید دانلود خودکار بسازید: «/schedule لینک 7d» یعنی هر ۷ روز یک‌بار آن لینک به‌صورت خودکار دانلود و همین‌جا برایتان ارسال شود. بازه‌های مجاز: 90m، 12h، 1d، 7d و 2w.",
-        False,
     ),
     (
         ["آمار شخصی", "امار شخصی", "امار من", "آمار من", "mystats", "گزارش شخصی"],
         "با دستور /mystats آمار شخصی ۳۰ روز اخیر خود را ببینید: تعداد دانلودها، حجم کل، پلتفرم‌های پراستفاده و نمودار روزانه.",
-        False,
     ),
     (
         ["اشتراک", "autoshare", "کانال", "ارسال خودکار"],
         "با /autoshare add داخل کانال یا گروه خودتان (ربات باید ادمین باشد) مقصد ثبت کنید؛ از این بعد هر محتوایی که دانلود کنید به‌صورت خودکار به آنجا هم ارسال می‌شود.",
-        False,
     ),
     (
         ["خلاصه", "summarize", "خلاصه کن"],
         "زیر کپشن‌های اینستاگرام و متن توییت‌ها دکمهٔ «🤖 خلاصه کن» نمایش داده می‌شود؛ با زدن آن خلاصهٔ فارسی همان محتوا برایتان ارسال می‌شود.",
-        False,
     ),
     (
         ["کیفیت", "quality", "رزولوشن", "720", "1080", "4k"],
         "بعد از فرستادن لینک، منوی کیفیت‌ها (مثلاً 144p تا 4K یا فقط صدا) نمایش داده می‌شود؛ حجم تقریبی هر گزینه کنار دکمه نوشته شده و کافی است روی گزینهٔ دلخواه بزنید.",
-        False,
     ),
     (
         ["حجم", "مگابایت", "گیگ", "لیمیت", "بزرگ", "limit"],
         "فایل‌های بزرگ‌تر از حد تلگرام به‌صورت خودکار روی فضای ابری آپلود می‌شوند و لینک دانلود موقت برایتان ارسال می‌شود؛ پس عملاً محدودیتی حس نمی‌کنید.",
-        False,
     ),
     (
         ["توقف", "لغو", "cancel", "کنسل"],
         "با دستور /cancel می‌توانید دانلودهای در حال انجام خودتان را متوقف کنید.",
-        False,
-    ),
-    (
-        ["شروع", "start", "چه کاری", "چیکار", "قابلیت", "معرفی"],
-        "این ربات دانلودر است: لینک محتوا (ویدیو، موسیقی، پست، پین و…) را بفرستید تا دانلود و برایتان ارسال شود. پلتفرم‌ها: اینستاگرام، یوتیوب، تیک‌تاک، توییتر/X، فیسبوک، اسپاتیفای، ساوندکلاد، پینترست، VK و… . راهنمای کامل: /help",
-        True,
-    ),
-    (
-        ["دانلود", "لینک", "download", "چطور", "چطوری", "نصب", "استفاده"],
-        "فقط کافی است لینک محتوای دلخواهتان را در همین گفتگو بفرستید؛ ربات نوع محتوا را تشخیص می‌دهد، منوی گزینه‌ها را نشان می‌دهد و پس از انتخاب شما، فایل را ارسال می‌کند. در گروه‌ها هم با /dl لینک یا ریپلای کار می‌کند.",
-        True,
     ),
 ]
+
+
+_FAQ_STRONG_SCORE = 8
 
 
 def _norm(s: str) -> str:
@@ -544,12 +552,15 @@ def _norm(s: str) -> str:
     return " ".join(s.split())
 
 
-def _best_faq(q: str) -> str | None:
-    """Two-tier score-based match: specific topics always outrank the
-    generic «how to download» catch-all rows."""
-    best_specific: tuple[int, str] | None = None
-    best_generic: tuple[int, str] | None = None
-    for keywords, answer, is_generic in _FAQ:
+def _best_faq(q: str) -> tuple[str | None, str | None]:
+    """Return (strong_match, weak_match).
+
+    strong = score-based hit above _FAQ_STRONG_SCORE → safe to answer
+    locally without the AI. weak = best row overall → only used as a
+    fallback when the AI itself is unavailable or fails.
+    """
+    best: tuple[int, str] | None = None
+    for keywords, answer in _FAQ:
         score = 0
         for keyword in keywords:
             k = _norm(keyword)
@@ -557,44 +568,42 @@ def _best_faq(q: str) -> str | None:
                 score += len(k) + 2
         if score <= 0:
             continue
-        bucket = (score, answer)
-        if is_generic:
-            if best_generic is None or score > best_generic[0]:
-                best_generic = bucket
-        else:
-            if best_specific is None or score > best_specific[0]:
-                best_specific = bucket
-    if best_specific is not None:
-        return best_specific[1]
-    return best_generic[1] if best_generic is not None else None
+        if best is None or score > best[0]:
+            best = (score, answer)
+    if best is None:
+        return None, None
+    strong = best[1] if best[0] >= _FAQ_STRONG_SCORE else None
+    return strong, best[1]
 
 
 async def faq_answer(question: str, bot_help_text: str = "") -> str | None:
-    """Answer common usage questions: score-matched local FAQ first, AI with
-    full bot context as fallback."""
+    """Answer usage questions: a STRONG local FAQ match answers instantly,
+    everything else goes to the AI assistant (grounded in the full bot
+    guide). The weak local row is only a last-resort fallback when the AI
+    is unavailable or fails."""
     try:
         if not isinstance(question, str) or not question.strip():
             return None
         q = _norm(question)
-        local = _best_faq(q)
-        if local is not None:
-            return local  # matched locally — no AI call, no rate usage
+        strong, weak = _best_faq(q)
+        if strong is not None:
+            return strong  # confident local hit — no AI call, no rate usage
         if not ai_available():
-            return None
+            return weak  # AI off → best-effort canned row (may be None)
         cfg = _get_cfg()
         key = _cache_key("faq", cfg["provider"], cfg["model"], question)
         cached = _cache_get(key)
         if cached is not None:
             return cached
         if not _allow_call(cfg["rate"]):
-            return None
+            return weak
         system = (
             "تو دستیار پشتیبانی یک ربات دانلودر تلگرام هستی. فقط بر اساس «راهنمای ربات» پایین پاسخ بده؛ "
             "اگر پاسخ در راهنما نیست، صادقانه بگو این مورد را نمی‌دانی و به /help ارجاع بده. "
             "پاسخ را کوتاه، دقیق و کاملاً به زبان فارسی بنویس. "
             + _PLAIN_TEXT_RULE
             + "\n\nراهنمای ربات:\n"
-            + (bot_help_text or "")[:3000]
+            + (bot_help_text or "")[:6000]
         )
         raw = await _chat(question[: cfg["max_input"]], system=system, max_tokens=300)
         if raw and (answer := _strip_quotes(raw)):
