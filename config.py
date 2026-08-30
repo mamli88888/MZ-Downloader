@@ -112,6 +112,16 @@ class Settings:
     apify_token_cooldown: float
     # 1404 upgrade — numeric chat id of the main admin receiving token alerts
     bot_admin_chat_id: int
+    # CreatorCrawl (Instagram /profile feature). Keys are listed as
+    # "API_KEY|EMAIL" pairs (the email identifies the account each key
+    # belongs to, used in the admin PV when a key burns its quota).
+    creatorcrawl_keys: tuple[str, ...]
+    creatorcrawl_key_limit: int
+    # Persistent KV for CreatorCrawl usage counters — Upstash Redis REST
+    # survives restarts, redeploys and deploys on a different Railway
+    # account (the local cc_usage.json fallback does NOT).
+    upstash_rest_url: str
+    upstash_rest_token: str
 
 
 def _as_bool(value: str | None, default: bool) -> bool:
@@ -301,6 +311,14 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         apify_poll_interval=_as_float(env, "APIFY_POLL_INTERVAL_SECONDS", 3.0, minimum=0.2),
         apify_token_cooldown=_as_float(env, "APIFY_TOKEN_COOLDOWN_SECONDS", 600.0, minimum=5.0),
         bot_admin_chat_id=max(0, int(env.get("BOT_ADMIN_CHAT_ID", "0") or 0)),
+        creatorcrawl_keys=tuple(
+            k.strip()
+            for k in env.get("CREATORCRAWL_API_KEYS", "").split(",")
+            if k.strip()
+        ),
+        creatorcrawl_key_limit=_as_int(env, "CREATORCRAWL_KEY_LIMIT", 50, minimum=1),
+        upstash_rest_url=env.get("UPSTASH_REDIS_REST_URL", "").strip(),
+        upstash_rest_token=env.get("UPSTASH_REDIS_REST_TOKEN", "").strip(),
         download_root=download_root,
         max_file_size=_as_int(env, "MAX_FILE_SIZE_MB", 30) * 1024 * 1024,
         # Zero disables the application-level source-size cap. Telegram upload

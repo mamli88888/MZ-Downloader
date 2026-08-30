@@ -32,6 +32,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    InputMediaVideo,
     MessageEntity,
     Update,
 )
@@ -79,16 +80,7 @@ from downloader import (
     request_dr_downloader_album,
 )
 from instagram_caption import InstagramCaptionError, fetch_instagram_caption
-from instagram_profile import (
-    InstagramProfileError,
-    InstagramProfileNotFound,
-    InstagramProfilePrivate,
-    fetch_profile,
-    fetch_latest_post_url,
-    fetch_stories,
-    format_profile_caption,
-    download_media as ig_download_media,
-)
+import creatorcrawl
 from routing import Platform, all_providers, detect_platform, is_instagram_image_post, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
 from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
 from social_gateway import (
@@ -466,8 +458,9 @@ REEL_SONG_DOWNLOADS: dict[str, tuple[str, str, float, int, int]] = {}
 # the original YouTube URL when the user clicks 🇮🇷 فارسی or 🇬🇧 English.
 YOUTUBE_SUBTITLE_URLS: dict[str, tuple[str, float, int, int]] = {}
 YOUTUBE_SUBTITLE_TTL = 600  # 10 minutes
-# token → (username, created_at, chat_id, user_id)
-IG_PROFILE_SESSIONS: dict[str, tuple[str, float, int, int]] = {}
+# token → (CreatorCrawlProfile, created_at, chat_id, user_id) backing the
+# "دانلود آخرین پست" button of the /profile command (CreatorCrawl method).
+IG_PROFILE_SESSIONS: dict[str, tuple[creatorcrawl.CreatorCrawlProfile, float, int, int]] = {}
 IG_PROFILE_TTL = 600  # 10 minutes
 ADMIN_USERNAME = "iR0nin"  # only this user can use /broadcast
 
@@ -4018,12 +4011,46 @@ WELCOME_GROUP = status_card(
 )
 
 
-# ── Instagram Profile Feature ─────────────────────────────────────────
+# ── Instagram Profile Feature (CreatorCrawl) ──────────────────────────
+
+
+def _cc_fmt_count(n: int) -> str:
+    """Compact follower/post count: 1.2K / 3.4M (presentation only)."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _profile_caption(profile: creatorcrawl.CreatorCrawlProfile) -> str:
+    name_line = f"@{html.escape(profile.username)}"
+    if profile.full_name:
+        name_line = f"{html.escape(profile.full_name)} ({name_line})"
+    if profile.is_verified:
+        name_line += " ✔️"
+
+    lines = [
+        f"📌 {name_line}",
+        f"👥 فالوور: <b>{_cc_fmt_count(profile.followers)}</b>",
+        f"📸 پست: <b>{_cc_fmt_count(profile.posts)}</b>",
+    ]
+
+    post = profile.latest_post
+    if post is not None:
+        if post.url:
+            lines.append(f"🔗 آخرین پست: {html.escape(post.url)}")
+        if post.like_count or post.comment_count:
+            lines.append(f"❤️ {post.like_count} · 💬 {post.comment_count}")
+        if post.caption:
+            lines.append("")
+            lines.append(f"💬 {html.escape(post.caption[:200])}")
+    return "\n".join(lines)
 
 
 @membership_required
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /profile <username> — fetch and display an Instagram public profile."""
+    """Handle /profile <username> — CreatorCrawl profile card + latest-post button."""
     message = update.effective_message
     args = (message.text or message.caption or "").split(None, 1)
     username = args[1].strip() if len(args) > 1 else ""
@@ -4038,54 +4065,39 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # Clean @ prefix
-    username = username.strip("@/").strip()
-
     status_message = await message.reply_text(
         status_card(
             "🔍 دارم پروفایل رو می‌گیرم…",
-            f"در حال دریافت اطلاعات صفحه عمومی <b>@{html_escape(username)}</b>",
+            f"در حال دریافت اطلاعات صفحه <b>@{html_escape(username.strip('@/'))}</b> از CreatorCrawl",
         ),
         parse_mode=ParseMode.HTML,
     )
 
-    proxy_url = (
-        f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
-        if SETTINGS.use_proxy
-        else None
-    )
-
     try:
-        profile = await fetch_profile(username, proxy_url=proxy_url)
-    except InstagramProfileNotFound:
+        profile = await creatorcrawl.get_user_posts(username)
+    except creatorcrawl.CreatorCrawlNoKeys as exc:
+        await edit_status(
+            status_message,
+            status_card("🔑 کلید فعال نیست", str(exc)),
+        )
+        return
+    except creatorcrawl.CreatorCrawlNotFound:
         await edit_status(
             status_message,
             status_card(
                 "❌ پیج پیدا نشد",
-                f"نام‌کاربری <b>@{html_escape(username)}</b> وجود ندارد یا حذف شده است.",
+                f"نام‌کاربری <b>@{html_escape(username.strip('@/'))}</b> وجود ندارد یا حذف شده است.",
             ),
         )
         return
-    except InstagramProfilePrivate:
+    except creatorcrawl.CreatorCrawlError as exc:
         await edit_status(
             status_message,
-            status_card(
-                "🔒 پیج خصوصی",
-                f"پیج <b>@{html_escape(username)}</b> خصوصی است و اطلاعات آن در دسترس نیست.",
-            ),
+            status_card("❌ خطا", str(exc)),
         )
         return
-    except InstagramProfileError as exc:
-        await edit_status(
-            status_message,
-            status_card(
-                "❌ خطا",
-                str(exc),
-            ),
-        )
-        return
-    except Exception as exc:
-        logger.exception("Profile fetch failed for @%s", username)
+    except Exception:
+        logger.exception("CreatorCrawl profile fetch failed for %s", username)
         await edit_status(
             status_message,
             status_card(
@@ -4095,23 +4107,27 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    # Build caption
-    caption = format_profile_caption(profile)
+    caption = _profile_caption(profile)
 
-    # Build glass-style inline keyboard
-    token = uuid.uuid4().hex[:12]
-    IG_PROFILE_SESSIONS[token] = (username, time.monotonic(), update.effective_chat.id, update.effective_user.id)
+    keyboard_rows = []
+    if profile.latest_post is not None and profile.latest_post.media:
+        token = uuid.uuid4().hex[:12]
+        IG_PROFILE_SESSIONS[token] = (
+            profile,
+            time.monotonic(),
+            update.effective_chat.id,
+            update.effective_user.id,
+        )
+        keyboard_rows.append(
+            [InlineKeyboardButton("🖼 دانلود آخرین پست", callback_data=f"cc_prof:{token}:dl")]
+        )
+        if profile.latest_post.url:
+            keyboard_rows.append(
+                [InlineKeyboardButton("🔗 مشاهده پست در اینستاگرام", url=profile.latest_post.url)]
+            )
+    keyboard = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📸 دریافت آخرین پست", callback_data=f"ig_prof:{token}:post"),
-        ],
-        [
-            InlineKeyboardButton("📖 دریافت آخرین استوری‌ها", callback_data=f"ig_prof:{token}:stories"),
-        ],
-    ])
-
-    # Send profile photo with caption + buttons
+    # Send profile photo with caption + glass-style buttons
     try:
         if profile.avatar_url:
             await status_message.delete()
@@ -4142,7 +4158,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 @membership_required
 async def on_ig_profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Instagram profile callback buttons (latest post / stories)."""
+    """Handle the "دانلود آخرین پست" button — direct CDN download via CreatorCrawl links."""
     query = update.callback_query
     data = query.data or ""
     parts = data.split(":")
@@ -4150,15 +4166,17 @@ async def on_ig_profile_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("درخواست نامعتبر است.", show_alert=True)
         return
 
-    token = parts[1]
-    action = parts[2]  # "post" or "stories"
+    token, action = parts[1], parts[2]
+    if action != "dl":
+        await query.answer("عملیات نامعتبر.", show_alert=True)
+        return
 
     entry = IG_PROFILE_SESSIONS.get(token)
     if entry is None:
         await query.answer("این درخواست منقضی شده است.", show_alert=True)
         return
 
-    username, created_at, orig_chat_id, orig_user_id = entry
+    profile, created_at, orig_chat_id, orig_user_id = entry
     if time.monotonic() - created_at > IG_PROFILE_TTL:
         IG_PROFILE_SESSIONS.pop(token, None)
         await query.answer("این درخواست منقضی شده است.", show_alert=True)
@@ -4167,120 +4185,132 @@ async def on_ig_profile_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("این درخواست متعلق به شما نیست.", show_alert=True)
         return
 
-    # Don't pop the token — the user may click the other button too.
+    post = profile.latest_post
+    if post is None or not post.media:
+        await query.answer("پستی برای دانلود پیدا نشد.", show_alert=True)
+        return
 
+    await query.answer("دارم آخرین پست رو دانلود می‌کنم…")
+    with contextlib.suppress(TelegramError):
+        await query.edit_message_reply_markup(reply_markup=None)
+
+    chat_id = update.effective_chat.id
+    reply_to = query.message.message_id if query.message else None
     proxy_url = (
         f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
         if SETTINGS.use_proxy
         else None
     )
-    chat_id = update.effective_chat.id
-    reply_to = query.message.message_id if query.message else None
+    username = profile.username
 
-    if action == "post":
-        await query.answer("دارم آخرین پست رو پیدا می‌کنم…")
-        with contextlib.suppress(TelegramError):
-            await query.edit_message_reply_markup(reply_markup=None)
+    status_msg = await send_status(
+        context,
+        chat_id,
+        status_card(
+            "⬇️ دارم آخرین پست رو دانلود می‌کنم",
+            f"در حال دریافت مستقیم آخرین پست <b>@{html.escape(username)}</b> از لینک‌های CreatorCrawl…",
+        ),
+        reply_to,
+    )
 
-        post_url = await fetch_latest_post_url(username, proxy_url=proxy_url)
-        if not post_url:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=status_card(
-                    "❌ پستی پیدا نشد",
-                    f"پیج <b>@{html_escape(username)}</b> پستی ندارد یا اطلاعات در دسترس نیست.",
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=reply_to,
-            )
-            return
+    # Download straight from the CDN links the API returned.
+    MAX_MEDIA = 30  # safety cap for huge carousels
+    downloaded: list[tuple[str, bytes]] = []
+    for media in post.media[:MAX_MEDIA]:
+        try:
+            payload = await creatorcrawl.download_media(media.url, proxy_url=proxy_url)
+            downloaded.append((media.kind, payload))
+        except Exception as exc:
+            logger.warning("Latest-post media download failed for @%s: %s", username, exc)
+            continue
 
-        # Use the existing download flow to download and send the post
-        await process_urls(
-            update,
-            context,
-            [post_url],
-            reply_to,
-        )
-
-    elif action == "stories":
-        await query.answer("دارم استوری‌ها رو می‌گیرم…")
-        with contextlib.suppress(TelegramError):
-            await query.edit_message_reply_markup(reply_markup=None)
-
-        stories = await fetch_stories(username, proxy_url=proxy_url)
-        if not stories:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=status_card(
-                    "📖 استوری فعالی نیست",
-                    f"پیج <b>@{html_escape(username)}</b> فعلاً استوری فعالی نداره یا کوکی‌ها تنظیم نشده‌اند.",
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=reply_to,
-            )
-            return
-
-        status_msg = await send_status(
-            context,
-            chat_id,
-            status_card(
-                f"📖 دارم {len(stories)} استوری رو دانلود می‌کنم",
-                f"در حال دریافت تمام استوری‌های فعال <b>@{html_escape(username)}</b>…",
-            ),
-            reply_to,
-        )
-
-        sent_count = 0
-        for i, story in enumerate(stories):
-            try:
-                media_bytes = await ig_download_media(story.url, proxy_url=proxy_url)
-
-                if story.media_type == "video":
-                    if len(media_bytes) > 50 * 1024 * 1024:
-                        await context.bot.send_document(
-                            chat_id=chat_id,
-                            document=io.BytesIO(media_bytes),
-                            filename=f"story_{username}_{i + 1}.mp4",
-                            caption=f"📖 استوری {i + 1} از @{username}",
-                            reply_to_message_id=reply_to if sent_count == 0 else None,
-                        )
-                    else:
-                        await context.bot.send_video(
-                            chat_id=chat_id,
-                            video=io.BytesIO(media_bytes),
-                            caption=f"📖 استوری {i + 1} از @{username}",
-                            reply_to_message_id=reply_to if sent_count == 0 else None,
-                            supports_streaming=True,
-                        )
-                else:
-                    await context.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=io.BytesIO(media_bytes),
-                        caption=f"📖 استوری {i + 1} از @{username}",
-                        reply_to_message_id=reply_to if sent_count == 0 else None,
-                    )
-                sent_count += 1
-            except Exception as exc:
-                logger.warning("Failed to send story %d for @%s: %s", i + 1, username, exc)
-                continue
-
+    if not downloaded:
         with contextlib.suppress(TelegramError):
             await status_msg.delete()
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=status_card(
+                "❌ دانلود شکست خورد",
+                "در دریافت فایل آخرین پست خطایی رخ داد. لطفاً بعداً دوباره امتحان کن.",
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=reply_to,
+        )
+        return
 
-        if sent_count == 0:
+    base_caption = f"🖼 آخرین پست @{html.escape(username)}"
+    if post.url:
+        base_caption += f"\n🔗 {html.escape(post.url)}"
+
+    async def _send_single(kind: str, payload: bytes, caption: str, reply: bool) -> None:
+        stream = io.BytesIO(payload)
+        if kind == "video":
+            if len(payload) > 50 * 1024 * 1024:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=stream,
+                    filename=f"post_{username}.mp4",
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=reply_to if reply else None,
+                )
+            else:
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=stream,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=reply_to if reply else None,
+                    supports_streaming=True,
+                )
+        else:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=stream,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=reply_to if reply else None,
+            )
+
+    try:
+        if len(downloaded) == 1:
+            kind, payload = downloaded[0]
+            await _send_single(kind, payload, base_caption, reply=True)
+        else:
+            # Album — send in media groups of 10 (Telegram hard limit).
+            for chunk_start in range(0, len(downloaded), 10):
+                chunk = downloaded[chunk_start:chunk_start + 10]
+                group = []
+                for idx, (kind, payload) in enumerate(chunk):
+                    caption = base_caption if idx == 0 and chunk_start == 0 else ""
+                    if kind == "video":
+                        group.append(InputMediaVideo(media=io.BytesIO(payload), caption=caption, parse_mode=ParseMode.HTML))
+                    else:
+                        group.append(InputMediaPhoto(media=io.BytesIO(payload), caption=caption, parse_mode=ParseMode.HTML))
+                await context.bot.send_media_group(chat_id=chat_id, media=group)
+    except TelegramError as exc:
+        logger.warning("Latest-post send failed for @%s: %s", username, exc)
+        # Fall back to one-by-one sends with document overflow support.
+        sent_any = False
+        for idx, (kind, payload) in enumerate(downloaded):
+            try:
+                await _send_single(kind, payload, base_caption if idx == 0 else "", reply=not sent_any)
+                sent_any = True
+            except TelegramError as inner:
+                logger.warning("Latest-post item send failed for @%s: %s", username, inner)
+        if not sent_any:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=status_card(
-                    "❌ ارسال استوری شکست خورد",
-                    "در دانلود استوری‌ها خطایی رخ داد. لطفاً بعداً دوباره امتحان کن.",
+                    "❌ ارسال شکست خورد",
+                    "فایل دانلود شد ولی ارسال به تلگرام ممکن نشد. لطفاً بعداً دوباره امتحان کن.",
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_to_message_id=reply_to,
             )
-    else:
-        await query.answer("عملیات نامعتبر.", show_alert=True)
 
+    with contextlib.suppress(TelegramError):
+        await status_msg.delete()
 
 
 @membership_required
@@ -6388,6 +6418,12 @@ async def post_init(application: Application) -> None:
         SETTINGS.apify_tokens,
     )
     token_alerts.start()
+    creatorcrawl.initialize(
+        application.bot,
+        SETTINGS.bot_admin_chat_id,
+        SETTINGS.creatorcrawl_keys,
+        SETTINGS.creatorcrawl_key_limit,
+    )
     FEATURES_SCHEDULER_TASK = asyncio.create_task(
         features_scheduler_loop(application), name="features-scheduler"
     )
@@ -6592,7 +6628,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(on_youtube_search_callback, pattern=r"^(?:ys|yp):"))
     application.add_handler(CallbackQueryHandler(on_shazam_search_callback, pattern=r"^(?:ss|sp):"))
     application.add_handler(CallbackQueryHandler(on_youtube_subtitle_callback, pattern=r"^yt_sub:"))
-    application.add_handler(CallbackQueryHandler(on_ig_profile_callback, pattern=r"^ig_prof:"))
+    application.add_handler(CallbackQueryHandler(on_ig_profile_callback, pattern=r"^cc_prof:"))
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
