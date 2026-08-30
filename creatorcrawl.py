@@ -1,10 +1,25 @@
 """CreatorCrawl API client — Instagram profile + latest post with key rotation.
 
 Replaces the old direct-Instagram-scraping ``instagram_profile.py`` method.
-The bot now talks to https://app.creatorcrawl.com only:
+The bot now talks to https://app.creatorcrawl.com only, using the TWO
+endpoints documented in the official OpenAPI spec
+(https://app.creatorcrawl.com/api/openapi.json):
 
+    GET /api/instagram/profile?handle=<username>
+        → data{handle, name, avatar_url, follower_count, post_count,
+               verified, is_private, recent_posts[]}
     GET /api/instagram/user/posts?handle=<username>
+        → data[{url, type, text, media[{type,url,width,height}],
+                like_count, comment_count, author{handle,name,avatar_url}}]
+
     header: x-api-key: <KEY>
+
+Both endpoints return a NORMALIZED envelope: ``{"data": ..., "page": {},
+"meta": {}}``.  ``/profile`` is queried first — it carries the avatar,
+follower/post counts AND (when the upstream includes them) recent posts, so
+the whole card usually costs ONE credit.  Only when that response has no
+usable latest post does the bot spend a second credit on ``/user/posts``.
+Private pages skip the second call entirely.
 
 Every successful call costs 1 credit.  Each CreatorCrawl account (free plan)
 ships 50 credits, so the operator registers SEVERAL accounts and lists all
@@ -36,7 +51,7 @@ import html
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from html import unescape
 from pathlib import Path
 from typing import Any
@@ -50,7 +65,21 @@ from config import PROJECT_DIR, SETTINGS
 logger = logging.getLogger("MZDownloader.creatorcrawl")
 
 API_BASE = "https://app.creatorcrawl.com/api"
+PROFILE_PATH = "/instagram/profile"
 USER_POSTS_PATH = "/instagram/user/posts"
+
+# Response-envelope tokens that mean "the KEY/account is the problem".
+_KEY_ERROR_TOKENS = (
+    "credit", "quota", "unauthorized", "invalid api key", "billing",
+    "payment", "rate limit", "rate-limit", "ratelimit", "exceeded",
+    "insufficient", "forbidden", "not authorized",
+)
+# Response-envelope tokens that mean "the HANDLE is the problem".
+_NOT_FOUND_TOKENS = (
+    "not found", "no user", "user_not_found", "doesn't exist",
+    "does not exist", "unable to locate", "invalid handle",
+    "unknown handle", "cannot find user", "couldn't find",
+)
 
 _DATACENTER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -109,6 +138,7 @@ class CreatorCrawlProfile:
     posts: int
     is_verified: bool
     latest_post: CreatorCrawlPost | None
+    is_private: bool = False
 
 
 # ── Key bookkeeping ──────────────────────────────────────────────────
@@ -338,20 +368,22 @@ def _validate_handle(handle: str) -> str:
     return cleaned
 
 
-async def _call_api(api_key: str, handle: str) -> dict[str, Any]:
+async def _call_api(api_key: str, path: str, handle: str) -> dict[str, Any]:
     from perf import pooled_client
 
     try:
         client = pooled_client("creatorcrawl")
         resp = await client.get(
-            f"{API_BASE}{USER_POSTS_PATH}",
+            f"{API_BASE}{path}",
             params={"handle": handle},
             headers={"x-api-key": api_key, "accept": "application/json"},
         )
     except httpx.HTTPError as exc:
         raise CreatorCrawlError(f"خطای شبکه در تماس با CreatorCrawl: {exc}") from exc
 
-    if resp.status_code == 404:
+    # 400 = "Missing or invalid handle", 404 = unknown handle (both mean the
+    # HANDLE is wrong — retrying with another key would only burn credits).
+    if resp.status_code in (400, 404):
         raise CreatorCrawlNotFound("handle_not_found")
     if resp.status_code in (401, 403):
         raise _KeyRejected("کلید نامعتبر یا غیرفعال شد (HTTP %d)" % resp.status_code)
@@ -372,19 +404,19 @@ async def _call_api(api_key: str, handle: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise CreatorCrawlError("ساختار پاسخ CreatorCrawl نامعتبر بود")
 
-    # Some plans surface quota problems inside a 200 envelope.
-    message = str(data.get("error") or data.get("message") or "")
+    # Some plans surface quota/handle problems inside a 200 envelope.
+    message = str(data.get("error") or data.get("message") or data.get("detail") or "")
     lowered = message.lower()
-    if lowered and any(
-        token in lowered
-        for token in ("credit", "quota", "unauthorized", "invalid api key", "billing", "payment")
-    ):
-        raise _KeyRejected(f"سرویس کلید را رد کرد: {message[:120]}")
+    if lowered:
+        if any(token in lowered for token in _NOT_FOUND_TOKENS):
+            raise CreatorCrawlNotFound(message[:120])
+        if any(token in lowered for token in _KEY_ERROR_TOKENS):
+            raise _KeyRejected(f"سرویس کلید را رد کرد: {message[:120]}")
 
     return data
 
 
-# ── Response parsing (defensive against shape changes) ───────────────
+# ── Response parsing (matches the official normalized OpenAPI shapes) ─
 
 
 def _first_int(*values: Any) -> int:
@@ -397,8 +429,58 @@ def _first_int(*values: Any) -> int:
     return 0
 
 
+def _dump_payload(kind: str, data: dict[str, Any]) -> None:
+    """Log an unrecognized payload so Railway logs reveal the real shape.
+
+    Never raises; the snippet contains only public post/profile data, no keys.
+    """
+    try:
+        snippet = json.dumps(data, ensure_ascii=False)[:800]
+    except Exception:  # noqa: BLE001 — logging must never break the flow
+        snippet = str(data)[:800]
+    logger.error(
+        "CreatorCrawl %s payload mismatch — top-level keys=%s snippet=%s",
+        kind, list(data.keys()), snippet,
+    )
+
+
+_SHORTCODE_RE = re.compile(r"instagram\.com/(?:p|reel|tv|reels)/([A-Za-z0-9_-]+)")
+
+
+def _extract_shortcode(url: str, item: dict[str, Any]) -> str:
+    match = _SHORTCODE_RE.search(url or "")
+    if match:
+        return match.group(1)
+    return str(item.get("code") or item.get("shortcode") or "").strip()
+
+
+def _media_list_normalized(item: dict[str, Any]) -> list[CreatorCrawlMedia]:
+    """Media list from the documented normalized shape.
+
+    ``media`` is an array of ``{type: image|video|gif, url, thumbnail_url,
+    width, height, duration_seconds}``; carousels arrive FLATTENED in it.
+    The API's order is preserved (carousel slide order matters); entries
+    without a URL are skipped, falling back to ``thumbnail_url``.
+    """
+    entries = item.get("media")
+    if not isinstance(entries, list):
+        return []
+    media: list[CreatorCrawlMedia] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url") or "").strip()
+        if not url:
+            url = str(entry.get("thumbnail_url") or "").strip()
+        if not url:
+            continue
+        kind = "video" if str(entry.get("type") or "").lower() == "video" else "photo"
+        media.append(CreatorCrawlMedia(url=url, kind=kind))
+    return media
+
+
 def _pick_media(item: dict[str, Any]) -> CreatorCrawlMedia | None:
-    """Extract the best-quality media URL from a feed item / carousel child."""
+    """LEGACY fallback: best-quality media from raw Instagram feed shapes."""
     is_video = bool(item.get("video_versions")) or item.get("media_type") == 2 or bool(item.get("video_url"))
 
     if is_video:
@@ -430,30 +512,8 @@ def _pick_media(item: dict[str, Any]) -> CreatorCrawlMedia | None:
     return None
 
 
-def _parse_post(item: dict[str, Any]) -> CreatorCrawlPost | None:
-    if not isinstance(item, dict):
-        return None
-
-    shortcode = str(item.get("code") or item.get("shortcode") or "").strip()
-    post_url = f"https://www.instagram.com/p/{shortcode}/" if shortcode else ""
-
-    caption_raw = item.get("caption")
-    if isinstance(caption_raw, dict):
-        caption_text = str(caption_raw.get("text") or "")
-    else:
-        caption_text = str(caption_raw or "")
-
-    like_count = _first_int(
-        item.get("like_count"),
-        (item.get("edge_liked_by") or {}).get("count"),
-        (item.get("edge_media_preview_like") or {}).get("count"),
-    )
-    comment_count = _first_int(
-        item.get("comment_count"),
-        (item.get("edge_media_to_comment") or {}).get("count"),
-        (item.get("edge_media_to_parent_comment") or {}).get("count"),
-    )
-
+def _media_list_legacy(item: dict[str, Any]) -> list[CreatorCrawlMedia]:
+    """LEGACY fallback for raw Instagram feed items (carousel-aware)."""
     media: list[CreatorCrawlMedia] = []
     carousel = item.get("carousel_media")
     if not carousel and item.get("edge_sidecar_to_children"):
@@ -470,13 +530,46 @@ def _parse_post(item: dict[str, Any]) -> CreatorCrawlPost | None:
         piece = _pick_media(item)
         if piece:
             media.append(piece)
+    return media
 
-    if not media and not post_url:
+
+def _parse_post(item: dict[str, Any]) -> CreatorCrawlPost | None:
+    """Parse ONE post — normalized shape first, raw Instagram shape second."""
+    if not isinstance(item, dict):
+        return None
+
+    url = str(item.get("url") or "").strip()
+    shortcode = _extract_shortcode(url, item)
+    if not url and shortcode:
+        url = f"https://www.instagram.com/p/{shortcode}/"
+
+    caption_raw = item.get("text")
+    if caption_raw is None:
+        caption_raw = item.get("caption")
+    if isinstance(caption_raw, dict):
+        caption_text = str(caption_raw.get("text") or "")
+    else:
+        caption_text = str(caption_raw or "")
+
+    like_count = _first_int(
+        item.get("like_count"),
+        (item.get("edge_liked_by") or {}).get("count"),
+        (item.get("edge_media_preview_like") or {}).get("count"),
+    )
+    comment_count = _first_int(
+        item.get("comment_count"),
+        (item.get("edge_media_to_comment") or {}).get("count"),
+        (item.get("edge_media_to_parent_comment") or {}).get("count"),
+    )
+
+    media = _media_list_normalized(item) or _media_list_legacy(item)
+
+    if not media and not url:
         return None
 
     return CreatorCrawlPost(
         shortcode=shortcode,
-        url=post_url,
+        url=url,
         caption=unescape(caption_text).strip(),
         like_count=like_count,
         comment_count=comment_count,
@@ -484,60 +577,171 @@ def _parse_post(item: dict[str, Any]) -> CreatorCrawlPost | None:
     )
 
 
-def _parse_response(data: dict[str, Any], handle: str) -> CreatorCrawlProfile:
-    user = data.get("user") if isinstance(data.get("user"), dict) else {}
-    if not user and isinstance(data.get("data"), dict):
-        user = data["data"].get("user") or {}
+def _first_post(items: Any) -> CreatorCrawlPost | None:
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        post = _parse_post(item)
+        if post is not None:
+            return post
+    return None
 
-    items = data.get("items") if isinstance(data.get("items"), list) else []
-    if not items and isinstance(data.get("data"), dict):
-        items = data["data"].get("items") or []
 
-    if not user and not items:
+def _unwrap_user_node(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Locate the profile object inside a /profile response.
+
+    Documented: ``data.data`` is the user node.  Defensively accepted:
+    ``data.data.user``, ``data.user`` (legacy wrappers).
+
+    Returns ``{}`` for EXPLICIT emptiness (``data: null`` / ``[]``) → the
+    handle resolved to nothing; returns ``None`` only for shapes we do not
+    recognize at all (honest-error path, never a fake "not found").
+    """
+    if "data" in data:
+        raw = data.get("data")
+        if isinstance(raw, dict):
+            inner_user = raw.get("user")
+            if isinstance(inner_user, dict) and inner_user and not (
+                raw.get("handle") or raw.get("avatar_url") or raw.get("follower_count")
+            ):
+                return inner_user
+            return raw
+        if isinstance(raw, list):
+            return {} if not raw else None  # empty list == explicitly nothing
+        if raw is None:
+            return {}  # explicit null == explicitly nothing found
+        return None  # str/int/… → unrecognized shape
+    legacy = data.get("user")
+    if isinstance(legacy, dict):
+        return legacy
+    return None
+
+
+def _scan_node_error(node: dict[str, Any], handle: str) -> None:
+    """Raise if the user node itself carries an error / not-found marker."""
+    message = str(node.get("error") or node.get("message") or node.get("detail") or "")
+    lowered = message.lower()
+    if not lowered:
+        return
+    if any(token in lowered for token in _NOT_FOUND_TOKENS):
         raise CreatorCrawlNotFound(f"پیج @{handle} پیدا نشد")
+    if any(token in lowered for token in _KEY_ERROR_TOKENS):
+        raise _KeyRejected(f"سرویس کلید را رد کرد: {message[:120]}")
+    raise CreatorCrawlError(f"CreatorCrawl: {message[:150]}")
 
-    username = str(user.get("username") or handle)
+
+def _parse_profile_response(data: dict[str, Any], handle: str) -> CreatorCrawlProfile:
+    """Parse ``GET /instagram/profile`` → avatar, followers, post count, recent posts."""
+    message = str(data.get("error") or data.get("message") or data.get("detail") or "")
+    lowered = message.lower()
+    if lowered and any(token in lowered for token in _NOT_FOUND_TOKENS):
+        raise CreatorCrawlNotFound(f"پیج @{handle} پیدا نشد")
+    if lowered and any(token in lowered for token in _KEY_ERROR_TOKENS):
+        raise _KeyRejected(f"سرویس کلید را رد کرد: {message[:120]}")
+
+    node = _unwrap_user_node(data)
+    if node is None:
+        # A shape we simply do not recognize — say so honestly (with a log
+        # dump) instead of lying "page not found".
+        _dump_payload("profile", data)
+        raise CreatorCrawlError(
+            "ساختار پاسخ CreatorCrawl شناخته نشد — جزئیات در لاگ سرور ثبت شد"
+        )
+    if not node:
+        # Explicitly empty response (null / {} / []) → the handle truly
+        # resolved to nothing.
+        raise CreatorCrawlNotFound(f"پیج @{handle} پیدا نشد")
+    _scan_node_error(node, handle)
+
+    username = str(node.get("handle") or node.get("username") or handle).lstrip("@")
     followers = _first_int(
-        user.get("follower_count"),
-        (user.get("edge_followed_by") or {}).get("count"),
-        user.get("followerCount"),
+        node.get("follower_count"),
+        (node.get("edge_followed_by") or {}).get("count"),
+        node.get("followerCount"),
     )
     posts = _first_int(
-        user.get("media_count"),
-        (user.get("edge_owner_to_timeline_media") or {}).get("count"),
-        user.get("mediaCount"),
-        user.get("post_count"),
+        node.get("post_count"),
+        node.get("media_count"),
+        (node.get("edge_owner_to_timeline_media") or {}).get("count"),
+        node.get("mediaCount"),
+        node.get("postCount"),
     )
     avatar = str(
-        user.get("profile_pic_url_hd")
-        or user.get("profile_pic_url")
-        or user.get("profile_pic_url_https")
+        node.get("avatar_url")
+        or node.get("profile_pic_url_hd")
+        or node.get("profile_pic_url")
+        or node.get("profile_pic_url_https")
         or ""
     )
+    full_name = unescape(str(node.get("name") or node.get("full_name") or "")).strip()
+    is_verified = bool(node.get("verified") or node.get("is_verified"))
+    is_private = bool(node.get("is_private"))
 
-    latest_post: CreatorCrawlPost | None = None
-    for item in items:
-        latest_post = _parse_post(item)
-        if latest_post is not None:
-            break
+    latest_post = _first_post(node.get("recent_posts"))
 
     return CreatorCrawlProfile(
         username=username,
-        full_name=unescape(str(user.get("full_name") or "")).strip(),
+        full_name=full_name,
         avatar_url=avatar,
         followers=followers,
         posts=posts,
-        is_verified=bool(user.get("is_verified")),
+        is_verified=is_verified,
         latest_post=latest_post,
+        is_private=is_private,
     )
+
+
+def _parse_posts_response(
+    data: dict[str, Any], handle: str
+) -> tuple[CreatorCrawlPost | None, dict[str, Any]]:
+    """Parse ``GET /instagram/user/posts`` → (first usable post, author node).
+
+    An empty ``data`` array is NOT an error here — existing accounts can
+    simply have zero posts — so this returns (None, {}) instead of raising.
+    """
+    message = str(data.get("error") or data.get("message") or data.get("detail") or "")
+    lowered = message.lower()
+    if lowered and any(token in lowered for token in _NOT_FOUND_TOKENS):
+        raise CreatorCrawlNotFound(f"پیج @{handle} پیدا نشد")
+    if lowered and any(token in lowered for token in _KEY_ERROR_TOKENS):
+        raise _KeyRejected(f"سرویس کلید را رد کرد: {message[:120]}")
+
+    items: Any = None
+    raw = data.get("data")
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        if isinstance(raw.get("items"), list):
+            items = raw["items"]
+        elif isinstance(raw.get("recent_posts"), list):
+            items = raw["recent_posts"]
+    elif raw is None and "data" in data:
+        items = []  # explicit null == no posts
+    if items is None and isinstance(data.get("items"), list):
+        items = data["items"]
+
+    if items is None:
+        _dump_payload("user/posts", data)
+        raise CreatorCrawlError(
+            "ساختار پاسخ CreatorCrawl شناخته نشد — جزئیات در لاگ سرور ثبت شد"
+        )
+
+    for item in items:
+        post = _parse_post(item)
+        if post is not None:
+            author = item.get("author") if isinstance(item.get("author"), dict) else {}
+            return post, author
+    return None, {}
 
 
 # ── Public entry point ───────────────────────────────────────────────
 
 
-async def get_user_posts(handle: str) -> CreatorCrawlProfile:
-    """Fetch profile info + latest post, rotating keys transparently."""
-    username = _validate_handle(handle)
+async def _request_via_rotation(path: str, handle: str) -> dict[str, Any]:
+    """Run ONE API call through the key-rotation / quota / notify machinery.
+
+    Every HTTP-200 response burns 1 credit of the key that served it.
+    """
     keys: tuple[_Key, ...] = _state["keys"]
     if not keys:
         raise CreatorCrawlNoKeys(
@@ -568,7 +772,7 @@ async def get_user_posts(handle: str) -> CreatorCrawlProfile:
             continue  # already full — skip silently
 
         try:
-            data = await _call_api(key.secret, username)
+            data = await _call_api(key.secret, path, handle)
         except CreatorCrawlNotFound:
             raise  # the handle is wrong, NOT the key — do not burn other keys
         except _KeyRejected as exc:
@@ -587,7 +791,10 @@ async def get_user_posts(handle: str) -> CreatorCrawlProfile:
 
         # Success — burn one credit.
         count = await kv.incr(_count_key(key.key_id))
-        logger.info("CreatorCrawl key %s (%s) → %d/%d used", key.label, key.email or "-", count, limit)
+        logger.info(
+            "CreatorCrawl key %s (%s) → %d/%d used [%s]",
+            key.label, key.email or "-", count, limit, path,
+        )
 
         if count >= limit:
             # The key just hit its limit; switch + notify for the NEXT call.
@@ -596,7 +803,7 @@ async def get_user_posts(handle: str) -> CreatorCrawlProfile:
                 await kv.set(_ACTIVE_KEY, next_key.key_id)
             await _notify_key_exhausted(key, "سهمیه تکمیل شد", next_key)
 
-        return _parse_response(data, username)
+        return data
 
     if last_error is not None:
         raise CreatorCrawlNoKeys(
@@ -605,6 +812,55 @@ async def get_user_posts(handle: str) -> CreatorCrawlProfile:
     raise CreatorCrawlNoKeys(
         f"سهمیه همه {len(keys)} کلید CreatorCrawl تمام شده است. کلید جدید (با ایمیل اکانت جدید) به CREATORCRAWL_API_KEYS اضافه کن."
     )
+
+
+async def get_user_posts(handle: str) -> CreatorCrawlProfile:
+    """Fetch profile info + latest post, rotating keys transparently.
+
+    Credit-efficient two-step flow (official normalized endpoints):
+
+      1. ``/instagram/profile`` — avatar, follower/post counts, verified,
+         private flag AND ``recent_posts`` when the upstream includes them
+         → usually the whole card costs ONE credit.
+      2. Only when step 1 yields no usable latest post (and the page is not
+         private) does step 2 spend one more credit on ``/instagram/user/posts``.
+    """
+    username = _validate_handle(handle)
+    profile_raw = await _request_via_rotation(PROFILE_PATH, username)
+    try:
+        profile = _parse_profile_response(profile_raw, username)
+    except _KeyRejected as exc:
+        # Quota markers can also hide INSIDE the data node (data.error).
+        # Rotation has already returned, so surface it as a normal error
+        # instead of leaking the private exception.
+        logger.warning("Profile node-level key rejection for @%s: %s", username, exc.reason)
+        raise CreatorCrawlError(f"کلید CreatorCrawl رد شد: {exc.reason}") from exc
+
+    if profile.latest_post is None or not profile.latest_post.media:
+        if profile.is_private:
+            # Private page: posts are not public anyway — save the credit.
+            logger.info("Profile @%s is private — skipping the user/posts call", username)
+            return profile
+        # Step 2 is best-effort: the profile card is already secured, so any
+        # failure here only means "no download button", never an error card.
+        try:
+            posts_raw = await _request_via_rotation(USER_POSTS_PATH, username)
+        except CreatorCrawlError as exc:
+            logger.warning("user/posts fallback failed for @%s: %s", username, exc)
+            return profile
+        post, author = _parse_posts_response(posts_raw, username)
+        if post is not None:
+            profile = replace(profile, latest_post=post)
+        if not profile.avatar_url and author:
+            author_avatar = str(author.get("avatar_url") or "")
+            author_name = unescape(str(author.get("name") or "")).strip()
+            if author_avatar or author_name:
+                profile = replace(
+                    profile,
+                    avatar_url=author_avatar or profile.avatar_url,
+                    full_name=profile.full_name or author_name,
+                )
+    return profile
 
 
 # ── Direct CDN download (bypasses the bot's own download chain) ──────

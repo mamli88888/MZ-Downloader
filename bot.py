@@ -4035,6 +4035,8 @@ def _profile_caption(profile: creatorcrawl.CreatorCrawlProfile) -> str:
         f"👥 فالوور: <b>{_cc_fmt_count(profile.followers)}</b>",
         f"📸 پست: <b>{_cc_fmt_count(profile.posts)}</b>",
     ]
+    if getattr(profile, "is_private", False):
+        lines.append("🔒 این پیج خصوصی است و پست‌هایش قابل دانلود نیست")
 
     post = profile.latest_post
     if post is not None:
