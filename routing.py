@@ -225,3 +225,30 @@ def is_instagram_image_post(url: str) -> bool:
         return False
     query = parse_qs(parsed.query)
     return any(key.lower() == "img_index" for key in query)
+
+
+def is_instagram_post_page(url: str) -> bool:
+    """Return True for EVERY Instagram post page (path starts with ``/p/``).
+
+    ``is_instagram_image_post`` needs the ``img_index`` query parameter, but
+    most shared carousel links do NOT carry it — so from the URL alone a
+    photo carousel is indistinguishable from a video post.  AHM7's
+    ``alldl`` endpoint only ever returns ONE ``videoUrl``/``audioUrl`` —
+    on a carousel that is the FIRST slide, served as a "video", with no
+    photo option in the menu at all.
+
+    Therefore every ``/p/`` post is routed through Apify's
+    ``instagram-scraper`` Actor as its PRIMARY downloader: the Actor
+    resolves ``displayUrl`` / ``images`` / ``childPosts`` recursively, so
+    carousels come out complete (all slides, in order).  Reels
+    (``/reel/``, ``/reels/``, ``/tv/``) are always a single video and keep
+    AHM7 as their primary downloader.
+    """
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower().strip(".")
+    if not (host == "instagram.com" or host.endswith(".instagram.com")):
+        return False
+    return parsed.path.lower().startswith("/p/")

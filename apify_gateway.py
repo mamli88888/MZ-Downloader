@@ -32,7 +32,7 @@ from downloader import (
     ProgressCallback,
     QualityOption,
 )
-from routing import Platform, is_instagram_image_post
+from routing import Platform, is_instagram_image_post, is_instagram_post_page
 from apify_platforms import (
     NEW_APIFY_PLATFORMS,
     PLATFORM_RATE_PER_MINUTE,
@@ -550,41 +550,71 @@ class ApifyGateway:
     def _instagram_options(url: str = "") -> tuple[QualityOption, ...]:
         """Build the inline-button menu for an Instagram post.
 
-        For image carousel posts (URL carries ``img_index``), only a photo
-        option is offered — the audio option requires a video track to
-        extract from, so on a photo-only post it would always fail. The
-        ``instagram-scraper`` Actor transparently returns whatever the
-        post actually contains (photos and/or videos), so the photo option
-        works for both single-image and multi-slide carousel posts.
+        ``img_index`` links are DEFINITELY image carousels → only a photo
+        option (there is no video track to extract audio from, so the
+        video/audio options would always fail).
+
+        Every other post page (``/p/…`` without ``img_index``) can be
+        anything — a single image, a photo carousel, or a video — and the
+        URL alone cannot tell.  Since all /p/ posts land on this Actor,
+        the menu offers BOTH a photo option (all slides of a carousel, or
+        the single picture) and a video option, plus MP3.  The Actor
+        returns whatever the post actually contains, so a wrong guess is
+        still served correctly: a pure-image carousel picked as "video"
+        yields all of its photos, and a video picked as "photos" yields
+        that video.
         """
         is_image = bool(url) and is_instagram_image_post(url)
-        primary_label = "تصاویر (کیفیت اصلی)" if is_image else "ویدیو (کیفیت اصلی)"
-        primary = QualityOption(
-            label=primary_label,
-            row=0,
-            column=0,
-            # The fingerprint kind stays "video" so ``_actor_request`` runs
-            # the same ``instagram-scraper`` Actor (whose input schema does
-            # not distinguish photo vs. video posts). ``expected_kind``
-            # carries the user-facing kind so the menu button gets a 📷
-            # prefix and the bot's media-type filtering is consistent.
-            fingerprint=_fingerprint({"platform": "instagram", "kind": "video"}),
-            expected_kind=MediaKind.PHOTO if is_image else MediaKind.VIDEO,
-            expected_height=1080,
-        )
+        is_post = bool(url) and is_instagram_post_page(url)
         if is_image:
-            return (primary,)
-        return (
-            primary,
+            return (
+                QualityOption(
+                    label="تصاویر (کیفیت اصلی)",
+                    row=0,
+                    column=0,
+                    fingerprint=_fingerprint({"platform": "instagram", "kind": "photo"}),
+                    expected_kind=MediaKind.PHOTO,
+                    expected_height=1080,
+                ),
+            )
+        options: list[QualityOption] = [
+            QualityOption(
+                label="ویدیو (کیفیت اصلی)",
+                row=0,
+                column=0,
+                # The fingerprint kind stays "video" so ``_actor_request``
+                # runs the same ``instagram-scraper`` Actor (whose input
+                # schema does not distinguish photo vs. video posts).
+                # ``expected_kind`` carries the user-facing kind so the
+                # menu button gets the right emoji and the bot's media-type
+                # handling stays consistent.
+                fingerprint=_fingerprint({"platform": "instagram", "kind": "video"}),
+                expected_kind=MediaKind.VIDEO,
+                expected_height=1080,
+            ),
+        ]
+        if is_post:
+            options.append(
+                QualityOption(
+                    label="تصاویر (همه اسلایدها)",
+                    row=0,
+                    column=1,
+                    fingerprint=_fingerprint({"platform": "instagram", "kind": "photo"}),
+                    expected_kind=MediaKind.PHOTO,
+                    expected_height=1080,
+                ),
+            )
+        options.append(
             QualityOption(
                 label="فقط صدا (MP3)",
-                row=0,
+                row=1 if is_post else 0,
                 column=1,
                 fingerprint=_fingerprint({"platform": "instagram", "kind": "audio"}),
                 expected_kind=MediaKind.AUDIO,
                 expected_bitrate_kbps=192,
             ),
         )
+        return tuple(options)
 
     def _actor_request(
         self,
@@ -623,7 +653,7 @@ class ApifyGateway:
             raise InvalidDownload("invalid YouTube selection")
 
         if platform == Platform.INSTAGRAM:
-            if kind not in {"video", "audio"}:
+            if kind not in {"video", "audio", "photo"}:
                 raise InvalidDownload("invalid Instagram selection")
             return (
                 INSTAGRAM_ACTOR_ID,

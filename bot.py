@@ -80,7 +80,7 @@ from downloader import (
 )
 from instagram_caption import InstagramCaptionError, fetch_instagram_caption
 import creatorcrawl
-from routing import Platform, all_providers, detect_platform, is_instagram_image_post, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
+from routing import Platform, all_providers, detect_platform, is_instagram_post_page, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
 from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
 from social_gateway import (
     SOCIAL_PROVIDER,
@@ -2129,18 +2129,21 @@ async def _process_url(
     # CapCut / SnackVideo / Douyin). The fallback chain (Apify where
     # applicable → Telegram bots) only kicks in when AHM7 fails.
     #
-    # Instagram image carousels (URLs carrying ``img_index``) are an
-    # exception: AHM7's ``alldl`` endpoint only returns ``videoUrl`` /
-    # ``audioUrl`` and cannot serve photo carousels, so these posts are
-    # routed through Apify's ``instagram-scraper`` Actor as their
-    # *primary* downloader. Instagram Reels and other non-carousel posts
-    # still hit AHM7 first.
+    # Instagram POST pages (/p/…) are an exception: a shared carousel link
+    # usually carries no ``img_index``, so a photo carousel cannot be told
+    # apart from a video post by URL alone — and AHM7's ``alldl`` endpoint
+    # only ever returns ONE ``videoUrl``/``audioUrl`` (the FIRST slide,
+    # served as a "video", with no photo option in the menu).  ALL /p/
+    # posts are therefore routed through Apify's ``instagram-scraper``
+    # Actor as their *primary* downloader — it returns every carousel
+    # slide via ``childPosts``.  Reels (/reel/, /reels/, /tv/) are always
+    # a single video and still hit AHM7 first.
     use_ahm7 = (
         not skip_ahm7
         and AHM7_GATEWAY is not None
         and platform in AHM7_SUPPORTED_PLATFORMS
         and not is_spotify_collection
-        and not is_instagram_image_post(url)
+        and not is_instagram_post_page(url)
     )
     if not providers and not is_spotify_collection and not _social_only and not use_apify and not use_voiddl and not use_yoinku and not use_ahm7:
         STATS.failed += 1
