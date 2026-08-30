@@ -32,7 +32,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
-    InputMediaVideo,
     MessageEntity,
     Update,
 )
@@ -4112,7 +4111,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     caption = _profile_caption(profile)
 
     keyboard_rows = []
-    if profile.latest_post is not None and profile.latest_post.media:
+    if profile.latest_post is not None and profile.latest_post.url:
         token = uuid.uuid4().hex[:12]
         IG_PROFILE_SESSIONS[token] = (
             profile,
@@ -4160,7 +4159,8 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 @membership_required
 async def on_ig_profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the "دانلود آخرین پست" button — direct CDN download via CreatorCrawl links."""
+    """Handle the "دانلود آخرین پست" button — hand the latest-post link to the
+    bot's own download chain, exactly as if the user had sent that link."""
     query = update.callback_query
     data = query.data or ""
     parts = data.split(":")
@@ -4188,131 +4188,24 @@ async def on_ig_profile_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     post = profile.latest_post
-    if post is None or not post.media:
+    if post is None or not post.url:
         await query.answer("پستی برای دانلود پیدا نشد.", show_alert=True)
         return
 
-    await query.answer("دارم آخرین پست رو دانلود می‌کنم…")
+    # One-shot: a click starts exactly one download run.
+    IG_PROFILE_SESSIONS.pop(token, None)
+
+    await query.answer("دارم آخرین پست رو آماده می‌کنم…")
     with contextlib.suppress(TelegramError):
         await query.edit_message_reply_markup(reply_markup=None)
 
-    chat_id = update.effective_chat.id
+    # Feed the latest-post link into the bot's REGULAR download pipeline —
+    # the exact path a pasted link takes (AHM7 → Apify → gateway-worker
+    # bots → yt-dlp / SOCIAL_GATEWAY, quality menus, progress cards,
+    # captions, reel-music offer, …).  CreatorCrawl only DISCOVERS the
+    # link; it never downloads the media itself.
     reply_to = query.message.message_id if query.message else None
-    proxy_url = (
-        f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
-        if SETTINGS.use_proxy
-        else None
-    )
-    username = profile.username
-
-    status_msg = await send_status(
-        context,
-        chat_id,
-        status_card(
-            "⬇️ دارم آخرین پست رو دانلود می‌کنم",
-            f"در حال دریافت مستقیم آخرین پست <b>@{html.escape(username)}</b> از لینک‌های CreatorCrawl…",
-        ),
-        reply_to,
-    )
-
-    # Download straight from the CDN links the API returned.
-    MAX_MEDIA = 30  # safety cap for huge carousels
-    downloaded: list[tuple[str, bytes]] = []
-    for media in post.media[:MAX_MEDIA]:
-        try:
-            payload = await creatorcrawl.download_media(media.url, proxy_url=proxy_url)
-            downloaded.append((media.kind, payload))
-        except Exception as exc:
-            logger.warning("Latest-post media download failed for @%s: %s", username, exc)
-            continue
-
-    if not downloaded:
-        with contextlib.suppress(TelegramError):
-            await status_msg.delete()
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=status_card(
-                "❌ دانلود شکست خورد",
-                "در دریافت فایل آخرین پست خطایی رخ داد. لطفاً بعداً دوباره امتحان کن.",
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_to_message_id=reply_to,
-        )
-        return
-
-    base_caption = f"🖼 آخرین پست @{html.escape(username)}"
-    if post.url:
-        base_caption += f"\n🔗 {html.escape(post.url)}"
-
-    async def _send_single(kind: str, payload: bytes, caption: str, reply: bool) -> None:
-        stream = io.BytesIO(payload)
-        if kind == "video":
-            if len(payload) > 50 * 1024 * 1024:
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=stream,
-                    filename=f"post_{username}.mp4",
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_to_message_id=reply_to if reply else None,
-                )
-            else:
-                await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=stream,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_to_message_id=reply_to if reply else None,
-                    supports_streaming=True,
-                )
-        else:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=stream,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=reply_to if reply else None,
-            )
-
-    try:
-        if len(downloaded) == 1:
-            kind, payload = downloaded[0]
-            await _send_single(kind, payload, base_caption, reply=True)
-        else:
-            # Album — send in media groups of 10 (Telegram hard limit).
-            for chunk_start in range(0, len(downloaded), 10):
-                chunk = downloaded[chunk_start:chunk_start + 10]
-                group = []
-                for idx, (kind, payload) in enumerate(chunk):
-                    caption = base_caption if idx == 0 and chunk_start == 0 else ""
-                    if kind == "video":
-                        group.append(InputMediaVideo(media=io.BytesIO(payload), caption=caption, parse_mode=ParseMode.HTML))
-                    else:
-                        group.append(InputMediaPhoto(media=io.BytesIO(payload), caption=caption, parse_mode=ParseMode.HTML))
-                await context.bot.send_media_group(chat_id=chat_id, media=group)
-    except TelegramError as exc:
-        logger.warning("Latest-post send failed for @%s: %s", username, exc)
-        # Fall back to one-by-one sends with document overflow support.
-        sent_any = False
-        for idx, (kind, payload) in enumerate(downloaded):
-            try:
-                await _send_single(kind, payload, base_caption if idx == 0 else "", reply=not sent_any)
-                sent_any = True
-            except TelegramError as inner:
-                logger.warning("Latest-post item send failed for @%s: %s", username, inner)
-        if not sent_any:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=status_card(
-                    "❌ ارسال شکست خورد",
-                    "فایل دانلود شد ولی ارسال به تلگرام ممکن نشد. لطفاً بعداً دوباره امتحان کن.",
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=reply_to,
-            )
-
-    with contextlib.suppress(TelegramError):
-        await status_msg.delete()
+    await process_urls(update, context, (post.url,), reply_to)
 
 
 @membership_required

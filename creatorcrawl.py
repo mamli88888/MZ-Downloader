@@ -38,9 +38,11 @@ keys in ``CREATORCRAWL_API_KEYS`` as ``API_KEY|EMAIL`` pairs.  This module:
     unauthorized) the key is marked exhausted immediately and the request
     is retried on the next key.
 
-The media download links that CreatorCrawl returns point straight at the
-Instagram CDN; ``download_media`` fetches them directly, so the bot's own
-downloader chain (yt-dlp / gateway bots / Apify) is NOT involved.
+CreatorCrawl is ONLY used to DISCOVER the profile card and the latest
+post's link.  When the user taps "دانلود آخرین پست", the bot feeds that
+link into its regular download chain (AHM7 → Apify → gateway-worker
+bots → yt-dlp / SOCIAL_GATEWAY) exactly as if the user had pasted the
+link themselves — CreatorCrawl never downloads the media.
 """
 
 from __future__ import annotations
@@ -79,11 +81,6 @@ _NOT_FOUND_TOKENS = (
     "not found", "no user", "user_not_found", "doesn't exist",
     "does not exist", "unable to locate", "invalid handle",
     "unknown handle", "cannot find user", "couldn't find",
-)
-
-_DATACENTER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 
@@ -861,23 +858,3 @@ async def get_user_posts(handle: str) -> CreatorCrawlProfile:
                     full_name=profile.full_name or author_name,
                 )
     return profile
-
-
-# ── Direct CDN download (bypasses the bot's own download chain) ──────
-
-
-async def download_media(url: str, *, proxy_url: str | None = None) -> bytes:
-    """Download a CDN media URL returned by CreatorCrawl.
-
-    Plain browser-UA GET — no yt-dlp, no gateway bots, no Apify.
-    """
-    async with httpx.AsyncClient(
-        headers={"User-Agent": _DATACENTER_UA},
-        proxy=proxy_url,
-        timeout=httpx.Timeout(60.0, connect=15.0),
-        follow_redirects=True,
-        trust_env=False,
-    ) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        return resp.content
