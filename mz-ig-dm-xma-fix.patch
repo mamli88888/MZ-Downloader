@@ -1,0 +1,777 @@
+diff --git a/IG_DM_SETUP_FA.md b/IG_DM_SETUP_FA.md
+index 944f2f8..84fd783 100644
+--- a/IG_DM_SETUP_FA.md
++++ b/IG_DM_SETUP_FA.md
+@@ -42,7 +42,7 @@
+ 
+ ---
+ 
+-## 🔧 رفع مشکل لاگین روی Railway (BadPassword / 429)
++## 🔧 رفع مشکل لاگین روی Railway (بدون رمز!) — روش sessionid
+ 
+ **علامت در لاگ Railway:**
+ 
+@@ -52,53 +52,52 @@ CAA login fallback failed: 429 Too Many Requests
+ ig-dm: login failed (BadPassword): ...
+ ```
+ 
+-**چرا؟** لاگین اینستاگرام از **IP دیتاسنتر Railway** (Google Cloud) به‌احتمال خیلی زیاد رد
+-می‌شود؛ اینستاگرام IP کلود را باور نمی‌کند و حتی با رمز درست، خطای `BadPassword` می‌دهد
+-و تلاش بعدی هم `429` (محدودیت نرخ) می‌شود. این رفتار ربات نیست؛ محافظت خود اینستاگرام است.
++**چرا؟** لاگینِ رمزی اینستاگرام از **IP دیتاسنتر Railway** (و حتی از IPهای VPN)
++به‌احتمال خیلی زیاد رد می‌شود؛ اینستاگرام IP کلود را باور نمی‌کند و حتی با رمز
++درست `BadPassword` می‌دهد و تلاش بعدی `429` می‌شود. این رفتار ربات نیست؛
++محافظت خود اینستاگرام است.
+ 
+-**راه‌حل اصلی — سشن آماده از IP خانگی (رایگان و مطمئن‌ترین):**
++**راه‌حل — لاگین فقط با کوکی sessionid مرورگر (بدون رمز عبور):**
+ 
+-1. روی کامپیوتر خودت (نه سرور):
++مرورگر خودت که پیج را در آن باز می‌کنی یک سشن معتبر و قابل‌اعتماد دارد؛
++ربات از همان سشن استفاده می‌کند و دیگر هیچ درخواست لاگین رمزی زده نمی‌شود:
++
++1. در کامپیوتر، مرورگر را باز کن → `instagram.com` → مطمئن شو پیج‌ات لوگین است.
++2. دکمه **F12** را بزن → تب **Application** (فایرفاکس: Storage) → منوی چپ
++   **Cookies** → `https://www.instagram.com`
++3. از لیست کوکی‌ها، مقدار (Value) ردیف **sessionid** را کامل کپی کن
++   (رشتهٔ خیلی طولانی، وسطش `%3A` دارد).
++4. در Railway → Variables این متغیر را بساز و Deploy بزن:
+ 
+    ```
+-   pip install "instagrapi==2.18.18" pysocks
+-   python ig_session_helper.py
++   IG_SESSIONID=<همان مقدار کپی‌شده>
+    ```
+ 
+-   یوزرنیم/رمز پیج را بده (اگر 2FA دارد، کد را وارد کن). اسکریپت فایل `ig_session.json`
+-   می‌سازد و یک متن **base64** چاپ می‌کند.
+-2. در Railway → Variables متغیر `IG_SESSION_B64` را بساز و همان متن را درش بگذار.
+-3. دوباره Deploy بزن. در لاگ باید ببینی:
++5. در لاگ باید ببینی:
+ 
+    ```
+-   ig-dm: session seeded from IG_SESSION_B64 → ig_session.json
+-   ig-dm: login ok (session=file, proxy=off, device=…)
++   ig-dm: enabled (page=@..., auth=sessionid, ...)
++   ig-dm: login ok (session=sessionid, ...)
+    ```
+ 
+-   از این به بعد هیچ لاگین پسوردی روی Railway زده نمی‌شود؛ حتی بعد از هر ری‌دیپلوی
+-   سشن از همین متغیر بازسازی می‌شود (چون فایلِ داخل کانتینر با ری‌دیپلوی پاک می‌شود).
+-
+-**راه‌حل دوم — پراکسی مسکونی/موبایل در `IG_PROXY`:**
+-
+-```
+-IG_PROXY=socks5://user:pass@host:port      (یا http://...)
+-```
++نکته‌ها:
++- با `IG_SESSIONID` دیگر نیازی به `IG_USERNAME` / `IG_PASSWORD` نیست (بمانندشان، ضرری ندارد).
++- اگر روزی اتصال قطع شد (رمز عوض کردی یا Log out زدی)، یک sessionid تازه بردار و همان متغیر را آپدیت کن.
++- امنیت: sessionid مثل کلید ورود پیج است؛ فقط در Railway خودت بگذارش و با کسی به اشتراک نگذار.
++- اگر مرورگر/ترمینالت مستقیم به اینستاگرام وصل نمی‌شود، اسکریپت کمکی همین کار را با پراکسی انجام می‌دهد:
+ 
+-پراکسی «دیتاسنتری» معمولاً فایده ندارد؛ پراکسی مسکونی/موبایل بگیر. با این متغیر
+-لاگین از IP پراکسی انجام می‌شود و سشن بعدش در `ig_session.json` ذخیره می‌شود.
++  ```
++  pip install "instagrapi==2.18.18" pysocks
++  python ig_session_helper.py        # گزینهٔ 1 → sessionid
++  ```
+ 
+-**راه‌حل سوم — Railway Volume (پیشرفته):** یک Volume به مسیر `/data` وصل کن و
+-`IG_DM_SESSION_FILE=/data/ig_session.json` بده تا فایل سشن بین ری‌دیپلوی‌ها بماند
+-| `IG_PROXY` | ➖ | پراکسی مخصوص اینستاگرام مثل `socks5://user:pass@host:port` یا `http://...` — برای لاگین از IP تمیز |
+-| `IG_SESSION_B64` | ➖ | سشن آماده (base64 خروجی `ig_session_helper.py`) — بعد از هر ری‌دیپلوی بدون لاگین مجدد بازیابی می‌شود |
+-(اولین لاگین همچنان به راه‌حل ۱ یا ۲ نیاز دارد).
++**روش‌های جایگزین (اگر sessionid به هر دلیلی جواب نداد):**
+ 
+-**نکته‌ها:**
+-- اگر یک‌باره لاگین پسوردی موفق شد، در تلگرام به ربات دستور ادمینِ `/igsession` بزن
+-  تا سشن سالمِ فعلی را به‌صورت base64 بگیری و در `IG_SESSION_B64` بگذاری.
+-- بعد از تعویض رمز پیج یا Log-out از همهٔ سشن‌ها در خود اینستاگرام، باید سشن جدید بسازی.
+-- اینستاگرام گاهی «چالش تأیید» فعال می‌کند: یک‌بار با اپ/مرورگر وارد پیج شو، تأیید را
+-  کامل کن، بعد اسکریپت کمکی را دوباره اجرا کن.
++- **سشن کامل از IP خانگی:** `python ig_session_helper.py` → خروجی base64 → متغیر `IG_SESSION_B64`.
++- **پراکسی مسکونی/موبایل** در `IG_PROXY` (مثل `socks5://user:pass@host:port`)؛ پراکسی دیتاسنتری معمولاً فایده ندارد.
++- **Railway Volume** برای ماندگاری فایل سشن (پیشرفته): Volume در مسیر `/data` + متغیر `IG_DM_SESSION_FILE=/data/ig_session.json` (اولین ورود همچنان به روش‌های بالا نیاز دارد).
++- اگر یک‌بار ورود موفق شد، با دستور ادمینِ `/igsession` سشن سالم فعلی را بگیر و در `IG_SESSION_B64` بگذار.
++- اینستاگرام گاهی «چالش تأیید» فعال می‌کند: یک‌بار با اپ/مرورگر وارد پیج شو، تأیید را کامل کن، بعد دوباره امتحان کن.
+ 
+ ---
+ 
+@@ -116,6 +115,25 @@ IG_PROXY=socks5://user:pass@host:port      (یا http://...)
+ 
+ ---
+ 
++## ❗ «پست رو با Share فرستادم ولی ربات هیچ جوابی نداد»
++
++این مشکل مخصوص نسخه‌های قدیمی بود: اینستاگرام وقتی کاربری ریلز/پست را با
++Share می‌فرستد، نوع پیام را `xma_clip` / `xma_media_share` می‌گذارد و محتوایش
++را در ساختار XMA (به‌صورت مدل `MediaXma` در instagrapi 2.x) قرار می‌دهد؛
++نسخه‌های قبلی فقط dictهای خام را اسکن می‌کردند و پیام را **بی‌صدا** رد می‌کردند.
++
++در نسخهٔ فعلی:
++- همهٔ ساختارهای XMA (`xma_clip`, `xma_media_share`, `generic_xma`, `raw_xma`) و
++  مدل‌های `Media` / `MediaXma` / `MessageLink` پشتیبانی می‌شوند؛
++- اگر به هر دلیلی لینک از داخل اشتراک درنیاید، ربات دیگر بی‌صدا نمی‌ماند و
++  پیام «لطفاً Copy link بزن و لینک را متن بفرست» می‌دهد؛
++- در لاگ هم علت مشخص می‌شود: `extracted N url(s)` یا `no url in message (type=…)`.
++
++اگر باز پیامی بی‌جواب ماند، در لاگ دنبال `no url in message (type=…)` بگرد و
++`type` را همراه لاگ گزارش کن.
++
++---
++
+ ## راه‌اندازی
+ 
+ ### ۱) متغیرهای محیطی (Railway Variables یا فایل `.env`)
+@@ -130,8 +148,11 @@ IG_PROXY=socks5://user:pass@host:port      (یا http://...)
+ | `IG_DM_POLL_SECONDS` | ➖ | فاصلهٔ چک کردن دایرکت (پیش‌فرض `10`) |
+ | `IG_DM_MAX_THREADS` | ➖ | تعداد چت‌های آخر که هر دور بررسی می‌شود (پیش‌فرض `20`) |
+ | `IG_DM_SESSION_FILE` | ➖ | مسیر فایل سشن (پیش‌فرض `ig_session.json` کنار ربات) |
++| `IG_SESSIONID` | ⭐ پیشنهادی | کوکی `sessionid` از مرورگر خودت (F12 → Application → Cookies → instagram.com) — ورود بدون رمز، حتی روی Railway |
++| `IG_PROXY` | ➖ | پراکسی مخصوص اینستاگرام مثل `socks5://user:pass@host:port` یا `http://...` |
++| `IG_SESSION_B64` | ➖ | سشن کامل به‌صورت base64 (خروجی `ig_session_helper.py`) |
+ 
+-تا وقتی `IG_USERNAME` و `IG_PASSWORD` تنظیم نشده باشند، پل کاملاً خاموش است و `/link` پیام «غیرفعال» می‌دهد.
++پل وقتی فعال می‌شود که `IG_SESSIONID` تنظیم شده باشد **یا** هر دوِ `IG_USERNAME` و `IG_PASSWORD` موجود باشند؛ در غیر این صورت خاموش است و `/link` پیام «غیرفعال» می‌دهد.
+ 
+ ### ۲) تنظیمات خود پیج اینستاگرام (مهم!)
+ 
+diff --git a/ig_dm.py b/ig_dm.py
+index abe35b0..bba9e82 100644
+--- a/ig_dm.py
++++ b/ig_dm.py
+@@ -67,6 +67,9 @@ IG_TOTP_SECRET = os.getenv("IG_TOTP_SECRET", "").strip().replace(" ", "")
+ # پراکسی مخصوص اینستاگرام (مثلاً socks5://user:pass@host:port یا http://host:port).
+ # روی Railway معمولاً لازم است چون IP دیتاسنتر توسط اینستاگرام رد/محدود می‌شود.
+ IG_PROXY = os.getenv("IG_PROXY", "").strip()
++# کوکی sessionid از مرورگر خودت (F12 → Application → Cookies → instagram.com).
++# با این متغیر «هیچ لاگین رمزی» لازم نیست — حتی روی Railway. روش پیشنهادی.
++IG_SESSIONID = os.getenv("IG_SESSIONID", "").strip().strip('"').strip("'")
+ # سشن آماده به‌صورت base64 (خروجی ig_session_helper.py) — بدون نیاز به Volume
+ # روی Railway، بعد از هر ری‌دیپلوی سشن از همین متغیر بازسازی می‌شود.
+ IG_SESSION_B64 = os.getenv("IG_SESSION_B64", "").strip()
+@@ -82,6 +85,19 @@ if not IG_DM_SESSION_FILE.is_absolute():
+ IG_LINKS_FILE = PROJECT_DIR / "ig_links.json"
+ IG_DM_STATE_FILE = PROJECT_DIR / "ig_dm_state.json"
+ 
++# دیپ‌لینک داخلی XMA: وقتی target_url به‌جای https، دیپ‌لینک اپ است.
++# عدد بعد از id= معمولاً pk مدیاست و با InstagramIdCodec به shortcode تبدیل می‌شود.
++DEEP_LINK_RE = re.compile(r"instagram://media\?id=(\d{5,25})", re.IGNORECASE)
++
++# انواع پیام دایرکت که «لینک/اشتراک/مدیا» محسوب می‌شوند.
++# xma_clip/xma_media_share = فرمت جدید شیرِ ریل/پست در API اینستاگرام.
++FEEDBACK_ITEM_TYPES = {
++    "media_share", "clip", "xma_clip", "xma_media_share", "reel_share",
++    "xma_share", "story_share", "felix_share", "generic_xma", "link",
++    "media", "visual_media", "animated_media", "voice_media",
++}
++GUIDE_ITEM_TYPES = FEEDBACK_ITEM_TYPES | {"text"}
++
+ CODE_TTL_SECONDS = 15 * 60  # 15 دقیقه اعتبار کد اتصال
+ MAX_URLS_PER_DM = 2         # حداکثر لینک پردازش‌شده در هر پیام دایرکت
+ CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # بدون 0/O/1/I/L
+@@ -94,16 +110,17 @@ MAX_SCAN_NODES = 600
+ # فاصلهٔ ارسال مجدد پیام‌های راهنما (ثانیه)
+ INSTRUCTION_COOLDOWN = 6 * 60 * 60   # راهنمای اتصال: هر ۶ ساعت به ازای هر کاربر
+ NO_LINK_COOLDOWN = 30 * 60           # «لینکی ندیدم»: هر ۳۰ دقیقه
++EXTRACT_FAIL_COOLDOWN = 30 * 60      # «اشتراک قابل خواندن نبود»: هر ۳۰ دقیقه
+ BUSY_COOLDOWN = 5 * 60               # «یکی یکی»: هر ۵ دقیقه
+ RATELIMIT_COOLDOWN = 5 * 60          # پیام محدودیت نرخ
+ 
+ 
+ def feature_enabled() -> bool:
+-    """فعال بودن پل دایرکت: فقط با وجود IG_USERNAME و IG_PASSWORD."""
++    """فعال بودن پل دایرکت: با IG_SESSIONID یا با IG_USERNAME + IG_PASSWORD."""
+     forced_off = os.getenv("IG_DM_ENABLED", "").strip().lower() in {"0", "false", "no", "off"}
+     if forced_off:
+         return False
+-    return bool(IG_USERNAME and IG_PASSWORD)
++    return bool(IG_USERNAME and IG_PASSWORD) or bool(IG_SESSIONID)
+ 
+ 
+ # ────────────────────────────── TOTP (stdlib, بدون وابستگی) ──────────────────────────────
+@@ -308,19 +325,77 @@ def _media_path(d: dict[str, Any]) -> str:
+ 
+ def _url_from_payload(payload: dict[str, Any]) -> str | None:
+     """استخراج URL از یک اشتراک (media_share / clip / xma_share / reel_share …)."""
+-    # 1) اول خود URLهای اینستاگرام داخل payload
++    # 1) اول مدیای ساختاریافته با shortcode — دقیق‌ترین روش
++    #    (کپشن‌هایی که خودشان لینک دارند گول نمی‌خوریم)
++    for media in _scan_media_dicts(payload):
++        if media.get("code"):
++            return f"https://www.instagram.com/{_media_path(media)}"
++    # 2) بعد URLهای اینستاگرام داخل رشته‌های payload (مثل target_url در XMA)
+     for text in _scan_strings(payload):
+         for match in URL_RE.findall(text):
+             url = _clean_url(match)
+             if _is_ig_url(url) and "/stories/" not in url.lower():
+                 return url
+-    # 2) بعد مدیای ساختاریافته با shortcode
+-    for media in _scan_media_dicts(payload):
+-        if media.get("code"):
+-            return f"https://www.instagram.com/{_media_path(media)}"
+     return None
+ 
+ 
++def _payload_to_dict(obj: Any) -> dict[str, Any] | None:
++    """تبدیل مدل‌های Pydantic اینستاگرام (Media / MediaXma / MessageLink…) به dict.
++
++    در instagrapi 2.x خیلی از فیلدهای DirectMessage به‌جای dict خام، مدل
++    Pydantic هستند (مثلاً xma_share از نوع MediaXma است). اسکنرهای ما فقط
++    با dict کار می‌کنند، پس اینجا یک‌دست‌شان می‌کنیم.
++    """
++    if isinstance(obj, dict):
++        return obj or None
++    dump = getattr(obj, "model_dump", None)  # Pydantic v2 (instagrapi 2.x)
++    if not callable(dump):
++        return None
++    try:
++        data = dump(mode="json", exclude_none=True)
++    except TypeError:
++        try:
++            data = dump(exclude_none=True)
++        except Exception:  # noqa: BLE001
++            return None
++    except Exception:  # noqa: BLE001
++        return None
++    if isinstance(data, dict) and data:
++        return data
++    return None
++
++
++def _shortcode_from_pk(pk: Any) -> str | None:
++    """تبدیل pk عددی مدیا به shortcode (برای دیپ‌لینک‌های instagram://media?id=…)."""
++    try:
++        from instagrapi.utils import InstagramIdCodec  # بارگذاری تنبل و اختیاری
++
++        return str(InstagramIdCodec.encode(int(pk)))
++    except Exception:  # noqa: BLE001
++        return None
++
++
++def _dm_share_payloads(dm: Any) -> list[dict[str, Any]]:
++    """همهٔ payloadهای «اشتراک» پیام دایرکت به‌صورت dict.
++
++    مدل‌های Pydantic (media_share/clip/xma_share/generic_xma) تبدیل می‌شوند و
++    raw_xma (dict خام که instagrapi حفظ می‌کند) هم اضافه می‌شود.
++    """
++    payloads: list[dict[str, Any]] = []
++    for attr in ("media_share", "clip", "reel_share", "xma_share", "felix_share"):
++        payload = _payload_to_dict(getattr(dm, attr, None))
++        if payload:
++            payloads.append(payload)
++    for item in getattr(dm, "generic_xma", None) or []:
++        payload = _payload_to_dict(item)
++        if payload:
++            payloads.append(payload)
++    raw_xma = getattr(dm, "raw_xma", None)
++    if isinstance(raw_xma, dict) and raw_xma:
++        payloads.append(raw_xma)
++    return payloads
++
++
+ def _story_url_from_payload(payload: dict[str, Any]) -> str | None:
+     """ساخت URL استوری از story_share: نیاز به username + pk مدیا دارد."""
+     stack, seen = [payload], set()
+@@ -367,22 +442,37 @@ def urls_from_dm(dm: Any) -> list[str]:
+     for url in extract_ig_urls(getattr(dm, "text", None)):
+         add(url)
+ 
+-    # لینک ضمیمه (item_type == link)
+-    link = getattr(dm, "link", None)
+-    if isinstance(link, dict):
+-        add(_clean_url(str(link.get("link_url") or "")) or None)
++    # لینک ضمیمه (item_type == link) — در instagrapi 2.x مدل MessageLink است
++    # و URL داخل link_context.link_url قرار دارد؛ با اسکن عمومی پیدایش می‌کنیم.
++    link_payload = _payload_to_dict(getattr(dm, "link", None))
++    if link_payload:
++        add(_url_from_payload(link_payload))
+ 
+-    # اشتراک‌های مختلف (Share از داخل اپ اینستاگرام)
+-    for attr in ("media_share", "clip", "reel_share", "xma_share", "felix_share"):
+-        payload = getattr(dm, attr, None)
+-        if isinstance(payload, dict) and payload:
+-            add(_url_from_payload(payload))
++    # اشتراک‌های مختلف (Share از داخل اپ اینستاگرام) — در instagrapi 2.x
++    # این فیلدها مدل Pydantic هستند و باید اول به dict تبدیل شوند.
++    for payload in _dm_share_payloads(dm):
++        add(_url_from_payload(payload))
+ 
+     # استوری (آخر اولویت؛ پشتیبانی استوری بستگی به زنجیرهٔ فعلی ربات دارد)
+-    story_payload = getattr(dm, "story_share", None)
+-    if isinstance(story_payload, dict) and story_payload:
++    story_payload = _payload_to_dict(getattr(dm, "story_share", None))
++    if story_payload:
+         add(_story_url_from_payload(story_payload) or _url_from_payload(story_payload))
+ 
++    # آخرین راه: دیپ‌لینک داخلی instagram://media?id=… (وقتی target_url دیپ‌لینک است)
++    if not urls:
++        item_type = str(getattr(dm, "item_type", "") or "")
++        prefix = "reel" if item_type in {"xma_clip", "clip", "reel_share"} else "p"
++        for payload in _dm_share_payloads(dm):
++            for text in _scan_strings(payload):
++                match = DEEP_LINK_RE.search(text)
++                if match:
++                    code = _shortcode_from_pk(match.group(1))
++                    if code:
++                        add(f"https://www.instagram.com/{prefix}/{code}/")
++                        break
++            if urls:
++                break
++
+     return urls[:MAX_URLS_PER_DM]
+ 
+ 
+@@ -579,6 +669,14 @@ def _no_link_text() -> str:
+     )
+ 
+ 
++def _extract_fail_text() -> str:
++    return (
++        "🤔 این اشتراک رو نتونستم باز کنم.\n"
++        "لطفاً ریلز/پست رو توی اینستاگرام باز کن، از منوی ⋯ گزینهٔ "
++        "«Copy link» رو بزن و لینک رو به‌صورت متن همین‌جا بفرست 🙏"
++    )
++
++
+ def _linked_success_text(page_hint: str) -> str:
+     page = f"@{page_hint}" if page_hint else "پیج"
+     return (
+@@ -648,6 +746,7 @@ class InstagramDmBridge:
+     # ── login ──
+ 
+     async def _ensure_client(self) -> Any | None:
++        global IG_DM_PAGE_HINT
+         if self._client is not None:
+             return self._client
+         Client, ig_exc = ig_imports()
+@@ -676,12 +775,24 @@ class InstagramDmBridge:
+                     logger.info("ig-dm: session file loaded (%s)", IG_DM_SESSION_FILE.name)
+                 except Exception as exc:  # noqa: BLE001
+                     logger.warning("ig-dm: session file invalid: %s", exc)
+-            # نکته: login() در instagrapi 2.18 خودش سشن بارگذاری‌شده را
+-            # اعتبارسنجی می‌کند — اگر سشن معتبر باشد هیچ درخواست لاگین زده
+-            # نمی‌شود؛ اگر منقضی باشد، با «همان فینگرپرینت دستگاه» دوباره
+-            # لاگین می‌کند (نه دستگاه تازه) که برای اعتماد اینستاگرام حیاتی است.
+-            verification_code = totp_now(IG_TOTP_SECRET) or ""
+-            cl.login(IG_USERNAME, IG_PASSWORD, verification_code=verification_code)
++            if IG_SESSIONID:
++                # روش پیشنهادی: ورود فقط با کوکی sessionid مرورگر — بدون رمز.
++                # مرورگر خودت سشن معتبر و قابل‌اعتماد دارد؛ اینجا فقط همان
++                # سشن به کلاینت منتقل می‌شود (هیچ درخواست لاگین رمزی زده
++                # نمی‌شود و IP دیتاسنتر هم مشکلی ایجاد نمی‌کند).
++                cl.login_by_sessionid(IG_SESSIONID)
++                # اعتبارسنجی سخت — اطمینان از اینکه سشن واقعاً زنده است.
++                # توجه: در instagrapi 2.18 متد current_user حذف شده؛
++                # خود instagrapi هم برای اعتبارسنجی سشن از account_info استفاده می‌کند.
++                cl.account_info()
++                session_source = "sessionid"
++            else:
++                # نکته: login() در instagrapi 2.18 خودش سشن بارگذاری‌شده را
++                # اعتبارسنجی می‌کند — اگر سشن معتبر باشد هیچ درخواست لاگین زده
++                # نمی‌شود؛ اگر منقضی باشد، با «همان فینگرپرینت دستگاه» دوباره
++                # لاگین می‌کند (نه دستگاه تازه) که برای اعتماد اینستاگرام حیاتی است.
++                verification_code = totp_now(IG_TOTP_SECRET) or ""
++                cl.login(IG_USERNAME, IG_PASSWORD, verification_code=verification_code)
+             try:
+                 cl.dump_settings(str(IG_DM_SESSION_FILE))
+             except Exception as exc:  # noqa: BLE001
+@@ -703,9 +814,13 @@ class InstagramDmBridge:
+             self._client = await self._run_ig(_build_and_login)
+             self._login_failures = 0
+             pk = getattr(self._client, "user_id", 0)
+-            logger.info("ig-dm: logged in as @%s (pk=%s)", IG_USERNAME, pk)
++            # در حالت فقط-sessionid، یوزرنیم پیج ممکن است خالی باشد — از خود کلاینت پر می‌کنیم
++            page_name = IG_USERNAME or str(getattr(self._client, "username", "") or "")
++            if page_name and not IG_DM_PAGE_HINT:
++                IG_DM_PAGE_HINT = page_name
++            logger.info("ig-dm: logged in as @%s (pk=%s)", page_name, pk)
+             await self.notify_admin(
+-                "🟢 پل دایرکت اینستاگرام وصل شد (@" + IG_USERNAME + ")",
++                "🟢 پل دایرکت اینستاگرام وصل شد (@" + page_name + ")",
+                 "login_ok",
+                 cooldown=6 * 60 * 60,
+             )
+@@ -728,11 +843,21 @@ class InstagramDmBridge:
+             )
+             proxy = _proxy_url()
+             session_ready = IG_DM_SESSION_FILE.exists()
+-            hint_ip = (
+-                "راه‌حل: سشن را روی سیستم خودت با ig_session_helper.py بساز و به‌صورت "
+-                "IG_SESSION_B64 به Railway بده؛ یا یک پراکسی مسکونی در IG_PROXY تنظیم کن."
+-            )
+-            if two_fa:
++            if IG_SESSIONID:
++                hint_ip = (
++                    "sessionid این پیج پذیرفته نشد — یعنی منقضی/ناقص کپی شده یا از مرورگر دیگری است. "
++                    "از همان مرورگری که پیج در آن لوگین است، دوباره کوکی sessionid را بردار "
++                    "(F12 → Application → Cookies → instagram.com) و IG_SESSIONID را در Railway عوض کن."
++                )
++            else:
++                hint_ip = (
++                    "راه‌حل: کوکی sessionid مرورگر را در IG_SESSIONID بگذار (روش پیشنهادی، بدون رمز) "
++                    "یا سشن را با ig_session_helper.py بساز؛ یا پراکسی مسکونی در IG_PROXY تنظیم کن."
++                )
++            if IG_SESSIONID:
++                # در حالت sessionid تقریباً هر خطایی یعنی «کوکی قابل قبول نیست»
++                detail = hint_ip
++            elif two_fa:
+                 detail = "کد 2FA لازم است — IG_TOTP_SECRET را تنظیم کن یا لاگین دستی بزن."
+             elif challenge:
+                 detail = "چالش تأیید اینستاگرام فعال شد — یک‌بار با مرورگر/اپ وارد پیج شو و تأیید کن."
+@@ -934,7 +1059,10 @@ class InstagramDmBridge:
+         # 2) استخراج لینک‌ها (متن یا Share)
+         urls = urls_from_dm(dm)
+         rec = self._store.link_for(sender_pk)
+-        if not urls:
++        if urls:
++            logger.info("ig-dm: extracted %d url(s) (type=%s)", len(urls), item_type)
++        else:
++            logger.info("ig-dm: no url in message (type=%s, linked=%s)", item_type, bool(rec))
+             if rec:
+                 if item_type == "text" and text and not CODE_RE.search(text):
+                     await self.maybe_dm(
+@@ -943,7 +1071,15 @@ class InstagramDmBridge:
+                         _no_link_text(),
+                         NO_LINK_COOLDOWN,
+                     )
+-            elif item_type in {"text", "media_share", "clip", "reel_share", "xma_share", "story_share", "link"}:
++                elif item_type in FEEDBACK_ITEM_TYPES:
++                    # اشتراک/مدیا بود ولی لینک درنیاوردیم — کاربر بی‌صدا نماند
++                    await self.maybe_dm(
++                        thread_id,
++                        f"extract_fail:{sender_pk}",
++                        _extract_fail_text(),
++                        EXTRACT_FAIL_COOLDOWN,
++                    )
++            elif item_type in GUIDE_ITEM_TYPES:
+                 await self.maybe_dm(
+                     thread_id,
+                     f"guide:{sender_pk}",
+@@ -1193,7 +1329,7 @@ def maybe_start(
+     """اگر قابلیت فعال باشد، پل دایرکت را در پس‌زمینه اجرا می‌کند."""
+     global _BRIDGE
+     if not feature_enabled():
+-        logger.info("ig-dm: disabled (IG_USERNAME / IG_PASSWORD not set)")
++        logger.info("ig-dm: disabled (no IG_SESSIONID and no IG_USERNAME / IG_PASSWORD)")
+         return None
+     Client, _ = ig_imports()
+     if Client is None:
+@@ -1202,17 +1338,19 @@ def maybe_start(
+     _ensure_stores()
+     _seed_session_from_env()
+     proxy = _proxy_url()
++    auth_mode = "sessionid" if IG_SESSIONID else "password"
+     logger.info(
+-        "ig-dm: enabled (page=@%s, session_file=%s, proxy=%s)",
+-        IG_USERNAME,
++        "ig-dm: enabled (page=@%s, auth=%s, session_file=%s, proxy=%s)",
++        IG_USERNAME or IG_DM_PAGE_HINT or "?",
++        auth_mode,
+         IG_DM_SESSION_FILE.name,
+         _mask_proxy(proxy),
+     )
+-    if not proxy and not IG_DM_SESSION_FILE.exists():
++    if auth_mode == "password" and not proxy and not IG_DM_SESSION_FILE.exists():
+         logger.warning(
+-            "ig-dm: هشدار — نه IG_PROXY تنظیم شده و نه سشن (IG_SESSION_B64/فایل)؛ "
+-            "لاگین از IP دیتاسنتر به احتمال زیاد توسط اینستاگرام رد می‌شود "
+-            "(BadPassword / 429). راه‌حل را در IG_DM_SETUP_FA.md ببین."
++            "ig-dm: هشدار — لاگین رمزی از IP دیتاسنتر به احتمال زیاد رد می‌شود "
++            "(BadPassword / 429). راه بهتر: کوکی sessionid مرورگر را در متغیر "
++            "IG_SESSIONID بگذار (بدون رمز، بدون پراکسی). راهنما: IG_DM_SETUP_FA.md"
+         )
+     _BRIDGE = InstagramDmBridge(
+         application, process_url, allow_requests, active_requests, _STORE, _STATE
+diff --git a/ig_session_helper.py b/ig_session_helper.py
+index 8167ffb..367947b 100644
+--- a/ig_session_helper.py
++++ b/ig_session_helper.py
+@@ -1,32 +1,35 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+-"""ig_session_helper.py — ساخت سشن اینستاگرام روی سیستم خودت (IP خانگی).
++"""ig_session_helper.py — اتصال پل دایرکت بدون لاگینِ رمزی (روش sessionid).
+ 
+-چرا این اسکریپت؟
+-    لاگین اینستاگرام از IP دیتاسنتر Railway معمولاً رد می‌شود (BadPassword/429)
+-    چون اینستاگرام IP کلود را باور نمی‌کند. راه‌حل: یک‌بار روی کامپیوتر خودت
+-    (با IP خانگی) لاگین کن، سشن را ذخیره کن و به‌صورت base64 در متغیر
+-    IG_SESSION_B64 به Railway بده. از این به بعد ربات «بدون لاگینِ مجدد»
+-    با همین سشن کار می‌کند.
++چرا sessionid؟
++    لاگین رمزی اینستاگرام از IP دیتاسنتر (Railway) و حتی از IP های VPN رد
++    می‌شود (BadPassword/429). ولی مرورگر خودت که هر روز پیج را در آن باز
++    می‌کنی، یک «سشن معتبر و قابل‌اعتماد» دارد. با کپی کردن کوکی sessionid
++    از همان مرورگر، ربات از همان سشن استفاده می‌کند — بدون اینکه هیچ جا
++    رمز عبور لاگین شود.
+ 
+ اجرا:
+     pip install "instagrapi==2.18.18" pysocks
+     python ig_session_helper.py
+ 
+-خروجی:
+-    - فایل ig_session.json در همین پوشه
+-    - متن base64 که باید در Railway به متغیر IG_SESSION_B64 داده شود
++خروجی موفق:
++    - فایل ig_session.json
++    - مقدار IG_SESSIONID برای Railway (همان متن کپی‌شده از مرورگر)
++    - (اختیاری) مقدار IG_SESSION_B64
+ 
+-نکتهٔ امنیتی: این فایل حاوی کوکی‌های ورود پیج است؛ فقط در Railway خودت
+-بگذارش و با کسی به اشتراک نگذار. برای خروج، از اینستاگرام روی همان پیج
+-«Log out of all sessions» بزن.
++نکتهٔ امنیتی: sessionid = کلید ورود پیج تو است؛ فقط در Railway خودت بگذارش
++و با کسی به اشتراک نگذار. اگر روزی خواستی اتصال را قطع کنی، از اینستاگرام
++«Log out» بزن تا سشن باطل شود.
+ """
+ 
+ from __future__ import annotations
+ 
+ import base64
+ import getpass
++import json
+ import os
++import re
+ import sys
+ from pathlib import Path
+ 
+@@ -39,6 +42,35 @@ except ImportError:
+     sys.exit(1)
+ 
+ SESSION_FILE = Path(os.getenv("IG_DM_SESSION_FILE", "ig_session.json"))
++DIAG_FILE = Path("ig_login_diag.txt")
++
++MASK_RE = re.compile(r"(\w{8})\w{10,}(\w{4})")
++
++
++def mask(value: str) -> str:
++    """ماسک کردن مقادیر حساس در فایل خطایابی."""
++    return MASK_RE.sub(r"\1***\2", value)
++
++
++def save_diag(stage: str, exc: BaseException, cl: Client | None = None) -> None:
++    """ذخیرهٔ جزئیات خطا برای ارسال به دستیار."""
++    lines = [
++        f"stage: {stage}",
++        f"exception: {type(exc).__name__}: {exc}",
++    ]
++    try:
++        last_json = getattr(cl, "last_json", None) if cl else None
++        if last_json:
++            lines.append("last_json: " + mask(json.dumps(last_json, ensure_ascii=False, default=str)))
++        error_type = ""
++        if isinstance(last_json, dict):
++            error_type = str(last_json.get("error_type", "") or last_json.get("message", ""))
++        if error_type:
++            lines.append(f"error_type: {mask(error_type)}")
++    except Exception:  # noqa: BLE001
++        pass
++    DIAG_FILE.write_text("\n".join(lines), encoding="utf-8")
++    print(f"\n📄 جزئیات فنی خطا در «{DIAG_FILE.resolve()}» ذخیره شد — اگر خواستی کمک بگیری، همین فایل را برایش بفرست.")
+ 
+ 
+ def ask(prompt: str, default: str = "") -> str:
+@@ -47,53 +79,105 @@ def ask(prompt: str, default: str = "") -> str:
+     return value or default
+ 
+ 
+-def save_and_print_b64(cl: Client) -> None:
+-    cl.dump_settings(str(SESSION_FILE))
+-    raw = SESSION_FILE.read_bytes()
+-    b64 = base64.b64encode(raw).decode("ascii")
++def ask_proxy() -> str:
++    print("\nاگر ترمینال/پایتون به اینستاگرام وصل نمی‌شود (مثلاً VPNت فقط مرورگر را رد می‌کند)،")
++    print("پراکسی همان VPN را بده؛ مثل: socks5://127.0.0.1:10808 یا http://127.0.0.1:8888")
++    proxy = ask("پراکسی (Enter = بدون پراکسی)", "")
++    return proxy
++
++
++def build_client(proxy: str) -> Client:
++    cl = Client()
++    cl.delay_range = [1, 3]
++    if proxy:
++        cl.set_proxy(proxy)
++    return cl
++
++
++def print_success(cl: Client, sessionid_hint: str) -> None:
++    username = ""
++    try:
++        username = getattr(cl.account_info(), "username", "") or ""
++    except Exception:  # noqa: BLE001
++        username = str(getattr(cl, "username", "") or "")
+     print("\n" + "=" * 62)
+-    print(f"✅ سشن ذخیره شد: {SESSION_FILE.resolve()}")
++    print(f"✅ اتصال برقرار شد! پیج: @{username or '?'}")
+     print("=" * 62)
+-    print("این متن را کامل کپی کن و در Railway به متغیر زیر بده:")
+-    print("   IG_SESSION_B64 = (این متن)")
++    cl.dump_settings(str(SESSION_FILE))
++    print(f"📁 سشن ذخیره شد: {SESSION_FILE.resolve()}")
++    print("\nقدم بعدی — در Railway → Variables فقط این را بساز:")
+     print("-" * 62)
++    print(f"IG_SESSIONID = {sessionid_hint}")
++    print("-" * 62)
++    print("بعد Deploy بزن. در لاگ باید ببینی:")
++    print("  ig-dm: enabled (page=@..., auth=sessionid, ...)")
++    print("  ig-dm: login ok (session=sessionid, ...)")
++    print("✅ تمام! دیگر هیچ لاگین رمزی لازم نیست.")
++    print("\n(اختیاری) اگر خواستی سشن کامل را هم داشته باشی، IG_SESSION_B64:")
++    raw = SESSION_FILE.read_bytes()
++    b64 = base64.b64encode(raw).decode("ascii")
+     for i in range(0, len(b64), 96):
+         print(b64[i : i + 96])
+-    print("=" * 62)
+-    print("قدم بعدی در Railway (Variables):")
+-    print("  1) IG_SESSION_B64 را با متن بالا بساز")
+-    print("  2) Deploy دوباره بزن")
+-    print("  3) در لاگ باید ببینی: «ig-dm: session seeded from IG_SESSION_B64»")
+-    print("     و بعد: «ig-dm: login ok (session=file ...)»")
+-    print("✅ با این کار دیگر روی Railway لاگینِ پسوردی زده نمی‌شود.")
+ 
+ 
+-def main() -> None:
+-    print("── ساخت سشن اینستاگرام برای پل دایرکت MZ-Downloader ──\n")
++def flow_sessionid() -> None:
++    print(
++        "\n── مراحل گرفتن sessionid از مرورگر (کامپیوتر) ──\n"
++        "  1) در کروم/فایرفاکس برو به  instagram.com  و مطمئن شو پیج‌ات لوگین است\n"
++        "  2) دکمه F12 را بزن (DevTools باز می‌شود)\n"
++        "  3) تب  Application  (در فایرفاکس: Storage) را باز کن\n"
++        "  4) از منوی چپ:  Cookies  →  https://www.instagram.com\n"
++        "  5) از لیست، ردیف  sessionid  را پیدا کن و مقدار (Value) آن را کپی کن\n"
++        "     (رشتهٔ خیلی طولانی که با چند رقم شروع می‌شود، وسطش %3A دارد)\n"
++    )
++    sessionid = ask("sessionid کپی‌شده را اینجا بچسبان").strip().strip('"').strip("'")
++    if not sessionid:
++        print("❌ sessionid خالی بود.")
++        return save_diag("sessionid-empty", ValueError("empty sessionid"))
++    if len(sessionid) < 30:
++        print("❌ این مقدار خیلی کوتاه است — کل Value کوکی sessionid را کپی کن (چند صد کاراکتر).")
++        return save_diag("sessionid-too-short", ValueError(f"len={len(sessionid)}"))
++    proxy = ask_proxy()
++    cl = build_client(proxy)
++    try:
++        cl.login_by_sessionid(sessionid)
++        # اعتبارسنجی سخت: سشن باید واقعاً زنده باشد.
++        # (در instagrapi 2.18 متد current_user حذف شده؛ account_info جای آن است)
++        cl.account_info()
++    except Exception as exc:  # noqa: BLE001
++        print(f"\n❌ این sessionid پذیرفته نشد: {type(exc).__name__}: {str(exc)[:200]}")
++        print("   چک کن: کل Value را کپی کرده باشی، مرورگر همان پیج را داشته باشد،")
++        print("   و پیج داخل مرورگر لوگین/سالم باشد (صفحه را رفرش کن و مطمئن شو لاگین ماندی).")
++        if proxy:
++            print("   اگر پراکسی دادی، آدرس/پورتش درست باشد و VPN روشن باشد.")
++        return save_diag("sessionid-login", exc, cl)
++    print_success(cl, sessionid)
++
++
++def flow_password() -> None:
++    print("\n(این روش فقط وقتی sessionid کار نکرد؛ روی IP خانگی بدون VPN امتحان کن)")
+     username = ask("یوزرنیم پیج", os.getenv("IG_USERNAME", "")).lstrip("@")
+     password = os.getenv("IG_PASSWORD", "") or getpass.getpass("رمز پیج: ")
+     totp_secret = (
+-        ask("سکرت 2FA (اگر داری؛ Enter یعنی ندارم)", os.getenv("IG_TOTP_SECRET", ""))
++        ask("سکرت 2FA (Enter = ندارم)", os.getenv("IG_TOTP_SECRET", ""))
+         .replace(" ", "")
+         .replace("-", "")
+     )
+-    proxy = ask("پراکسی (معمولاً لازم نیست روی IP خانگی؛ Enter = بدون پراکسی)", "")
+-
+-    def build() -> Client:
+-        cl = Client()
+-        cl.delay_range = [1, 3]
+-        if proxy:
+-            cl.set_proxy(proxy)
+-        return cl
+-
+-    # ۱) اول با سشن قبلی (اگر هست) امتحان کن تا دستگاه ثابت بماند
+-    cl = build()
+-    if SESSION_FILE.exists():
+-        try:
+-            cl.load_settings(str(SESSION_FILE))
+-            print("📁 سشن قبلی بارگذاری شد؛ اعتبارسنجی می‌کنم…")
+-        except Exception as exc:  # noqa: BLE001
+-            print(f"⚠️ سشن قبلی نامعتبر بود ({exc})؛ لاگین تازه می‌زنم.")
++    proxy = ask_proxy()
++    cl = build_client(proxy)
++
++    def totp_code(secret: str) -> str:
++        import hashlib
++        import hmac as hmac_mod
++        import struct
++        import time
++
++        key = base64.b32decode(secret.upper() + "=" * ((8 - len(secret) % 8) % 8))
++        counter = int(time.time()) // 30
++        digest = hmac_mod.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
++        offset = digest[19] & 0x0F
++        value = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
++        return f"{value % 1_000_000:06d}"
+ 
+     def try_login(client: Client, code: str = "") -> bool:
+         try:
+@@ -104,42 +188,34 @@ def main() -> None:
+                 print("❌ کد 2FA پذیرفته نشد. دوباره امتحان کن.")
+                 return False
+             print("🔐 این پیج 2FA دارد.")
+-            if not totp_secret:
+-                manual = input("کد 6 رقمی اپ Authenticator را وارد کن: ").strip()
+-                return try_login(client, manual)
+-            import hashlib
+-            import hmac as hmac_mod
+-            import struct
+-            import time
+-
+-            key = base64.b32decode(totp_secret.upper() + "=" * ((8 - len(totp_secret) % 8) % 8))
+-            counter = int(time.time()) // 30
+-            digest = hmac_mod.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+-            offset = digest[19] & 0x0F
+-            value = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+-            generated = f"{value % 1_000_000:06d}"
+-            print(f"🔑 کد TOTP تولید شد: {generated}")
+-            return try_login(client, generated)
++            manual = input("کد 6 رقمی اپ Authenticator را وارد کن (Enter = تولید خودکار از سکرت): ").strip()
++            return try_login(client, manual or (totp_code(totp_secret) if totp_secret else ""))
+         except ig_exc.ChallengeRequired:
+             print(
+-                "🚧 اینستاگرام چالش تأیید داده (مثلاً کد پیامکی/ایمیلی).\n"
+-                "   یک‌بار با اپ یا مرورگر خودت وارد پیج شو، تأیید را کامل کن،\n"
+-                "   بعد دوباره این اسکریپت را اجرا کن."
++                "🚧 اینستاگرام چالش تأیید داده (کد پیامکی/ایمیلی یا «این تو بودی؟»)."
++                "\n   1) با همان مرورگر وارد instagram.com شو — معمولاً خودش می‌پذیرد."
++                "\n   2) بعد از تأیید، دیگر نیازی به این روش نداری: همان مراحل گزینه ۱ (sessionid) را برو."
+             )
+             return False
+         except ig_exc.BadPassword:
+-            print("❌ رمز اشتباه است (یا اینستاگرام قبول نکرد). دوباره چک کن.")
++            print("❌ رمز اشتباه است (یا اینستاگرام قبول نکرد).")
++            print("   راه بهتر: از مرورگر که پیج در آن باز است، گزینهٔ ۱ (sessionid) را برو — بدون رمز!")
+             return False
+ 
+     if not try_login(cl):
+-        sys.exit(1)
+-    try:
+-        info = cl.account_info()
+-        print(f"✅ لاگین موفق: @{info.username} (pk={info.pk})")
+-    except Exception as exc:  # noqa: BLE001
+-        print(f"⚠️ لاگین انجام شد ولی گرفتن مشخصات اکانت خطا داد: {exc}")
++        return save_diag("password-login", Exception("login failed"), cl)
++    print_success(cl, "(همان sessionid مرورگر را در IG_SESSIONID بگذار — روش مطمئن‌تر)")
+ 
+-    save_and_print_b64(cl)
++
++def main() -> None:
++    print("── اتصال پل دایرکت اینستاگرام بدون لاگین رمزی ──\n")
++    print("  1) ورود با sessionid مرورگر   ← پیشنهادی (بدون رمز، از هر IPای جواب می‌دهد)")
++    print("  2) ورود با رمز عبور          ← فقط وقتی گزینهٔ ۱ کار نکرد")
++    choice = ask("\nانتخاب", "1")
++    if choice == "2":
++        flow_password()
++    else:
++        flow_sessionid()
+ 
+ 
+ if __name__ == "__main__":

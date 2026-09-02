@@ -85,6 +85,19 @@ if not IG_DM_SESSION_FILE.is_absolute():
 IG_LINKS_FILE = PROJECT_DIR / "ig_links.json"
 IG_DM_STATE_FILE = PROJECT_DIR / "ig_dm_state.json"
 
+# دیپ‌لینک داخلی XMA: وقتی target_url به‌جای https، دیپ‌لینک اپ است.
+# عدد بعد از id= معمولاً pk مدیاست و با InstagramIdCodec به shortcode تبدیل می‌شود.
+DEEP_LINK_RE = re.compile(r"instagram://media\?id=(\d{5,25})", re.IGNORECASE)
+
+# انواع پیام دایرکت که «لینک/اشتراک/مدیا» محسوب می‌شوند.
+# xma_clip/xma_media_share = فرمت جدید شیرِ ریل/پست در API اینستاگرام.
+FEEDBACK_ITEM_TYPES = {
+    "media_share", "clip", "xma_clip", "xma_media_share", "reel_share",
+    "xma_share", "story_share", "felix_share", "generic_xma", "link",
+    "media", "visual_media", "animated_media", "voice_media",
+}
+GUIDE_ITEM_TYPES = FEEDBACK_ITEM_TYPES | {"text"}
+
 CODE_TTL_SECONDS = 15 * 60  # 15 دقیقه اعتبار کد اتصال
 MAX_URLS_PER_DM = 2         # حداکثر لینک پردازش‌شده در هر پیام دایرکت
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # بدون 0/O/1/I/L
@@ -97,6 +110,7 @@ MAX_SCAN_NODES = 600
 # فاصلهٔ ارسال مجدد پیام‌های راهنما (ثانیه)
 INSTRUCTION_COOLDOWN = 6 * 60 * 60   # راهنمای اتصال: هر ۶ ساعت به ازای هر کاربر
 NO_LINK_COOLDOWN = 30 * 60           # «لینکی ندیدم»: هر ۳۰ دقیقه
+EXTRACT_FAIL_COOLDOWN = 30 * 60      # «اشتراک قابل خواندن نبود»: هر ۳۰ دقیقه
 BUSY_COOLDOWN = 5 * 60               # «یکی یکی»: هر ۵ دقیقه
 RATELIMIT_COOLDOWN = 5 * 60          # پیام محدودیت نرخ
 
@@ -311,17 +325,75 @@ def _media_path(d: dict[str, Any]) -> str:
 
 def _url_from_payload(payload: dict[str, Any]) -> str | None:
     """استخراج URL از یک اشتراک (media_share / clip / xma_share / reel_share …)."""
-    # 1) اول خود URLهای اینستاگرام داخل payload
+    # 1) اول مدیای ساختاریافته با shortcode — دقیق‌ترین روش
+    #    (کپشن‌هایی که خودشان لینک دارند گول نمی‌خوریم)
+    for media in _scan_media_dicts(payload):
+        if media.get("code"):
+            return f"https://www.instagram.com/{_media_path(media)}"
+    # 2) بعد URLهای اینستاگرام داخل رشته‌های payload (مثل target_url در XMA)
     for text in _scan_strings(payload):
         for match in URL_RE.findall(text):
             url = _clean_url(match)
             if _is_ig_url(url) and "/stories/" not in url.lower():
                 return url
-    # 2) بعد مدیای ساختاریافته با shortcode
-    for media in _scan_media_dicts(payload):
-        if media.get("code"):
-            return f"https://www.instagram.com/{_media_path(media)}"
     return None
+
+
+def _payload_to_dict(obj: Any) -> dict[str, Any] | None:
+    """تبدیل مدل‌های Pydantic اینستاگرام (Media / MediaXma / MessageLink…) به dict.
+
+    در instagrapi 2.x خیلی از فیلدهای DirectMessage به‌جای dict خام، مدل
+    Pydantic هستند (مثلاً xma_share از نوع MediaXma است). اسکنرهای ما فقط
+    با dict کار می‌کنند، پس اینجا یک‌دست‌شان می‌کنیم.
+    """
+    if isinstance(obj, dict):
+        return obj or None
+    dump = getattr(obj, "model_dump", None)  # Pydantic v2 (instagrapi 2.x)
+    if not callable(dump):
+        return None
+    try:
+        data = dump(mode="json", exclude_none=True)
+    except TypeError:
+        try:
+            data = dump(exclude_none=True)
+        except Exception:  # noqa: BLE001
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(data, dict) and data:
+        return data
+    return None
+
+
+def _shortcode_from_pk(pk: Any) -> str | None:
+    """تبدیل pk عددی مدیا به shortcode (برای دیپ‌لینک‌های instagram://media?id=…)."""
+    try:
+        from instagrapi.utils import InstagramIdCodec  # بارگذاری تنبل و اختیاری
+
+        return str(InstagramIdCodec.encode(int(pk)))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _dm_share_payloads(dm: Any) -> list[dict[str, Any]]:
+    """همهٔ payloadهای «اشتراک» پیام دایرکت به‌صورت dict.
+
+    مدل‌های Pydantic (media_share/clip/xma_share/generic_xma) تبدیل می‌شوند و
+    raw_xma (dict خام که instagrapi حفظ می‌کند) هم اضافه می‌شود.
+    """
+    payloads: list[dict[str, Any]] = []
+    for attr in ("media_share", "clip", "reel_share", "xma_share", "felix_share"):
+        payload = _payload_to_dict(getattr(dm, attr, None))
+        if payload:
+            payloads.append(payload)
+    for item in getattr(dm, "generic_xma", None) or []:
+        payload = _payload_to_dict(item)
+        if payload:
+            payloads.append(payload)
+    raw_xma = getattr(dm, "raw_xma", None)
+    if isinstance(raw_xma, dict) and raw_xma:
+        payloads.append(raw_xma)
+    return payloads
 
 
 def _story_url_from_payload(payload: dict[str, Any]) -> str | None:
@@ -370,21 +442,36 @@ def urls_from_dm(dm: Any) -> list[str]:
     for url in extract_ig_urls(getattr(dm, "text", None)):
         add(url)
 
-    # لینک ضمیمه (item_type == link)
-    link = getattr(dm, "link", None)
-    if isinstance(link, dict):
-        add(_clean_url(str(link.get("link_url") or "")) or None)
+    # لینک ضمیمه (item_type == link) — در instagrapi 2.x مدل MessageLink است
+    # و URL داخل link_context.link_url قرار دارد؛ با اسکن عمومی پیدایش می‌کنیم.
+    link_payload = _payload_to_dict(getattr(dm, "link", None))
+    if link_payload:
+        add(_url_from_payload(link_payload))
 
-    # اشتراک‌های مختلف (Share از داخل اپ اینستاگرام)
-    for attr in ("media_share", "clip", "reel_share", "xma_share", "felix_share"):
-        payload = getattr(dm, attr, None)
-        if isinstance(payload, dict) and payload:
-            add(_url_from_payload(payload))
+    # اشتراک‌های مختلف (Share از داخل اپ اینستاگرام) — در instagrapi 2.x
+    # این فیلدها مدل Pydantic هستند و باید اول به dict تبدیل شوند.
+    for payload in _dm_share_payloads(dm):
+        add(_url_from_payload(payload))
 
     # استوری (آخر اولویت؛ پشتیبانی استوری بستگی به زنجیرهٔ فعلی ربات دارد)
-    story_payload = getattr(dm, "story_share", None)
-    if isinstance(story_payload, dict) and story_payload:
+    story_payload = _payload_to_dict(getattr(dm, "story_share", None))
+    if story_payload:
         add(_story_url_from_payload(story_payload) or _url_from_payload(story_payload))
+
+    # آخرین راه: دیپ‌لینک داخلی instagram://media?id=… (وقتی target_url دیپ‌لینک است)
+    if not urls:
+        item_type = str(getattr(dm, "item_type", "") or "")
+        prefix = "reel" if item_type in {"xma_clip", "clip", "reel_share"} else "p"
+        for payload in _dm_share_payloads(dm):
+            for text in _scan_strings(payload):
+                match = DEEP_LINK_RE.search(text)
+                if match:
+                    code = _shortcode_from_pk(match.group(1))
+                    if code:
+                        add(f"https://www.instagram.com/{prefix}/{code}/")
+                        break
+            if urls:
+                break
 
     return urls[:MAX_URLS_PER_DM]
 
@@ -579,6 +666,14 @@ def _no_link_text() -> str:
     return (
         "🙃 لینک اینستاگرام پیدا نکردم.\n"
         "لینک ریلز/پست رو بفرست یا خود پست رو با Share برام بفرست 📩"
+    )
+
+
+def _extract_fail_text() -> str:
+    return (
+        "🤔 این اشتراک رو نتونستم باز کنم.\n"
+        "لطفاً ریلز/پست رو توی اینستاگرام باز کن، از منوی ⋯ گزینهٔ "
+        "«Copy link» رو بزن و لینک رو به‌صورت متن همین‌جا بفرست 🙏"
     )
 
 
@@ -964,7 +1059,10 @@ class InstagramDmBridge:
         # 2) استخراج لینک‌ها (متن یا Share)
         urls = urls_from_dm(dm)
         rec = self._store.link_for(sender_pk)
-        if not urls:
+        if urls:
+            logger.info("ig-dm: extracted %d url(s) (type=%s)", len(urls), item_type)
+        else:
+            logger.info("ig-dm: no url in message (type=%s, linked=%s)", item_type, bool(rec))
             if rec:
                 if item_type == "text" and text and not CODE_RE.search(text):
                     await self.maybe_dm(
@@ -973,7 +1071,15 @@ class InstagramDmBridge:
                         _no_link_text(),
                         NO_LINK_COOLDOWN,
                     )
-            elif item_type in {"text", "media_share", "clip", "reel_share", "xma_share", "story_share", "link"}:
+                elif item_type in FEEDBACK_ITEM_TYPES:
+                    # اشتراک/مدیا بود ولی لینک درنیاوردیم — کاربر بی‌صدا نماند
+                    await self.maybe_dm(
+                        thread_id,
+                        f"extract_fail:{sender_pk}",
+                        _extract_fail_text(),
+                        EXTRACT_FAIL_COOLDOWN,
+                    )
+            elif item_type in GUIDE_ITEM_TYPES:
                 await self.maybe_dm(
                     thread_id,
                     f"guide:{sender_pk}",
