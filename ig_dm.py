@@ -67,6 +67,9 @@ IG_TOTP_SECRET = os.getenv("IG_TOTP_SECRET", "").strip().replace(" ", "")
 # پراکسی مخصوص اینستاگرام (مثلاً socks5://user:pass@host:port یا http://host:port).
 # روی Railway معمولاً لازم است چون IP دیتاسنتر توسط اینستاگرام رد/محدود می‌شود.
 IG_PROXY = os.getenv("IG_PROXY", "").strip()
+# کوکی sessionid از مرورگر خودت (F12 → Application → Cookies → instagram.com).
+# با این متغیر «هیچ لاگین رمزی» لازم نیست — حتی روی Railway. روش پیشنهادی.
+IG_SESSIONID = os.getenv("IG_SESSIONID", "").strip().strip('"').strip("'")
 # سشن آماده به‌صورت base64 (خروجی ig_session_helper.py) — بدون نیاز به Volume
 # روی Railway، بعد از هر ری‌دیپلوی سشن از همین متغیر بازسازی می‌شود.
 IG_SESSION_B64 = os.getenv("IG_SESSION_B64", "").strip()
@@ -99,11 +102,11 @@ RATELIMIT_COOLDOWN = 5 * 60          # پیام محدودیت نرخ
 
 
 def feature_enabled() -> bool:
-    """فعال بودن پل دایرکت: فقط با وجود IG_USERNAME و IG_PASSWORD."""
+    """فعال بودن پل دایرکت: با IG_SESSIONID یا با IG_USERNAME + IG_PASSWORD."""
     forced_off = os.getenv("IG_DM_ENABLED", "").strip().lower() in {"0", "false", "no", "off"}
     if forced_off:
         return False
-    return bool(IG_USERNAME and IG_PASSWORD)
+    return bool(IG_USERNAME and IG_PASSWORD) or bool(IG_SESSIONID)
 
 
 # ────────────────────────────── TOTP (stdlib, بدون وابستگی) ──────────────────────────────
@@ -648,6 +651,7 @@ class InstagramDmBridge:
     # ── login ──
 
     async def _ensure_client(self) -> Any | None:
+        global IG_DM_PAGE_HINT
         if self._client is not None:
             return self._client
         Client, ig_exc = ig_imports()
@@ -676,12 +680,22 @@ class InstagramDmBridge:
                     logger.info("ig-dm: session file loaded (%s)", IG_DM_SESSION_FILE.name)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("ig-dm: session file invalid: %s", exc)
-            # نکته: login() در instagrapi 2.18 خودش سشن بارگذاری‌شده را
-            # اعتبارسنجی می‌کند — اگر سشن معتبر باشد هیچ درخواست لاگین زده
-            # نمی‌شود؛ اگر منقضی باشد، با «همان فینگرپرینت دستگاه» دوباره
-            # لاگین می‌کند (نه دستگاه تازه) که برای اعتماد اینستاگرام حیاتی است.
-            verification_code = totp_now(IG_TOTP_SECRET) or ""
-            cl.login(IG_USERNAME, IG_PASSWORD, verification_code=verification_code)
+            if IG_SESSIONID:
+                # روش پیشنهادی: ورود فقط با کوکی sessionid مرورگر — بدون رمز.
+                # مرورگر خودت سشن معتبر و قابل‌اعتماد دارد؛ اینجا فقط همان
+                # سشن به کلاینت منتقل می‌شود (هیچ درخواست لاگین رمزی زده
+                # نمی‌شود و IP دیتاسنتر هم مشکلی ایجاد نمی‌کند).
+                cl.login_by_sessionid(IG_SESSIONID)
+                # اعتبارسنجی سخت — اطمینان از اینکه سشن واقعاً زنده است
+                cl.current_user()
+                session_source = "sessionid"
+            else:
+                # نکته: login() در instagrapi 2.18 خودش سشن بارگذاری‌شده را
+                # اعتبارسنجی می‌کند — اگر سشن معتبر باشد هیچ درخواست لاگین زده
+                # نمی‌شود؛ اگر منقضی باشد، با «همان فینگرپرینت دستگاه» دوباره
+                # لاگین می‌کند (نه دستگاه تازه) که برای اعتماد اینستاگرام حیاتی است.
+                verification_code = totp_now(IG_TOTP_SECRET) or ""
+                cl.login(IG_USERNAME, IG_PASSWORD, verification_code=verification_code)
             try:
                 cl.dump_settings(str(IG_DM_SESSION_FILE))
             except Exception as exc:  # noqa: BLE001
@@ -703,9 +717,13 @@ class InstagramDmBridge:
             self._client = await self._run_ig(_build_and_login)
             self._login_failures = 0
             pk = getattr(self._client, "user_id", 0)
-            logger.info("ig-dm: logged in as @%s (pk=%s)", IG_USERNAME, pk)
+            # در حالت فقط-sessionid، یوزرنیم پیج ممکن است خالی باشد — از خود کلاینت پر می‌کنیم
+            page_name = IG_USERNAME or str(getattr(self._client, "username", "") or "")
+            if page_name and not IG_DM_PAGE_HINT:
+                IG_DM_PAGE_HINT = page_name
+            logger.info("ig-dm: logged in as @%s (pk=%s)", page_name, pk)
             await self.notify_admin(
-                "🟢 پل دایرکت اینستاگرام وصل شد (@" + IG_USERNAME + ")",
+                "🟢 پل دایرکت اینستاگرام وصل شد (@" + page_name + ")",
                 "login_ok",
                 cooldown=6 * 60 * 60,
             )
@@ -728,11 +746,21 @@ class InstagramDmBridge:
             )
             proxy = _proxy_url()
             session_ready = IG_DM_SESSION_FILE.exists()
-            hint_ip = (
-                "راه‌حل: سشن را روی سیستم خودت با ig_session_helper.py بساز و به‌صورت "
-                "IG_SESSION_B64 به Railway بده؛ یا یک پراکسی مسکونی در IG_PROXY تنظیم کن."
-            )
-            if two_fa:
+            if IG_SESSIONID:
+                hint_ip = (
+                    "sessionid این پیج پذیرفته نشد — یعنی منقضی/ناقص کپی شده یا از مرورگر دیگری است. "
+                    "از همان مرورگری که پیج در آن لوگین است، دوباره کوکی sessionid را بردار "
+                    "(F12 → Application → Cookies → instagram.com) و IG_SESSIONID را در Railway عوض کن."
+                )
+            else:
+                hint_ip = (
+                    "راه‌حل: کوکی sessionid مرورگر را در IG_SESSIONID بگذار (روش پیشنهادی، بدون رمز) "
+                    "یا سشن را با ig_session_helper.py بساز؛ یا پراکسی مسکونی در IG_PROXY تنظیم کن."
+                )
+            if IG_SESSIONID:
+                # در حالت sessionid تقریباً هر خطایی یعنی «کوکی قابل قبول نیست»
+                detail = hint_ip
+            elif two_fa:
                 detail = "کد 2FA لازم است — IG_TOTP_SECRET را تنظیم کن یا لاگین دستی بزن."
             elif challenge:
                 detail = "چالش تأیید اینستاگرام فعال شد — یک‌بار با مرورگر/اپ وارد پیج شو و تأیید کن."
@@ -1193,7 +1221,7 @@ def maybe_start(
     """اگر قابلیت فعال باشد، پل دایرکت را در پس‌زمینه اجرا می‌کند."""
     global _BRIDGE
     if not feature_enabled():
-        logger.info("ig-dm: disabled (IG_USERNAME / IG_PASSWORD not set)")
+        logger.info("ig-dm: disabled (no IG_SESSIONID and no IG_USERNAME / IG_PASSWORD)")
         return None
     Client, _ = ig_imports()
     if Client is None:
@@ -1202,17 +1230,19 @@ def maybe_start(
     _ensure_stores()
     _seed_session_from_env()
     proxy = _proxy_url()
+    auth_mode = "sessionid" if IG_SESSIONID else "password"
     logger.info(
-        "ig-dm: enabled (page=@%s, session_file=%s, proxy=%s)",
-        IG_USERNAME,
+        "ig-dm: enabled (page=@%s, auth=%s, session_file=%s, proxy=%s)",
+        IG_USERNAME or IG_DM_PAGE_HINT or "?",
+        auth_mode,
         IG_DM_SESSION_FILE.name,
         _mask_proxy(proxy),
     )
-    if not proxy and not IG_DM_SESSION_FILE.exists():
+    if auth_mode == "password" and not proxy and not IG_DM_SESSION_FILE.exists():
         logger.warning(
-            "ig-dm: هشدار — نه IG_PROXY تنظیم شده و نه سشن (IG_SESSION_B64/فایل)؛ "
-            "لاگین از IP دیتاسنتر به احتمال زیاد توسط اینستاگرام رد می‌شود "
-            "(BadPassword / 429). راه‌حل را در IG_DM_SETUP_FA.md ببین."
+            "ig-dm: هشدار — لاگین رمزی از IP دیتاسنتر به احتمال زیاد رد می‌شود "
+            "(BadPassword / 429). راه بهتر: کوکی sessionid مرورگر را در متغیر "
+            "IG_SESSIONID بگذار (بدون رمز، بدون پراکسی). راهنما: IG_DM_SETUP_FA.md"
         )
     _BRIDGE = InstagramDmBridge(
         application, process_url, allow_requests, active_requests, _STORE, _STATE
