@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && mkdir -p /tmp/mz-downloader \
     && chown -R appuser:appuser /app /tmp/mz-downloader
 
-COPY --chown=appuser:appuser bot.py config.py creatorcrawl.py downloader.py routing.py instagram_caption.py spotisaver.py youtube_search.py social_gateway.py apify_gateway.py apify_platforms.py users_db.py pixeldrain_upload.py mz_shazam_search.py mz_reel_music.py youtube_subtitle.py feature_flags.py store.py token_alerts.py user_features.py ai_service.py perf.py media_size.py structured_logging.py ahm7_gateway.py yoinku_gateway.py voiddl_gateway.py ./
+COPY --chown=appuser:appuser bot.py config.py creatorcrawl.py downloader.py routing.py instagram_caption.py spotisaver.py youtube_search.py social_gateway.py apify_gateway.py apify_platforms.py users_db.py pixeldrain_upload.py mz_shazam_search.py mz_reel_music.py youtube_subtitle.py feature_flags.py store.py token_alerts.py user_features.py ai_service.py perf.py media_size.py structured_logging.py ahm7_gateway.py yoinku_gateway.py voiddl_gateway.py ig_dm.py ./
 COPY --chown=appuser:appuser migrations ./migrations
 
 USER appuser
