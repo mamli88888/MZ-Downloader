@@ -6558,6 +6558,7 @@ def main() -> None:
         application.add_handler(CommandHandler("igsession", ig_dm.igsession_command))
     if ig_follow is not None:
         application.add_handler(CommandHandler("igfollowstate", ig_follow.igfollowstate_command))
+        application.add_handler(CommandHandler("igfollowcheck", ig_follow.igfollowcheck_command))
     # ── 1404 upgrade: user features + admin tooling (all flag-gated inside) ──
     application.add_handler(TypeHandler(Update, _admin_seen_watcher), group=-1)
     application.add_handler(CommandHandler("bookmarks", user_features.bookmarks_command))
