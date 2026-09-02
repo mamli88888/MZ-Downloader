@@ -64,6 +64,12 @@ logger = logging.getLogger("MZDownloader.ig_dm")
 IG_USERNAME = os.getenv("IG_USERNAME", "").strip().lstrip("@")
 IG_PASSWORD = os.getenv("IG_PASSWORD", "").strip()
 IG_TOTP_SECRET = os.getenv("IG_TOTP_SECRET", "").strip().replace(" ", "")
+# پراکسی مخصوص اینستاگرام (مثلاً socks5://user:pass@host:port یا http://host:port).
+# روی Railway معمولاً لازم است چون IP دیتاسنتر توسط اینستاگرام رد/محدود می‌شود.
+IG_PROXY = os.getenv("IG_PROXY", "").strip()
+# سشن آماده به‌صورت base64 (خروجی ig_session_helper.py) — بدون نیاز به Volume
+# روی Railway، بعد از هر ری‌دیپلوی سشن از همین متغیر بازسازی می‌شود.
+IG_SESSION_B64 = os.getenv("IG_SESSION_B64", "").strip()
 IG_DM_PAGE_HINT = os.getenv("IG_DM_PAGE_HINT", "").strip().lstrip("@") or IG_USERNAME
 IG_DM_POLL_SECONDS = max(5, int(os.getenv("IG_DM_POLL_SECONDS", "10") or 10))
 IG_DM_MAX_THREADS = max(5, int(os.getenv("IG_DM_MAX_THREADS", "20") or 20))
@@ -143,9 +149,71 @@ def ig_imports() -> tuple[Any, Any]:
 
 
 def _proxy_url() -> str | None:
+    """پراکسی مخصوص اینستاگرام: اول IG_PROXY، بعد پراکسی عمومی ربات."""
+    if IG_PROXY:
+        return IG_PROXY
     if not SETTINGS.use_proxy:
         return None
     return f"{SETTINGS.proxy_type}://{SETTINGS.proxy_host}:{SETTINGS.proxy_port}"
+
+
+def _mask_proxy(proxy: str | None) -> str:
+    """نمایش ایمن پراکسی در لاگ — بدون نام‌کاربری/رمز."""
+    if not proxy:
+        return "off"
+    try:
+        parts = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+        auth = "***@" if parts.username else ""
+        if parts.port:
+            return f"{parts.scheme}://{auth}{parts.hostname}:{parts.port}"
+        return f"{parts.scheme}://{auth}{parts.hostname}"
+    except Exception:  # noqa: BLE001
+        return "set"
+
+
+def _seed_session_from_env() -> bool:
+    """اگر IG_SESSION_B64 تنظیم شده باشد، فایل سشن را از آن بازسازی می‌کند.
+
+    فقط وقتی فایل فعلی ناموجود یا نامعتبر است می‌نویسد تا سشن تازه‌ترِ
+    اجرای قبلی از بین نرود. خروجی True یعنی سشن از env بازسازی شد.
+    """
+    if not IG_SESSION_B64:
+        return False
+    if IG_DM_SESSION_FILE.exists():
+        try:
+            json.loads(IG_DM_SESSION_FILE.read_text(encoding="utf-8"))
+            return False  # فایل موجود و معتبر است — دست نمی‌زنیم
+        except Exception:  # noqa: BLE001
+            pass  # فایل خراب است → با سشن env بازنویسی می‌شود
+    try:
+        raw = base64.b64decode(IG_SESSION_B64, validate=False)
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("session JSON must be an object")
+        IG_DM_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        IG_DM_SESSION_FILE.write_text(json.dumps(payload), encoding="utf-8")
+        logger.info(
+            "ig-dm: session seeded from IG_SESSION_B64 → %s", IG_DM_SESSION_FILE.name
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ig-dm: IG_SESSION_B64 invalid: %s", exc)
+        return False
+
+
+def session_file_b64() -> str | None:
+    """محتوای فایل سشن به‌صورت base64 (برای دستور /igsession)."""
+    try:
+        if not IG_DM_SESSION_FILE.exists():
+            return None
+        raw = IG_DM_SESSION_FILE.read_bytes()
+        if not raw.strip():
+            return None
+        json.loads(raw.decode("utf-8"))  # فقط اعتبارسنجی
+        return base64.b64encode(raw).decode("ascii")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ig-dm: could not read session for export: %s", exc)
+        return None
 
 
 def _clean_url(candidate: str) -> str:
@@ -588,44 +656,47 @@ class InstagramDmBridge:
         self._ig_exc = ig_exc
 
         def _build_and_login() -> Any:
+            _seed_session_from_env()
             cl = Client()
             cl.delay_range = [1, 2]
             proxy = _proxy_url()
             if proxy:
+                # مهم: در instagrapi 2.x انتساب مستقیم «cl.proxy = ...» اثر
+                # ندارد (attribute ساده است و سشن‌های requests آپدیت نمی‌شوند)؛
+                # باید حتماً set_proxy صدا زده شود.
                 try:
-                    cl.proxy = proxy
+                    cl.set_proxy(proxy)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("ig-dm: could not set proxy: %s", exc)
-            session_loaded = False
+            session_source = "fresh"
             if IG_DM_SESSION_FILE.exists():
                 try:
                     cl.load_settings(str(IG_DM_SESSION_FILE))
-                    session_loaded = True
+                    session_source = "file"
                     logger.info("ig-dm: session file loaded (%s)", IG_DM_SESSION_FILE.name)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("ig-dm: session file invalid: %s", exc)
-            # اعتبارسنجی سشن فعلی
-            if session_loaded:
-                try:
-                    cl.current_user()
-                    logger.info("ig-dm: existing session is valid")
-                    return cl
-                except Exception as exc:  # noqa: BLE001
-                    logger.info("ig-dm: session expired, logging in again (%s)", type(exc).__name__)
-                    cl = Client()
-                    cl.delay_range = [1, 2]
-                    if proxy:
-                        try:
-                            cl.proxy = proxy
-                        except Exception:  # noqa: BLE001
-                            pass
+            # نکته: login() در instagrapi 2.18 خودش سشن بارگذاری‌شده را
+            # اعتبارسنجی می‌کند — اگر سشن معتبر باشد هیچ درخواست لاگین زده
+            # نمی‌شود؛ اگر منقضی باشد، با «همان فینگرپرینت دستگاه» دوباره
+            # لاگین می‌کند (نه دستگاه تازه) که برای اعتماد اینستاگرام حیاتی است.
             verification_code = totp_now(IG_TOTP_SECRET) or ""
             cl.login(IG_USERNAME, IG_PASSWORD, verification_code=verification_code)
-            cl.current_user()
             try:
                 cl.dump_settings(str(IG_DM_SESSION_FILE))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("ig-dm: could not dump session: %s", exc)
+            device_model = ""
+            try:
+                device_model = str((getattr(cl, "device_settings", None) or {}).get("model", ""))
+            except Exception:  # noqa: BLE001
+                pass
+            logger.info(
+                "ig-dm: login ok (session=%s, proxy=%s, device=%s)",
+                session_source,
+                _mask_proxy(proxy),
+                device_model or "?",
+            )
             return cl
 
         try:
@@ -646,25 +717,49 @@ class InstagramDmBridge:
                 exc, getattr(self._ig_exc, "TwoFactorRequired", ())
             )
             challenge = self._ig_exc is not None and isinstance(
-                exc, getattr(self._ig_exc, "ChallengeRequired", ())
+                exc, (getattr(self._ig_exc, "ChallengeRequired", ()), getattr(self._ig_exc, "ChallengeError", ()))
             )
-            detail = (
-                "کد 2FA لازم است — IG_TOTP_SECRET را تنظیم کن یا لاگین دستی بزن."
-                if two_fa
-                else "چالش تأیید اینستاگرام فعال شد — یک‌بار با مرورگر/اپ وارد پیج شو و تأیید کن."
-                if challenge
-                else "رمز/کاربر را چک کن یا چند دقیقه بعد دوباره تلاش کن."
+            throttled = (
+                self._ig_exc is not None
+                and isinstance(exc, getattr(self._ig_exc, "ClientThrottledError", ()))
+            ) or "429" in str(exc)
+            bad_password = self._ig_exc is not None and isinstance(
+                exc, getattr(self._ig_exc, "BadPassword", ())
             )
+            proxy = _proxy_url()
+            session_ready = IG_DM_SESSION_FILE.exists()
+            hint_ip = (
+                "راه‌حل: سشن را روی سیستم خودت با ig_session_helper.py بساز و به‌صورت "
+                "IG_SESSION_B64 به Railway بده؛ یا یک پراکسی مسکونی در IG_PROXY تنظیم کن."
+            )
+            if two_fa:
+                detail = "کد 2FA لازم است — IG_TOTP_SECRET را تنظیم کن یا لاگین دستی بزن."
+            elif challenge:
+                detail = "چالش تأیید اینستاگرام فعال شد — یک‌بار با مرورگر/اپ وارد پیج شو و تأیید کن."
+            elif throttled:
+                detail = (
+                    "اینستاگرام درخواست‌های لاگین از این IP را محدود کرده (429). " + hint_ip
+                )
+            elif bad_password:
+                detail = (
+                    "BadPassword — اگر رمز درست است، اینستاگرام IP دیتاسنتر/فینگرپرینت را رد کرده. "
+                    + hint_ip
+                )
+            else:
+                detail = "رمز/کاربر را چک کن یا چند دقیقه بعد دوباره تلاش کن."
             logger.error("ig-dm: login failed (%s): %s — %s", name, exc, detail)
             await self.notify_admin(
                 f"🔴 <b>لاگین دایرکت اینستاگرام ناموفق</b>\n"
                 f"حساب: <code>{IG_USERNAME}</code>\n"
-                f"خطا: <code>{name}: {html_escape(str(exc)[:200])}</code>\n{detail}",
+                f"خطا: <code>{name}: {html_escape(str(exc)[:200])}</code>\n"
+                f"پراکسی: <code>{_mask_proxy(proxy)}</code> | سشن: "
+                f"<code>{'دارد' if session_ready else 'ندارد'}</code>\n{detail}",
                 "login_fail",
                 cooldown=1800.0,
             )
-            # backoff فزاینده بین تلاش‌های لاگین
-            await asyncio.sleep(min(120 * self._login_failures, 900))
+            # backoff فزاینده بین تلاش‌های لاگین (برای محدودیت 429 مدت طولانی‌تر)
+            cap = 1800 if throttled else 900
+            await asyncio.sleep(min(120 * self._login_failures, cap))
             return None
 
     # ── send into DM thread ──
@@ -1051,6 +1146,42 @@ async def unlink_command(update: Any, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
 
+async def igsession_command(update: Any, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """دستور ادمین /igsession — خروجی base64 سشن فعلی برای متغیر IG_SESSION_B64."""
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if not SETTINGS.bot_admin_chat_id or chat.id != SETTINGS.bot_admin_chat_id:
+        await message.reply_text("🔒 این دستور فقط برای ادمین ربات است.")
+        return
+    if not feature_enabled():
+        await message.reply_text(
+            "😕 قابلیت دایرکت اینستاگرام فعال نیست (IG_USERNAME / IG_PASSWORD تنظیم نشده)."
+        )
+        return
+    b64 = session_file_b64()
+    if b64 is None:
+        await message.reply_text(
+            "ℹ️ هنوز فایل سشن اینستاگرام ساخته نشده است.\n"
+            "یا لاگین هنوز موفق نشده، یا فایل سشن خالی است."
+        )
+        return
+    # پیام تلگرام ۴۰۹۶ نویسه سقف دارد → تکه‌تکه می‌فرستیم
+    chunk_size = 3500
+    chunks = [b64[i : i + chunk_size] for i in range(0, len(b64), chunk_size)]
+    await message.reply_text(
+        f"📦 سشن فعلی اینستاگرام — base64 ({len(chunks)} بخش؛ همه را پشت‌سرهم "
+        "کپی کن و به متغیر <code>IG_SESSION_B64</code> در Railway بده):",
+        parse_mode=ParseMode.HTML,
+    )
+    for index, chunk in enumerate(chunks, 1):
+        await message.reply_text(
+            f"<code>{chunk}</code>" if len(chunks) == 1 else f"({index}/{len(chunks)})\n<code>{chunk}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 # ────────────────────────────── Setup hook (از post_init ربات) ──────────────────────────────
 
 def maybe_start(
@@ -1069,6 +1200,20 @@ def maybe_start(
         logger.error("ig-dm: instagrapi not installed → bridge disabled")
         return None
     _ensure_stores()
+    _seed_session_from_env()
+    proxy = _proxy_url()
+    logger.info(
+        "ig-dm: enabled (page=@%s, session_file=%s, proxy=%s)",
+        IG_USERNAME,
+        IG_DM_SESSION_FILE.name,
+        _mask_proxy(proxy),
+    )
+    if not proxy and not IG_DM_SESSION_FILE.exists():
+        logger.warning(
+            "ig-dm: هشدار — نه IG_PROXY تنظیم شده و نه سشن (IG_SESSION_B64/فایل)؛ "
+            "لاگین از IP دیتاسنتر به احتمال زیاد توسط اینستاگرام رد می‌شود "
+            "(BadPassword / 429). راه‌حل را در IG_DM_SETUP_FA.md ببین."
+        )
     _BRIDGE = InstagramDmBridge(
         application, process_url, allow_requests, active_requests, _STORE, _STATE
     )

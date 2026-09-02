@@ -6544,6 +6544,7 @@ def main() -> None:
     if ig_dm is not None:
         application.add_handler(CommandHandler(("link", "connect"), ig_dm.link_command))
         application.add_handler(CommandHandler("unlink", ig_dm.unlink_command))
+        application.add_handler(CommandHandler("igsession", ig_dm.igsession_command))
     # ── 1404 upgrade: user features + admin tooling (all flag-gated inside) ──
     application.add_handler(TypeHandler(Update, _admin_seen_watcher), group=-1)
     application.add_handler(CommandHandler("bookmarks", user_features.bookmarks_command))
