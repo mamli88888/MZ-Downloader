@@ -112,7 +112,7 @@ index 944f2f8..0ff9273 100644
  ### ۲) تنظیمات خود پیج اینستاگرام (مهم!)
  
 diff --git a/ig_dm.py b/ig_dm.py
-index abe35b0..030b88d 100644
+index abe35b0..92f49c5 100644
 --- a/ig_dm.py
 +++ b/ig_dm.py
 @@ -67,6 +67,9 @@ IG_TOTP_SECRET = os.getenv("IG_TOTP_SECRET", "").strip().replace(" ", "")
@@ -147,7 +147,7 @@ index abe35b0..030b88d 100644
          if self._client is not None:
              return self._client
          Client, ig_exc = ig_imports()
-@@ -676,12 +680,22 @@ class InstagramDmBridge:
+@@ -676,12 +680,24 @@ class InstagramDmBridge:
                      logger.info("ig-dm: session file loaded (%s)", IG_DM_SESSION_FILE.name)
                  except Exception as exc:  # noqa: BLE001
                      logger.warning("ig-dm: session file invalid: %s", exc)
@@ -163,8 +163,10 @@ index abe35b0..030b88d 100644
 +                # سشن به کلاینت منتقل می‌شود (هیچ درخواست لاگین رمزی زده
 +                # نمی‌شود و IP دیتاسنتر هم مشکلی ایجاد نمی‌کند).
 +                cl.login_by_sessionid(IG_SESSIONID)
-+                # اعتبارسنجی سخت — اطمینان از اینکه سشن واقعاً زنده است
-+                cl.current_user()
++                # اعتبارسنجی سخت — اطمینان از اینکه سشن واقعاً زنده است.
++                # توجه: در instagrapi 2.18 متد current_user حذف شده؛
++                # خود instagrapi هم برای اعتبارسنجی سشن از account_info استفاده می‌کند.
++                cl.account_info()
 +                session_source = "sessionid"
 +            else:
 +                # نکته: login() در instagrapi 2.18 خودش سشن بارگذاری‌شده را
@@ -176,7 +178,7 @@ index abe35b0..030b88d 100644
              try:
                  cl.dump_settings(str(IG_DM_SESSION_FILE))
              except Exception as exc:  # noqa: BLE001
-@@ -703,9 +717,13 @@ class InstagramDmBridge:
+@@ -703,9 +719,13 @@ class InstagramDmBridge:
              self._client = await self._run_ig(_build_and_login)
              self._login_failures = 0
              pk = getattr(self._client, "user_id", 0)
@@ -192,7 +194,7 @@ index abe35b0..030b88d 100644
                  "login_ok",
                  cooldown=6 * 60 * 60,
              )
-@@ -728,11 +746,21 @@ class InstagramDmBridge:
+@@ -728,11 +748,21 @@ class InstagramDmBridge:
              )
              proxy = _proxy_url()
              session_ready = IG_DM_SESSION_FILE.exists()
@@ -219,7 +221,7 @@ index abe35b0..030b88d 100644
                  detail = "کد 2FA لازم است — IG_TOTP_SECRET را تنظیم کن یا لاگین دستی بزن."
              elif challenge:
                  detail = "چالش تأیید اینستاگرام فعال شد — یک‌بار با مرورگر/اپ وارد پیج شو و تأیید کن."
-@@ -1193,7 +1221,7 @@ def maybe_start(
+@@ -1193,7 +1223,7 @@ def maybe_start(
      """اگر قابلیت فعال باشد، پل دایرکت را در پس‌زمینه اجرا می‌کند."""
      global _BRIDGE
      if not feature_enabled():
@@ -228,7 +230,7 @@ index abe35b0..030b88d 100644
          return None
      Client, _ = ig_imports()
      if Client is None:
-@@ -1202,17 +1230,19 @@ def maybe_start(
+@@ -1202,17 +1232,19 @@ def maybe_start(
      _ensure_stores()
      _seed_session_from_env()
      proxy = _proxy_url()
@@ -255,7 +257,7 @@ index abe35b0..030b88d 100644
      _BRIDGE = InstagramDmBridge(
          application, process_url, allow_requests, active_requests, _STORE, _STATE
 diff --git a/ig_session_helper.py b/ig_session_helper.py
-index 8167ffb..8d7efc1 100644
+index 8167ffb..367947b 100644
 --- a/ig_session_helper.py
 +++ b/ig_session_helper.py
 @@ -1,32 +1,35 @@
@@ -343,7 +345,7 @@ index 8167ffb..8d7efc1 100644
  
  
  def ask(prompt: str, default: str = "") -> str:
-@@ -47,53 +79,103 @@ def ask(prompt: str, default: str = "") -> str:
+@@ -47,53 +79,105 @@ def ask(prompt: str, default: str = "") -> str:
      return value or default
  
  
@@ -425,7 +427,9 @@ index 8167ffb..8d7efc1 100644
 +    cl = build_client(proxy)
 +    try:
 +        cl.login_by_sessionid(sessionid)
-+        cl.current_user()  # اعتبارسنجی سخت: سشن باید واقعاً زنده باشد
++        # اعتبارسنجی سخت: سشن باید واقعاً زنده باشد.
++        # (در instagrapi 2.18 متد current_user حذف شده؛ account_info جای آن است)
++        cl.account_info()
 +    except Exception as exc:  # noqa: BLE001
 +        print(f"\n❌ این sessionid پذیرفته نشد: {type(exc).__name__}: {str(exc)[:200]}")
 +        print("   چک کن: کل Value را کپی کرده باشی، مرورگر همان پیج را داشته باشد،")
@@ -481,7 +485,7 @@ index 8167ffb..8d7efc1 100644
  
      def try_login(client: Client, code: str = "") -> bool:
          try:
-@@ -104,42 +186,34 @@ def main() -> None:
+@@ -104,42 +188,34 @@ def main() -> None:
                  print("❌ کد 2FA پذیرفته نشد. دوباره امتحان کن.")
                  return False
              print("🔐 این پیج 2FA دارد.")

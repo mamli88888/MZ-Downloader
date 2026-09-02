@@ -686,8 +686,10 @@ class InstagramDmBridge:
                 # سشن به کلاینت منتقل می‌شود (هیچ درخواست لاگین رمزی زده
                 # نمی‌شود و IP دیتاسنتر هم مشکلی ایجاد نمی‌کند).
                 cl.login_by_sessionid(IG_SESSIONID)
-                # اعتبارسنجی سخت — اطمینان از اینکه سشن واقعاً زنده است
-                cl.current_user()
+                # اعتبارسنجی سخت — اطمینان از اینکه سشن واقعاً زنده است.
+                # توجه: در instagrapi 2.18 متد current_user حذف شده؛
+                # خود instagrapi هم برای اعتبارسنجی سشن از account_info استفاده می‌کند.
+                cl.account_info()
                 session_source = "sessionid"
             else:
                 # نکته: login() در instagrapi 2.18 خودش سشن بارگذاری‌شده را

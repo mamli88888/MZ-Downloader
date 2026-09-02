@@ -141,7 +141,9 @@ def flow_sessionid() -> None:
     cl = build_client(proxy)
     try:
         cl.login_by_sessionid(sessionid)
-        cl.current_user()  # اعتبارسنجی سخت: سشن باید واقعاً زنده باشد
+        # اعتبارسنجی سخت: سشن باید واقعاً زنده باشد.
+        # (در instagrapi 2.18 متد current_user حذف شده؛ account_info جای آن است)
+        cl.account_info()
     except Exception as exc:  # noqa: BLE001
         print(f"\n❌ این sessionid پذیرفته نشد: {type(exc).__name__}: {str(exc)[:200]}")
         print("   چک کن: کل Value را کپی کرده باشی، مرورگر همان پیج را داشته باشد،")
