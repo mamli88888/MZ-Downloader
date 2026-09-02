@@ -86,6 +86,11 @@ try:
     import ig_dm
 except ImportError:  # optional feature module
     ig_dm = None
+# فالو‌بک خودکار + پیام خوش‌آمد (اختیاری؛ از همان سشن ig_dm استفاده می‌کند)
+try:
+    import ig_follow
+except ImportError:  # optional feature module
+    ig_follow = None
 from routing import Platform, all_providers, detect_platform, is_instagram_post_page, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
 from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
 from social_gateway import (
@@ -6355,6 +6360,12 @@ async def post_init(application: Application) -> None:
         IG_DM_TASK = ig_dm.maybe_start(
             application, _process_url, allow_requests, ACTIVE_REQUESTS
         )
+    # ── فالو‌بک خودکار + پیام خوش‌آمد (اختیاری؛ وابسته به ig-dm) ──
+    if ig_dm is not None and ig_follow is not None:
+        try:
+            ig_follow.maybe_start_followback()
+        except Exception as follow_exc:  # noqa: BLE001
+            logger.warning("ig-follow: could not start follow-back: %s", follow_exc)
     asyncio.get_running_loop().create_task(maintenance_loop(), name="store-maintenance")
     cleanup_stale_download_directories()
     proxy = build_telethon_proxy()
@@ -6545,6 +6556,8 @@ def main() -> None:
         application.add_handler(CommandHandler(("link", "connect"), ig_dm.link_command))
         application.add_handler(CommandHandler("unlink", ig_dm.unlink_command))
         application.add_handler(CommandHandler("igsession", ig_dm.igsession_command))
+    if ig_follow is not None:
+        application.add_handler(CommandHandler("igfollowstate", ig_follow.igfollowstate_command))
     # ── 1404 upgrade: user features + admin tooling (all flag-gated inside) ──
     application.add_handler(TypeHandler(Update, _admin_seen_watcher), group=-1)
     application.add_handler(CommandHandler("bookmarks", user_features.bookmarks_command))
