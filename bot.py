@@ -80,17 +80,6 @@ from downloader import (
 )
 from instagram_caption import InstagramCaptionError, fetch_instagram_caption
 import creatorcrawl
-# Instagram DM → Telegram bridge (اختیاری). اگر فایل/وابستگی‌ها نبودند، ربات
-# بدون هیچ تغییری در رفتار قبلی بالا می‌آید.
-try:
-    import ig_dm
-except ImportError:  # optional feature module
-    ig_dm = None
-# فالو‌بک خودکار + پیام خوش‌آمد (اختیاری؛ از همان سشن ig_dm استفاده می‌کند)
-try:
-    import ig_follow
-except ImportError:  # optional feature module
-    ig_follow = None
 from routing import Platform, all_providers, detect_platform, is_instagram_post_page, is_instagram_reel, platform_info, providers_for_platform, spotify_resource_type
 from spotisaver import SpotisaverAlbumDownloader, _zip_and_remove as _zip_tracks
 from social_gateway import (
@@ -487,7 +476,6 @@ PIXELDRAIN_UPLOADER = PixeldrainUploader(
 
 FEEDBACK_STICKER_IDS: tuple[str, ...] = ()
 SELECTION_REAPER_TASK: asyncio.Task[Any] | None = None
-IG_DM_TASK: asyncio.Task[Any] | None = None
 HEALTH_SERVER: asyncio.AbstractServer | None = None
 STARTED_AT = time.monotonic()
 FEATURES_SCHEDULER_TASK: asyncio.Task[Any] | None = None
@@ -6335,7 +6323,7 @@ async def maintenance_loop() -> None:
 
 
 async def post_init(application: Application) -> None:
-    global SELECTION_REAPER_TASK, HEALTH_SERVER, FEATURES_SCHEDULER_TASK, IG_DM_TASK
+    global SELECTION_REAPER_TASK, HEALTH_SERVER, FEATURES_SCHEDULER_TASK
     setup_structured_logging()
     await store.init_store()
     token_alerts.initialize(
@@ -6353,19 +6341,6 @@ async def post_init(application: Application) -> None:
     FEATURES_SCHEDULER_TASK = asyncio.create_task(
         features_scheduler_loop(application), name="features-scheduler"
     )
-    # ── Instagram DM → Telegram bridge (optional) ──
-    # فعال می‌شود فقط وقتی IG_USERNAME / IG_PASSWORD تنظیم شده باشند و
-    # instagrapi نصب باشد؛ در غیر این صورت no-op است.
-    if ig_dm is not None:
-        IG_DM_TASK = ig_dm.maybe_start(
-            application, _process_url, allow_requests, ACTIVE_REQUESTS
-        )
-    # ── فالو‌بک خودکار + پیام خوش‌آمد (اختیاری؛ وابسته به ig-dm) ──
-    if ig_dm is not None and ig_follow is not None:
-        try:
-            ig_follow.maybe_start_followback()
-        except Exception as follow_exc:  # noqa: BLE001
-            logger.warning("ig-follow: could not start follow-back: %s", follow_exc)
     asyncio.get_running_loop().create_task(maintenance_loop(), name="store-maintenance")
     cleanup_stale_download_directories()
     proxy = build_telethon_proxy()
@@ -6457,12 +6432,7 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    global SELECTION_REAPER_TASK, HEALTH_SERVER, FEATURES_SCHEDULER_TASK, IG_DM_TASK
-    if IG_DM_TASK is not None:
-        IG_DM_TASK.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await IG_DM_TASK
-        IG_DM_TASK = None
+    global SELECTION_REAPER_TASK, HEALTH_SERVER, FEATURES_SCHEDULER_TASK
     if SELECTION_REAPER_TASK:
         SELECTION_REAPER_TASK.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -6551,14 +6521,6 @@ def main() -> None:
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("dl", dl_command))
     application.add_handler(CommandHandler("profile", profile_command))
-    # ── Instagram DM bridge: اتصال تلگرام ↔ دایرکت پیج اینستاگرام ──
-    if ig_dm is not None:
-        application.add_handler(CommandHandler(("link", "connect"), ig_dm.link_command))
-        application.add_handler(CommandHandler("unlink", ig_dm.unlink_command))
-        application.add_handler(CommandHandler("igsession", ig_dm.igsession_command))
-    if ig_follow is not None:
-        application.add_handler(CommandHandler("igfollowstate", ig_follow.igfollowstate_command))
-        application.add_handler(CommandHandler("igfollowcheck", ig_follow.igfollowcheck_command))
     # ── 1404 upgrade: user features + admin tooling (all flag-gated inside) ──
     application.add_handler(TypeHandler(Update, _admin_seen_watcher), group=-1)
     application.add_handler(CommandHandler("bookmarks", user_features.bookmarks_command))
